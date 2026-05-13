@@ -132,7 +132,14 @@ async fn run_tui_loop(
                     should_quit = true;
                     break;
                 }
-                handle_key(key, &mut table_state, repos.len());
+                if handle_key(key, &mut table_state, repos.len()) {
+                    // 's' pressed — force reload of repos config
+                    // Clear mtime so reload_if_changed actually reloads
+                    if let Ok(mut mtime_guard) = state.config_mtime.write() {
+                        *mtime_guard = None;
+                    }
+                    let _ = state.reload_if_changed();
+                }
             }
         }
 
@@ -176,9 +183,9 @@ fn is_quit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('q'))
 }
 
-fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) {
+fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) -> bool {
     if row_count == 0 {
-        return;
+        return false;
     }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
@@ -199,8 +206,12 @@ fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) {
         KeyCode::End => {
             table_state.select(Some(row_count - 1));
         }
+        KeyCode::Char('s') => {
+            return true; // signal: reload requested
+        }
         _ => {}
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +545,7 @@ fn render_footer(
     let left_line = Line::from(vec![
         Span::styled("[q] quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[↑↓] scroll  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[s] reload  ", Style::default().fg(Color::DarkGray)),
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
     ]);
 

@@ -1985,6 +1985,35 @@ async fn trigger_symbol_rebuild(
     }
 }
 
+/// Reload repos config handler: POST /reload
+///
+/// Forces a reload of repos.json from disk, even if the mtime hasn't changed.
+/// Used by the TUI [s] key to pick up external changes (e.g. `codesearch index add`).
+async fn reload_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> (
+    axum::http::StatusCode,
+    axum::response::Json<serde_json::Value>,
+) {
+    use axum::http::StatusCode;
+
+    // Clear the stored mtime so reload_if_changed will actually reload.
+    if let Ok(mut mtime_guard) = state.config_mtime.write() {
+        *mtime_guard = None;
+    }
+
+    match state.reload_if_changed() {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::response::Json(json!({"status": "reloaded"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::response::Json(json!({"error": format!("reload failed: {}", e)})),
+        ),
+    }
+}
+
 /// Reindex handler: POST /repos/{alias}/reindex
 ///
 /// Query params:
@@ -2584,6 +2613,7 @@ pub async fn run_serve(
         .route(STATUS_PATH, axum::routing::get(status_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
+        .route("/reload", axum::routing::post(reload_handler))
         .route(
             "/repos/:alias/reindex",
             axum::routing::post(reindex_handler),

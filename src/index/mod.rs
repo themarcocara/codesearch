@@ -1626,10 +1626,62 @@ async fn try_delegate_reindex_to_serve(
         .map_err(|e| format!("reindex POST failed: {}", e))?;
 
     if reindex_resp.status().is_success() {
-        Ok((alias, project_path))
+        return Ok((alias, project_path));
+    }
+
+    let status = reindex_resp.status();
+    let body = reindex_resp.text().await.unwrap_or_default();
+
+    // If 404, the alias is unknown to serve — auto-register via POST /repos, then retry reindex.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        tracing::info!(
+            "alias '{}' not known to serve (404), auto-registering via POST /repos",
+            alias
+        );
+
+        // Register the repo with serve
+        let mut add_body = serde_json::json!({
+            "path": project_path,
+            "global": false,
+        });
+        // Use the resolved alias so the reindex retry targets the same name
+        add_body["alias"] = serde_json::Value::String(alias.clone());
+
+        let add_resp = client
+            .post(format!("{}/repos", base_url))
+            .json(&add_body)
+            .send()
+            .await
+            .map_err(|e| format!("auto-register POST /repos failed: {}", e))?;
+
+        if !add_resp.status().is_success() {
+            let add_status = add_resp.status();
+            let add_text = add_resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "auto-register returned {} for alias '{}': {}",
+                add_status, alias, add_text
+            ));
+        }
+
+        // Repo registered — retry the reindex POST
+        let retry_resp = client
+            .post(&url)
+            .send()
+            .await
+            .map_err(|e| format!("reindex retry POST failed: {}", e))?;
+
+        if retry_resp.status().is_success() {
+            tracing::info!("reindex retry succeeded for alias '{}'", alias);
+            return Ok((alias, project_path));
+        }
+
+        let retry_status = retry_resp.status();
+        let retry_body = retry_resp.text().await.unwrap_or_default();
+        Err(format!(
+            "reindex retry returned {} for alias '{}': {}",
+            retry_status, alias, retry_body
+        ))
     } else {
-        let status = reindex_resp.status();
-        let body = reindex_resp.text().await.unwrap_or_default();
         Err(format!(
             "serve returned {} for alias '{}': {}",
             status, alias, body

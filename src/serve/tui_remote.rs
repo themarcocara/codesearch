@@ -176,7 +176,17 @@ async fn run_remote_tui_loop(
                     .as_ref()
                     .map(|d| d.repos.len())
                     .unwrap_or(0);
-                handle_key(key, &mut table_state, repo_count);
+                if handle_key(key, &mut table_state, repo_count) {
+                    // 's' pressed — trigger reload via HTTP
+                    let reload_url =
+                        format!("{}/reload", serve_url.trim_end_matches('/'));
+                    // Fire-and-forget POST; don't block the TUI loop
+                    let _ = reqwest::Client::new()
+                        .post(&reload_url)
+                        .timeout(std::time::Duration::from_secs(3))
+                        .send()
+                        .await;
+                }
             }
         }
 
@@ -209,9 +219,9 @@ fn is_quit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('q'))
 }
 
-fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) {
+fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) -> bool {
     if row_count == 0 {
-        return;
+        return false;
     }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
@@ -232,8 +242,12 @@ fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) {
         KeyCode::End => {
             table_state.select(Some(row_count - 1));
         }
+        KeyCode::Char('s') => {
+            return true; // signal: reload requested
+        }
         _ => {}
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +541,7 @@ fn render_footer(
     let left_line = Line::from(vec![
         Span::styled("[q] quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[↑↓] scroll  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[s] reload  ", Style::default().fg(Color::DarkGray)),
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
     ]);
 
