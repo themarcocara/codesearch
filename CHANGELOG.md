@@ -46,6 +46,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Clippy `unnecessary_sort_by`** — replaced `sort_by()` with `sort_by_key()`
   in two locations in `src/serve/mod.rs` to avoid lint failure on CI.
 
+## [1.0.96] - 2026-05-14
+
+### Fixed
+
+- **`add_repo_handler` deadlock** — POST `/repos` was calling `index_quiet()`
+  inline, causing a deadlock when the serve's own startup (Phase 1) still held
+  the LMDB lock. Indexing now runs in a `tokio::spawn` background task and the
+  handler returns `202 Accepted` immediately, matching the `reindex_handler`
+  pattern. This fixes the "fresh install → serve hangs" scenario on both Linux
+  and Windows.
+
+
+
 ## [1.0.95] - 2026-05-14
 
 ### Added
@@ -262,6 +275,7 @@ repositories.
 - `codesearch serve` keeps one writer per database (LMDB invariant). Concurrent
   reindex from a second process is rejected.
 
+[1.0.96]: https://github.com/flupkede/codesearch/compare/v1.0.95...v1.0.96
 [1.0.95]: https://github.com/flupkede/codesearch/compare/v1.0.94...v1.0.95
 [1.0.94]: https://github.com/flupkede/codesearch/compare/v1.0.93...v1.0.94
 [1.0.93]: https://github.com/flupkede/codesearch/compare/v1.0.77...v1.0.93
