@@ -39,9 +39,10 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::lmdb_registry::TrackedEnv;
 use anyhow::{bail, Context, Result};
 use heed::types::{Bytes, Str};
-use heed::{Database, Env, EnvOpenOptions};
+use heed::{Database, EnvOpenOptions};
 use serde::{Deserialize, Serialize};
 
 use super::scip_parse;
@@ -346,18 +347,17 @@ impl CSharpSymbolIndexer {
     /// Pre-opens ALL named databases so they exist before first use.
     /// LMDB requires named DBs to be created (or opened) in a write txn
     /// before they can be read in later read txns within the same env session.
-    fn open_scip_env(&self, db_path: &Path) -> Result<Env> {
+    fn open_scip_env(&self, db_path: &Path) -> Result<TrackedEnv> {
         let scip_dir = db_path.join("scip");
         std::fs::create_dir_all(&scip_dir)
             .with_context(|| format!("Failed to create SCIP directory: {}", scip_dir.display()))?;
 
         // SAFETY: same pattern as vectordb/store.rs — LMDB mmap contract.
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(64 * 1024 * 1024) // 64MB — symbol indexes are small
-                .max_dbs(10) // 5 named DBs + headroom
-                .open(&scip_dir)?
-        };
+        // TrackedEnv additionally prevents double-open within the same process.
+        let mut opts = EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(10); // 64MB, 5 named DBs + headroom
+        let env =
+            unsafe { TrackedEnv::open(&opts, &scip_dir, &format!("SCIP({})", db_path.display()))? };
 
         // Eagerly create / re-open all named databases.
         let mut wtxn = env.write_txn()?;
@@ -572,7 +572,7 @@ impl CSharpSymbolIndexer {
 
     /// Resolve a (possibly fuzzy) symbol name to the canonical SCIP key stored
     /// in `scip_symbols`. Returns `None` if no matching symbol is found.
-    fn resolve_canonical_key(&self, env: &Env, symbol: &str) -> Result<Option<String>> {
+    fn resolve_canonical_key(&self, env: &TrackedEnv, symbol: &str) -> Result<Option<String>> {
         let rtxn = env.read_txn()?;
 
         let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {

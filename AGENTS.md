@@ -191,6 +191,27 @@ Debugging this required reading serve logs — no user-visible indication that D
 - Symbol resolution: exact match first, then fuzzy via `scip_simple_names`
 - Position lookup matches `start_line` only (not `[start_line, end_line]` range)
 
+### ⚠️ LMDB Access Rule — CRITICAL
+
+LMDB **does not allow** two `EnvOpenOptions::open()` handles on the same directory in the same process. Violating this causes runtime panics and corrupted indexes.
+
+**In serve context (`codesearch serve`):** ALL LMDB access MUST go through `get_or_open_stores()` (serve/mod.rs) which returns `Arc<SharedStores>`. This is the single entry point that ensures one LMDB handle per `.codesearch.db`.
+
+**Forbidden in serve/MCP code:**
+- `VectorStore::new()` — opens its own LMDB environment
+- `VectorStore::open_readonly()` — same issue
+- Any direct `heed::EnvOpenOptions::open()` on a `.codesearch.db` path
+
+**Allowed in CLI/stdio context:** `VectorStore::new()` is fine when codesearch runs as a standalone CLI tool (own process, no conflicting handles).
+
+**The 4 LMDB environments in this codebase:**
+1. Vector DB — `.codesearch.db/` via `VectorStore` (serve: through `SharedStores` only)
+2. SCIP symbols — `.codesearch.db/scip/` via `open_scip_env()` (separate dir, separate handle, safe)
+3. Embed cache — `~/.codesearch/embed_cache/` via `EmbeddingCache` (global path, separate dir, safe)
+4. FTS — `.codesearch.db/fts/` — Tantivy, NOT LMDB (no constraint)
+
+**If you add a new feature that needs LMDB in serve context:** Use `get_or_open_stores()` to get the shared handle. Never open a second handle on the same path.
+
 ### Runtime vs build locations
 
 - **Runtime**: `C:\Users\develterf\.local\bin\` — contains `codesearch.exe` and `helpers/csharp/scip-csharp.exe`. This is where `codesearch serve` runs from.
