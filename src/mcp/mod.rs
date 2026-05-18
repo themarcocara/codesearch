@@ -3711,14 +3711,22 @@ impl CodesearchService {
             match action(&store) {
                 Ok(result) => return Ok(result),
                 Err(shared_err) => {
-                    tracing::error!(
-                        "Shared vector store read failed, falling back to standalone open: {:?}",
-                        shared_err
-                    );
+                    tracing::error!("Shared vector store read failed: {:?}", shared_err);
+
+                    // In serve mode, do NOT fall back to a standalone VectorStore —
+                    // it would open a second LMDB handle on the same .codesearch.db,
+                    // which LMDB rejects ("environment already opened with different options").
+                    if self.serve_state.is_some() {
+                        return Err(shared_err.context(
+                            "Shared vector store read failed in serve mode; \
+                             standalone fallback disabled to prevent LMDB double-open",
+                        ));
+                    }
                 }
             }
 
-            // If MCP is in readonly mode, fallback must also use readonly open.
+            // Standalone readonly fallback (non-serve mode only).
+            // In serve mode the guard above already returned.
             if stores.readonly {
                 let ro_store = VectorStore::open_readonly(&self.db_path, self.dimensions)
                     .context("Error opening readonly database for read fallback")?;
@@ -3727,9 +3735,8 @@ impl CodesearchService {
             }
         }
 
-        // Fallback path:
-        // - when shared stores are not available, OR
-        // - when shared read fails (e.g., transient readonly/shared handle issues)
+        // Standalone fallback (non-serve mode only — CLI / stdio MCP).
+        // In serve mode, either Priority 1/2 succeeded or the guard above returned Err.
         let store = VectorStore::new(&self.db_path, self.dimensions)
             .context("Error opening database for read fallback")?;
         action(&store).context("Error reading from vector store")
