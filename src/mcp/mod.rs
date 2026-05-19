@@ -5179,7 +5179,9 @@ impl CodesearchService {
 
     /// Fetch outline items for an already-normalised absolute path.
     ///
-    /// Returns `Ok(vec![])` when no chunks match; `Err` only on I/O failures.
+    /// Returns `Ok(vec![])` when no chunks match.
+    /// In multi-store mode, per-store I/O failures are logged and skipped (never `Err`).
+    /// In single-store mode, I/O failures are returned as `Err`.
     async fn outline_items_for_normalized(
         &self,
         normalized: &str,
@@ -5303,10 +5305,20 @@ impl CodesearchService {
                     normalized,
                     normalized_orig
                 );
-                items = self
+                items = match self
                     .outline_items_for_normalized(&normalized_orig, &ctx)
                     .await
-                    .unwrap_or_default();
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            "file_outline: fallback '{}' also failed: {:?}",
+                            normalized_orig,
+                            e
+                        );
+                        Vec::new()
+                    }
+                };
             }
         }
 
