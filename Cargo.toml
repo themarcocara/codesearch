@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.0.128"
+version = "1.0.130"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -47,6 +47,11 @@ tree-sitter-cpp = "0.23.4"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-go = "0.25"
 tree-sitter-java = "0.23.5"
+tree-sitter-bash = "0.25.1"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-php = "0.24.2"
+tree-sitter-yaml = "0.7.2"
+tree-sitter-json = "0.24.8"
 
 # File handling
 ignore = "0.4"
