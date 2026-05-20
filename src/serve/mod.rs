@@ -594,6 +594,15 @@ impl ServeState {
             return;
         }
 
+        // Pre-mark all queued candidates as C# Indexing so the TUI C# indicator
+        // reflects pending rebuilds immediately, even before each repo acquires
+        // its semaphore slot. trigger_symbol_rebuild will overwrite this with the
+        // same value (no-op) and eventually with Ready or Error on completion.
+        for (alias, _) in &candidates {
+            self.csharp_index_status
+                .insert(alias.clone(), CSharpIndexStatus::Indexing);
+        }
+
         let concurrency = Self::csharp_scip_concurrency();
         info!(
             "phase-2: {} candidates, concurrency={}",
@@ -721,6 +730,14 @@ impl ServeState {
                 let registry = state.symbol_registry.clone();
                 let alias_owned = alias.clone();
 
+                // Signal TUI: C# ref-cache pre-warm is in progress.
+                // We set csharp_index_status → Indexing so the C# column shows "C#…"
+                // without touching active_reindexes — pre-warm does not block HTTP
+                // /reindex requests and should not override the repo label (Warm/Open).
+                state
+                    .csharp_index_status
+                    .insert(alias_owned.clone(), CSharpIndexStatus::Indexing);
+
                 match tokio::task::spawn_blocking(move || {
                     let Some(indexer) = registry.get(LANG_CSHARP) else {
                         return Err(anyhow::anyhow!("No C# indexer"));
@@ -753,6 +770,13 @@ impl ServeState {
                         );
                     }
                 }
+
+                // Restore Ready status regardless of pre-warm outcome: the SCIP
+                // definitions index (built in Phase 2) remains valid even if
+                // ref-cache pre-warm fails. TUI returns to "C#·" (ready).
+                state
+                    .csharp_index_status
+                    .insert(alias_owned, CSharpIndexStatus::Ready);
             }));
         }
 
