@@ -207,6 +207,34 @@ impl std::fmt::Debug for ServeState {
     }
 }
 
+/// Decision returned by [`ServeState::evaluate_csharp_rebuild`].
+///
+/// Using an enum rather than `&'static str` prevents fragile string
+/// comparisons at call sites (previously `reason == "fresh, last_scip>=last_changed"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebuildDecision {
+    /// SCIP index exists and timestamps show no changes since last build.
+    Fresh,
+    /// No `.sln` file found; C# indexing is not applicable for this repo.
+    NoSolutionFile,
+    /// The scip-csharp helper binary is not available.
+    HelperUnavailable,
+    /// An indexing task for this alias is already running.
+    AlreadyInFlight,
+    /// The config lock was poisoned; retry later.
+    ConfigPoisoned,
+    /// No SCIP index exists yet; a first build is needed.
+    NoIndex,
+    /// The repo has changed since the last SCIP build.
+    ChangedSinceLastBuild,
+}
+
+impl RebuildDecision {
+    fn needs_rebuild(self) -> bool {
+        matches!(self, Self::NoIndex | Self::ChangedSinceLastBuild)
+    }
+}
+
 impl ServeState {
     fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
         let mut sys = sysinfo::System::new();
@@ -397,7 +425,7 @@ impl ServeState {
         best
     }
 
-    /// Returns (needs_rebuild, reason) for C# SCIP phase-2 evaluation.
+    /// Evaluates whether a C# SCIP rebuild is needed and why.
     ///
     /// Always bootstraps `last_changed_unix` when missing — even for repos
     /// that have no index yet — so phase-2 can sort *all* candidates by
@@ -411,16 +439,16 @@ impl ServeState {
         alias: &str,
         repo_path: &Path,
         db_path: &Path,
-    ) -> (bool, &'static str) {
+    ) -> RebuildDecision {
         if !Self::has_solution_file(repo_path) {
-            return (false, "no .sln");
+            return RebuildDecision::NoSolutionFile;
         }
 
         let Some(indexer) = self.symbol_registry.get(LANG_CSHARP) else {
-            return (false, "helper not available");
+            return RebuildDecision::HelperUnavailable;
         };
         if !indexer.is_available() {
-            return (false, "helper not available");
+            return RebuildDecision::HelperUnavailable;
         }
 
         let status = self
@@ -429,7 +457,7 @@ impl ServeState {
             .map(|e| *e.value())
             .unwrap_or(CSharpIndexStatus::None);
         if matches!(status, CSharpIndexStatus::Indexing) {
-            return (false, "indexing already in flight");
+            return RebuildDecision::AlreadyInFlight;
         }
 
         // Bootstrap last_changed_unix UP FRONT (before the has_index branch),
@@ -437,7 +465,7 @@ impl ServeState {
         let (last_changed, last_scip, touched_bootstrap) = {
             let mut cfg = match self.config.write() {
                 Ok(c) => c,
-                Err(_) => return (false, "config lock poisoned"),
+                Err(_) => return RebuildDecision::ConfigPoisoned,
             };
             let mut meta = cfg.meta(alias);
             let mut touched = false;
@@ -460,13 +488,13 @@ impl ServeState {
         }
 
         if !indexer.has_index(db_path) {
-            return (true, "no index, first build");
+            return RebuildDecision::NoIndex;
         }
 
         if last_changed > last_scip {
-            (true, "changed since last build")
+            RebuildDecision::ChangedSinceLastBuild
         } else {
-            (false, "fresh, last_scip>=last_changed")
+            RebuildDecision::Fresh
         }
     }
 
@@ -557,11 +585,11 @@ impl ServeState {
                 None => continue,
             };
             let db_path = path.join(DB_DIR_NAME);
-            let (needs, reason) = self.evaluate_csharp_rebuild(alias, &path, &db_path);
-            if !needs {
+            let decision = self.evaluate_csharp_rebuild(alias, &path, &db_path);
+            if !decision.needs_rebuild() {
                 // If the SCIP index exists and is fresh, mark C# status as Ready
                 // so the TUI shows the C# indicator (e.g. "C#·") instead of None.
-                if reason == "fresh, last_scip>=last_changed" {
+                if decision == RebuildDecision::Fresh {
                     let mut status = self
                         .csharp_index_status
                         .get(alias)
@@ -572,7 +600,7 @@ impl ServeState {
                     }
                     self.csharp_index_status.insert(alias.to_string(), status);
                 }
-                info!("phase-2: skip '{}' — {}", alias, reason);
+                info!("phase-2: skip '{}' — {:?}", alias, decision);
                 continue;
             }
             let last_changed = self
@@ -582,8 +610,8 @@ impl ServeState {
                 .and_then(|c| c.meta(alias).last_changed_unix)
                 .unwrap_or(0);
             info!(
-                "phase-2: queued '{}' — {} (last_changed={})",
-                alias, reason, last_changed
+                "phase-2: queued '{}' — {:?} (last_changed={})",
+                alias, decision, last_changed
             );
             candidates.push((alias.clone(), last_changed));
         }
@@ -907,7 +935,7 @@ impl ServeState {
                 }
                 RepoState::Readonly { .. } => {
                     // Cannot force-reindex a readonly store; let the caller
-                    // fall through to try_open_stores(create_if_missing=true)
+                    // fall through to try_open_stores(allow_create=true)
                     // which will attempt a write-mode open (and fail with a
                     // clear error if the write lock is still held).
                     return None;
@@ -1381,15 +1409,15 @@ impl ServeState {
 
     /// Opens (or creates) LMDB/Tantivy stores for the repo at db_path.
     ///
-    /// create_if_missing=false: warmup / incremental reindex path.
-    /// create_if_missing=true:  force-reindex / add-repo path, creates fresh DB.
+    /// `allow_create=false`: warmup / incremental reindex path — fails if DB is missing.
+    /// `allow_create=true`:  force-reindex / add-repo path — creates fresh DB if missing.
     fn try_open_stores(
         &self,
         alias: &str,
         db_path: &Path,
-        create_if_missing: bool,
+        allow_create: bool,
     ) -> std::result::Result<OpenedStores, String> {
-        if !db_path.exists() && !create_if_missing {
+        if !db_path.exists() && !allow_create {
             let parent = db_path
                 .parent()
                 .map(|p| p.display().to_string())
@@ -1411,7 +1439,7 @@ impl ServeState {
                 Ok(OpenedStores::Write(Arc::new(s)))
             }
             Err(write_err) => {
-                if create_if_missing {
+                if allow_create {
                     return Err(format!(
                         "Failed to open/create database for {}: {}",
                         alias, write_err
@@ -2018,6 +2046,13 @@ async fn trigger_symbol_rebuild(
         .insert(alias.to_string(), CSharpIndexStatus::Indexing);
     // Mark as actively indexing so the TUI status column shows "Indexing"
     // (not just the C# indicator). This mirrors what reindex_handler does.
+    //
+    // Known benign race: if the FSW-SCIP rebuild path (indexing_cb) fires for
+    // the same alias simultaneously, both paths insert into active_reindexes.
+    // Because DashSet::insert is idempotent, there is no data corruption.
+    // However, whichever path finishes first will call remove(), which may
+    // briefly flip the TUI back to Warm/Open while the other path is still
+    // running. This is a cosmetic flash only — no state is corrupted.
     state.active_reindexes.insert(alias.to_string());
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
@@ -2197,7 +2232,7 @@ async fn reindex_handler(
             Some(s) => s,
             None => {
                 // FSW not running -- open existing or create fresh DB.
-                // create_if_missing=true so a force-reindex can recover a deleted DB.
+                // allow_create=true so a force-reindex can recover a deleted DB.
                 let cancel = CancellationToken::new();
                 match state.try_open_stores(&alias, &db_path, true) {
                     Ok(OpenedStores::Write(s)) => {
@@ -2333,10 +2368,6 @@ struct AddRepoRequest {
     path: PathBuf,
     /// Optional alias to register under. If omitted, the directory name is used.
     alias: Option<String>,
-    /// Create a global index instead of local.
-    #[serde(default)]
-    #[allow(dead_code)]
-    global: bool,
 }
 
 /// Add-repo handler: POST /repos
@@ -2429,7 +2460,7 @@ async fn add_repo_handler(
     let stores = match state.try_open_stores(&alias, &db_path, true) {
         Ok(OpenedStores::Write(s)) => s,
         Ok(OpenedStores::Readonly(_)) => {
-            unreachable!("try_open_stores(create_if_missing=true) never returns Readonly")
+            unreachable!("try_open_stores(allow_create=true) never returns Readonly")
         }
         Err(e) => {
             // Clean up the config entry we just added
@@ -2462,10 +2493,18 @@ async fn add_repo_handler(
 
     // Guard against concurrent reindex for the same alias.
     if !state.active_reindexes.insert(alias.clone()) {
-        // Clean up the Write registration + cancel the token we just created,
-        // so the leaked LMDB handle is released and the alias reverts to Conflicted.
+        // Another reindex for this alias is already in progress.
+        // We must undo *all* side-effects created so far:
+        //   1. Cancel the token and remove from repos (releases the LMDB handle).
+        //   2. Unregister from config — the alias was persisted to repos.json a
+        //      few lines above. Without this cleanup the alias would remain in
+        //      repos.json with no open stores until the server is restarted.
         cancel_token.cancel();
         state.repos.remove(&alias);
+        if let Ok(mut config) = state.config.write() {
+            config.unregister_alias(&alias);
+            let _ = config.save();
+        }
         return (
             StatusCode::CONFLICT,
             axum::response::Json(json!({
