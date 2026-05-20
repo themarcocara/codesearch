@@ -19,7 +19,9 @@ use crate::vectordb::VectorStore;
 
 // Index manager module
 mod manager;
-pub use manager::{is_database_locked, CSharpRebuildNotifier, IndexManager, SharedStores};
+pub use manager::{
+    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores,
+};
 
 /// Update metadata.json with current chunk/file counts so that `status(projects)`
 /// can report accurate numbers without opening LMDB.

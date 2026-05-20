@@ -48,6 +48,8 @@ use serde::{Deserialize, Serialize};
 use super::scip_parse;
 use super::{PrewarmSummary, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
+use crate::constants::{SCIP_LMDB_DEFAULT_MAP_SIZE_MB, SCIP_LMDB_MAP_SIZE_MB_ENV};
+
 // ── Constants ─────────────────────────────────────────────────────
 
 /// LMDB database name for the SCIP symbol table (definitions only after Opt 2).
@@ -354,8 +356,17 @@ impl CSharpSymbolIndexer {
 
         // SAFETY: same pattern as vectordb/store.rs — LMDB mmap contract.
         // TrackedEnv additionally prevents double-open within the same process.
+        //
+        // map_size is virtual address space (not RSS). 512 MB default is safe on
+        // both Windows and POSIX; the OS only faults in pages that are written.
+        // Enterprise repos with thousands of symbols + Phase-3 ref_cache can
+        // exceed the old 64 MB limit, causing MDB_MAP_FULL on cache writes.
+        let map_size_mb = std::env::var(SCIP_LMDB_MAP_SIZE_MB_ENV)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(SCIP_LMDB_DEFAULT_MAP_SIZE_MB);
         let mut opts = EnvOpenOptions::new();
-        opts.map_size(64 * 1024 * 1024).max_dbs(10); // 64MB, 5 named DBs + headroom
+        opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
         let env =
             unsafe { TrackedEnv::open(&opts, &scip_dir, &format!("SCIP({})", db_path.display()))? };
 

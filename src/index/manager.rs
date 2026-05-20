@@ -46,6 +46,14 @@ use super::Result;
 /// without coupling `IndexManager` to `ServeState`.
 pub type CSharpRebuildNotifier = Arc<dyn Fn(bool, Option<String>) + Send + Sync>;
 
+/// Callback to notify the serve layer that text/vector indexing is active or idle.
+///
+/// Arguments: `(active: bool)` — `true` when indexing starts, `false` when it completes.
+///
+/// The serve layer uses this to update `active_reindexes` so the TUI shows "Indexing"
+/// during file-watcher-triggered refreshes (branch changes, batch flushes).
+pub type IndexingStatusCallback = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// Batch flush timeout in milliseconds.
 /// Events are batched and flushed when:
 /// 1. No new events for this duration, OR
@@ -787,6 +795,10 @@ impl IndexManager {
     ///   rebuild. Pass `Some(notifier)` from the serve layer to propagate rebuild outcomes to the
     ///   TUI (`csharp_index_status` / `csharp_index_error`). `None` is valid for standalone /
     ///   test use where no TUI status tracking is needed.
+    /// * `indexing_status_cb` — Optional callback invoked with `true` when text/vector indexing
+    ///   starts and `false` when it completes. The serve layer uses this to update
+    ///   `active_reindexes` so the TUI shows "Indexing" during watcher-triggered refreshes.
+    ///   `None` is valid for standalone/test use.
     ///
     /// # Returns
     /// * `Result<()>` - Success or error
@@ -803,6 +815,7 @@ impl IndexManager {
         &self,
         cancel_token: CancellationToken,
         csharp_notifier: Option<CSharpRebuildNotifier>,
+        indexing_status_cb: Option<IndexingStatusCallback>,
     ) -> Result<()> {
         let path = self.codebase_path.clone();
         let db_path = self.db_path.clone();
@@ -810,6 +823,7 @@ impl IndexManager {
         let stores = self.stores.clone();
         let git_head_watcher = self.git_head_watcher.clone();
         let symbol_registry = self.symbol_registry.clone();
+        let indexing_cb = indexing_status_cb.clone();
 
         info!("🚀 Starting background file watcher...");
 
@@ -859,12 +873,20 @@ impl IndexManager {
                     if let Ok(branch_changed) = watcher.check().await {
                         if branch_changed.is_some() {
                             info!("🔀 Git branch changed, triggering full incremental refresh...");
+                            // Notify serve layer: indexing active
+                            if let Some(ref cb) = indexing_cb {
+                                cb(true);
+                            }
                             // Perform a real incremental refresh: walk filesystem,
                             // detect changed/deleted files, clean stale chunks, re-index
                             if let Err(e) =
                                 Self::refresh_index_with_stores(&path, &db_path, &stores).await
                             {
                                 error!("❌ Branch change refresh failed: {}", e);
+                            }
+                            // Notify serve layer: indexing idle
+                            if let Some(ref cb) = indexing_cb {
+                                cb(false);
                             }
                             // Clear any buffered file events that arrived during the
                             // branch switch — the full refresh already handled everything
@@ -1012,6 +1034,12 @@ impl IndexManager {
                             let rp = path.clone();
                             let dp = db_path.clone();
                             let notifier = csharp_notifier.clone();
+                            // Clone indexing_cb so the SCIP rebuild can signal
+                            // active_reindexes (and therefore show "Indexing" in
+                            // the TUI) for the duration of the symbol rebuild —
+                            // separate from the text-index callback used for
+                            // branch-change refreshes above.
+                            let indexing_cb_scip = indexing_cb.clone();
                             tokio::task::spawn_blocking(move || {
                                 if let Some(indexer) = reg.get(LANG_CSHARP) {
                                     if !indexer.applies_to(&rp) {
@@ -1023,6 +1051,12 @@ impl IndexManager {
                                     if !indexer.is_available() {
                                         info!("🔬 symbol rebuild skipped: helper not available");
                                         return;
+                                    }
+
+                                    // Signal "Indexing" to the TUI now that we know
+                                    // a real SCIP rebuild will actually run.
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(true);
                                     }
 
                                     // Group modified files by their containing .csproj
@@ -1069,6 +1103,10 @@ impl IndexManager {
                                                     n(false, Some(e.to_string()));
                                                 }
                                             }
+                                        }
+                                        // Clear "Indexing" regardless of outcome
+                                        if let Some(ref cb) = indexing_cb_scip {
+                                            cb(false);
                                         }
                                         return;
                                     }
@@ -1135,6 +1173,10 @@ impl IndexManager {
                                             None => n(true, None),
                                             Some(msg) => n(false, Some(msg)),
                                         }
+                                    }
+                                    // Clear "Indexing" now that all groups are done
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(false);
                                     }
                                 }
                             });

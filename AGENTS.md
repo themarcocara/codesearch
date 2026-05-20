@@ -28,10 +28,12 @@ Add symbol-aware reference lookups to codesearch via `find_impact` MCP tool. Ret
 - **Sequential phase-2 startup** — Phase 1 warms repos sequentially, Phase 2 runs gated C# SCIP rebuilds ordered by `last_changed_unix` under `Semaphore(concurrency)` via `CSHARP_SCIP_CONCURRENCY` env (default **2**, clamp [1,4])
 - **`repos_meta` tracking** — `RepoMeta` (last_changed_unix, last_scip_indexed_unix) persisted in `repos.json` with debounced save (10s window)
 - **TUI C# indicator** — in status column: green `C#·` ready, yellow `C#…` indexing, red `C#!` error; footer shows helper availability; Calls column with tool call count
+- **Phase 2 & 3 TUI feedback** — Phase 2 pre-marks all queued candidates as `C#…` immediately on discovery (before semaphore slot); Phase 3 pre-warm sets `csharp_index_status = Indexing` before `batch-find-refs` and restores `Ready` after — TUI shows `C#…` throughout without touching `active_reindexes` (avoids blocking HTTP /reindex)
 - **Selective ref cache invalidation** — incremental rebuilds only purge cached refs for affected symbols, not entire cache
 - **Phase 3 pre-warm** — after Phase 2 definitions, `scip-csharp batch-find-refs` resolves all uncached symbols in a single workspace session; controlled by `CSHARP_PREWARM_ENABLED` env (default: true)
 - **`index symbol` CLI** — `codesearch index symbol [-f] <alias>` for symbol-only rebuild; `--symbols` flag on `index -f` for combined text+symbol rebuild
 - **Watcher .csproj grouping** — changed .cs files grouped by .csproj, incremental rebuild per project instead of full solution
+- **SCIP LMDB map_size 512 MB** — increased from 64 MB (was causing `MDB_MAP_FULL` on enterprise repos when Phase-3 ref_cache exceeded 64 MB); override with `CODESEARCH_SCIP_LMDB_MAP_MB` env var; virtual address space only (no RAM cost on pages not written)
 
 ## Architecture
 
@@ -85,18 +87,19 @@ Missing helper disables `find_impact` for C# only — all other features keep wo
 
 The trait includes `as_any()` for downcasting to concrete types (needed for Phase 3 pre-warm which calls `CSharpSymbolIndexer::prewarm_ref_cache()`).
 
-## Current commit state (2026-05-06)
+## Current commit state (2026-05-20)
 
-Latest commits on `features/symbol-references`:
-- `35bbf36` fix: review remarks (double-Env, partial-class merge, META_SYMBOL_COUNT, temp collision)
-- `bb8c1c8` feat: Opt1+2+3 — filter external types, lazy refs, incremental merge
-- `6fc7861` feat: live progress streaming from scip-csharp (stage 6)
-- `88a8f01` fix: ordering + concurrency default=2 (stage 5)
-- `becc518` fix: IncludeAllContentForSelfExtract + MSBuild registration (stage 4)
-- `4ed0a3f` fix: applies_to + non-C# repos red TUI (stage 3)
+Branch: `fix/tui-indexing-status`
 
-**Status**: `cargo check` + `cargo clippy` clean, `dotnet build` clean.
-**Deployed**: Run `..\copy-to-common.ps1` to deploy to `~/.local/bin/`.
+Latest commits:
+- `6a0d637` tests: add unit tests for SCIP LMDB map_size constant and env-var override
+- `d2b4ce0` docs: update AGENTS.md — v1.0.120, Phase 2/3 TUI status feature documented
+- `ce6dad1` fix: Phase 2 queued candidates + Phase 3 pre-warm now signal TUI C# Indexing status
+- `e4fe2ab` chore: version bump to 1.0.119
+- `26b1833` fix: FSW SCIP rebuild signals indexing_cb so TUI shows Indexing during watcher-triggered symbol rebuild
+
+**Status**: `cargo check` + `cargo clippy` clean. All 6 unit tests in `symbols_csharp_test` pass. **Deployed as v1.0.124** (pre-commit hook auto-bumped).
+**To redeploy**: Run `..\copy-to-common.ps1`.
 
 ## Known Bugs (field-tested 2026-05-07 on ExampleRepo)
 

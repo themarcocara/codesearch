@@ -253,6 +253,20 @@ pub const CSHARP_PREWARM_ENABLED_ENV: &str = "CSHARP_PREWARM_ENABLED";
 /// Limits the batch size to avoid excessive memory usage on large solutions.
 pub const CSHARP_PREWARM_MAX_SYMBOLS: usize = 5000;
 
+/// Default LMDB map size (MB) for the SCIP symbol index per repo.
+///
+/// This is virtual address space, not physical memory. On POSIX and Windows the
+/// OS only faults in pages that are actually written, so 512 MB has no RAM cost
+/// on typical repos. Enterprise C# repos with thousands of symbols and their
+/// reference caches (Phase 3) can push past the old 64 MB limit.
+///
+/// Override at runtime with `CODESEARCH_SCIP_LMDB_MAP_MB` (integer, in MB).
+pub const SCIP_LMDB_DEFAULT_MAP_SIZE_MB: usize = 512;
+
+/// Environment variable to override the SCIP LMDB map size in megabytes.
+/// When set, takes precedence over `SCIP_LMDB_DEFAULT_MAP_SIZE_MB`.
+pub const SCIP_LMDB_MAP_SIZE_MB_ENV: &str = "CODESEARCH_SCIP_LMDB_MAP_MB";
+
 /// Debounce window (seconds) for persisting repos.json metadata updates.
 /// Coalesces bursts of file changes into a single write.
 pub const PERSIST_DEBOUNCE_SECS: u64 = 10;

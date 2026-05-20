@@ -26,25 +26,6 @@ struct LmdbEntry {
     opened_at: Instant,
 }
 
-/// Check whether `path` is already registered (for diagnostics).
-#[allow(dead_code)]
-pub fn is_registered(path: &Path) -> bool {
-    let registry = match LMDB_REGISTRY.get() {
-        Some(r) => r,
-        None => return false,
-    };
-    match path.canonicalize() {
-        Ok(canonical) => registry.contains_key(&canonical),
-        Err(_) => false,
-    }
-}
-
-/// Return the number of currently tracked LMDB environments (for diagnostics).
-#[allow(dead_code)]
-pub fn tracked_count() -> usize {
-    LMDB_REGISTRY.get().map(|r| r.len()).unwrap_or(0)
-}
-
 fn register(path: &Path, description: &str) -> Result<PathBuf> {
     let registry = LMDB_REGISTRY.get_or_init(DashMap::new);
     let canonical = path
