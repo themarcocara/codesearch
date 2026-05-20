@@ -2466,7 +2466,13 @@ async fn add_repo_handler(
             // Clean up the config entry we just added
             if let Ok(mut config) = state.config.write() {
                 config.unregister_alias(&alias);
-                let _ = config.save();
+                if let Err(e) = config.save() {
+                    tracing::warn!(
+                        "Failed to persist config after add-repo DB open failure for '{}': {}",
+                        alias,
+                        e
+                    );
+                }
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2503,7 +2509,13 @@ async fn add_repo_handler(
         state.repos.remove(&alias);
         if let Ok(mut config) = state.config.write() {
             config.unregister_alias(&alias);
-            let _ = config.save();
+            if let Err(e) = config.save() {
+                tracing::warn!(
+                    "Failed to persist config after add-repo conflict for '{}': {}",
+                    alias,
+                    e
+                );
+            }
         }
         return (
             StatusCode::CONFLICT,
@@ -2541,7 +2553,13 @@ async fn add_repo_handler(
                 state_bg.active_reindexes.remove(&alias_bg);
                 if let Ok(mut config) = state_bg.config.write() {
                     config.unregister_alias(&alias_bg);
-                    let _ = config.save();
+                    if let Err(e) = config.save() {
+                        tracing::warn!(
+                            "Failed to persist config after add-repo index failure for '{}': {}",
+                            alias_bg,
+                            e
+                        );
+                    }
                 }
                 return;
             }
