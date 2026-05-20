@@ -1034,6 +1034,12 @@ impl IndexManager {
                             let rp = path.clone();
                             let dp = db_path.clone();
                             let notifier = csharp_notifier.clone();
+                            // Clone indexing_cb so the SCIP rebuild can signal
+                            // active_reindexes (and therefore show "Indexing" in
+                            // the TUI) for the duration of the symbol rebuild —
+                            // separate from the text-index callback used for
+                            // branch-change refreshes above.
+                            let indexing_cb_scip = indexing_cb.clone();
                             tokio::task::spawn_blocking(move || {
                                 if let Some(indexer) = reg.get(LANG_CSHARP) {
                                     if !indexer.applies_to(&rp) {
@@ -1045,6 +1051,12 @@ impl IndexManager {
                                     if !indexer.is_available() {
                                         info!("🔬 symbol rebuild skipped: helper not available");
                                         return;
+                                    }
+
+                                    // Signal "Indexing" to the TUI now that we know
+                                    // a real SCIP rebuild will actually run.
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(true);
                                     }
 
                                     // Group modified files by their containing .csproj
@@ -1091,6 +1103,10 @@ impl IndexManager {
                                                     n(false, Some(e.to_string()));
                                                 }
                                             }
+                                        }
+                                        // Clear "Indexing" regardless of outcome
+                                        if let Some(ref cb) = indexing_cb_scip {
+                                            cb(false);
                                         }
                                         return;
                                     }
@@ -1157,6 +1173,10 @@ impl IndexManager {
                                             None => n(true, None),
                                             Some(msg) => n(false, Some(msg)),
                                         }
+                                    }
+                                    // Clear "Indexing" now that all groups are done
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(false);
                                     }
                                 }
                             });
