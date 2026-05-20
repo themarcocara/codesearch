@@ -92,13 +92,13 @@ The trait includes `as_any()` for downcasting to concrete types (needed for Phas
 Branch: `fix/tui-indexing-status`
 
 Latest commits:
+- `6a0d637` tests: add unit tests for SCIP LMDB map_size constant and env-var override
+- `d2b4ce0` docs: update AGENTS.md — v1.0.120, Phase 2/3 TUI status feature documented
+- `ce6dad1` fix: Phase 2 queued candidates + Phase 3 pre-warm now signal TUI C# Indexing status
 - `e4fe2ab` chore: version bump to 1.0.119
 - `26b1833` fix: FSW SCIP rebuild signals indexing_cb so TUI shows Indexing during watcher-triggered symbol rebuild
-- `eadc5af` fix: trigger_symbol_rebuild sets active_reindexes so TUI shows Indexing during SCIP rebuild
-- `df00c01` docs: update AGENTS.md — commit state + v1.0.113 deployed
-- `ec83eaf` fix: review remarks on outline_items_for_normalized
 
-**Status**: `cargo check` + `cargo clippy` clean. **Deployed as v1.0.120** (pre-commit hook auto-bumped).
+**Status**: `cargo check` + `cargo clippy` clean. All 6 unit tests in `symbols_csharp_test` pass. **Deployed as v1.0.124** (pre-commit hook auto-bumped).
 **To redeploy**: Run `..\copy-to-common.ps1`.
 
 ## Known Bugs (field-tested 2026-05-07 on ExampleRepo)
