@@ -1062,6 +1062,83 @@ class Calculator:
     }
 
     #[test]
+    fn test_chunk_bash_script_fallback() {
+        // Shell has a tree-sitter grammar but no BashExtractor,
+        // so it falls back to fallback_chunk (sliding window).
+        // This test verifies bash files are still indexed with usable chunks.
+        let mut chunker = SemanticChunker::new(100, 2000, 10);
+
+        let bash_script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+# Deploy script for the application
+DEPLOY_DIR="/opt/app"
+VERSION=""
+
+deploy_application() {
+    echo "Deploying version $VERSION to $DEPLOY_DIR"
+    mkdir -p "$DEPLOY_DIR"
+    cp -r ./dist/* "$DEPLOY_DIR/"
+    systemctl restart app
+}
+
+rollback() {
+    echo "Rolling back to previous version"
+    cp -r ./backup/* "$DEPLOY_DIR/"
+    systemctl restart app
+}
+
+main() {
+    VERSION="$1"
+    deploy_application
+    echo "Deployment complete"
+}
+
+main "$@"
+"#;
+
+        let path = Path::new("deploy.sh");
+
+        // Verify language detection
+        assert_eq!(
+            crate::file::Language::from_path(path),
+            crate::file::Language::Shell,
+            ".sh files should be detected as Shell language"
+        );
+
+        let chunks = chunker
+            .chunk_semantic(crate::file::Language::Shell, path, bash_script)
+            .unwrap();
+
+        // Should produce chunks (via fallback)
+        assert!(
+            !chunks.is_empty(),
+            "Shell files should produce chunks via fallback, got 0"
+        );
+
+        // All chunks should be Block kind (fallback chunking)
+        assert!(
+            chunks.iter().all(|c| c.kind == ChunkKind::Block),
+            "Fallback chunks should all be Block kind"
+        );
+
+        // Chunks should cover the bash content
+        let all_content: String = chunks.iter().map(|c| c.content.as_str()).collect();
+        assert!(
+            all_content.contains("deploy_application"),
+            "Chunks should contain deploy_application function"
+        );
+        assert!(
+            all_content.contains("rollback"),
+            "Chunks should contain rollback function"
+        );
+        assert!(
+            all_content.contains("main"),
+            "Chunks should contain main function"
+        );
+    }
+
+    #[test]
     fn test_context_breadcrumbs() {
         let mut chunker = SemanticChunker::new(100, 2000, 10);
 

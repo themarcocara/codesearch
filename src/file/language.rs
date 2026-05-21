@@ -172,6 +172,21 @@ mod tests {
     }
 
     #[test]
+    fn test_shell_detection() {
+        assert_eq!(Language::from_extension("sh"), Language::Shell);
+        assert_eq!(Language::from_extension("bash"), Language::Shell);
+        assert_eq!(Language::from_extension("zsh"), Language::Shell);
+        assert_eq!(
+            Language::from_path(&PathBuf::from("scripts/deploy.sh")),
+            Language::Shell
+        );
+        // Extensionless shell filenames
+        assert_eq!(Language::from_filename("Dockerfile"), Language::Shell);
+        assert_eq!(Language::from_filename("Makefile"), Language::Shell);
+        assert_eq!(Language::from_filename(".env"), Language::Shell);
+    }
+
+    #[test]
     fn test_tree_sitter_support() {
         assert!(Language::Rust.supports_tree_sitter());
         assert!(Language::Python.supports_tree_sitter());
