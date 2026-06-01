@@ -118,6 +118,9 @@ codesearch index rm /path/to/my-project
 
 # List registered repos
 codesearch index list
+
+# Remove stale entries (relocates moved repos first, then drops the rest)
+codesearch index prune
 ```
 
 `codesearch index add` is intended to be run from inside the repo you want to register.
@@ -312,16 +315,38 @@ Repos are registered via `codesearch index add`:
 
 ```bash
 # Register a repo (creates index + adds to ~/.codesearch/repos.json)
-codesearch index add /path/to/my-project --alias my-project
+codesearch index add /path/to/my-project
 
 # Remove a repo
 codesearch index rm /path/to/my-project
 
 # List registered repos
 codesearch index list
+
+# Clean up stale entries (relocates moved repos, drops the rest)
+codesearch index prune
 ```
 
+The repository **alias** (the key in `repos.json`, used for groups and the MCP
+`project` argument) is always derived automatically from the directory name —
+there is no `--alias` flag.
+
 Serve reads `~/.codesearch/repos.json` on startup and manages all registered repos.
+
+#### Moved or renamed repositories
+
+If you rename or move a registered folder, serve does **not** crash. On startup
+it tries to **relocate** each missing repo automatically: it captures every
+repo's git remote (`remote.origin.url`) at registration, and on a missing path
+it scans nearby folders (bounded depth, override with
+`CODESEARCH_RELOCATE_MAX_DEPTH`, default `3`) for a git checkout with the same
+remote. A single unambiguous match is rewritten into `repos.json`; otherwise the
+entry is logged and skipped (never indexed against a dead path). Run
+`codesearch index prune` to relocate what can be relocated and drop the rest.
+
+A hand-edited `repos.json` is also tolerated: empty entries, orphaned metadata,
+and group references to unknown repos are cleaned up on load rather than
+crashing.
 
 ### Groups
 

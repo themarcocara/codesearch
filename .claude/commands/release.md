@@ -40,9 +40,10 @@ to `develop`). Then **wait for the develop PR to actually merge** (auto-merge wa
      matching history (e.g. `Release v1.0.142 — serve responsive during warmup`).
    - Body ends with: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
    - Capture the PR number: `RELEASE_PR=$(gh pr view develop --json number --jq .number)`.
-4. `gh pr merge "$RELEASE_PR" --auto --merge`. Wait until `state` is
+4. This repo **disallows merge commits** — always use `--squash`, never `--merge`.
+   `gh pr merge "$RELEASE_PR" --auto --squash`. Wait until `state` is
    `MERGED` (poll as in Part 1). If auto-merge is unavailable, `gh pr checks "$RELEASE_PR" --watch`
-   then `gh pr merge "$RELEASE_PR" --merge`. If CI fails, STOP.
+   then `gh pr merge "$RELEASE_PR" --squash`. If CI fails, STOP.
 
 ## Part 3 — tag the release
 1. `git fetch origin --tags && git checkout master && git pull --ff-only origin master`.

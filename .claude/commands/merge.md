@@ -80,9 +80,11 @@ release — tagging happens only in `/release`.
      `PR=$(gh pr view --json number --jq .number)`.
 
 8. **Auto-merge after CI**
-   - `gh pr merge "$PR" --auto --merge` so the PR lands automatically once required checks pass.
+   - This repo **disallows merge commits** — always use `--squash`. NEVER `--merge`
+     (it fails with "Merge commits are not allowed on this repository").
+   - `gh pr merge "$PR" --auto --squash` so the PR lands automatically once required checks pass.
    - If auto-merge is not enabled on the repo (command errors), fall back: poll
-     `gh pr checks "$PR" --watch`, then `gh pr merge "$PR" --merge` once green.
+     `gh pr checks "$PR" --watch`, then `gh pr merge "$PR" --squash` once green.
 
 ## Report
 Branch, pending release version, doc updates made, PR URL, and merge status
