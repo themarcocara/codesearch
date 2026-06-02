@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.153] - 2026-06-02
+
+### Added
+
+- **Auto-prune stale repos during Phase 1 warmup** — when a repo fails warmup
+  because its path or database no longer exists, `codesearch serve` now
+  automatically removes it from `repos.json` and logs a warning, instead of
+  silently retrying on every restart. Works in concert with the relocation pass
+  (reconcile_all_paths): relocatable repos are rewritten first, truly missing
+  ones are pruned.
+
+### Fixed
+
+- **Missing `YELLOW` color variable in `scripts/qc.sh`** — the variable was
+  referenced but never declared, causing a visual glitch in QC output.
+
 ## [1.0.152] - 2026-06-02
 
 ### Added
