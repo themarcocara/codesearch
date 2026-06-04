@@ -19,8 +19,8 @@ jobs:
     steps:
       # pin@v4
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      # pin@v1
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+# pin@stable
+- uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       # pin@v4
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
@@ -40,8 +40,8 @@ jobs:
     steps:
       # pin@v4
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      # pin@v1
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+# pin@stable
+- uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       # pin@v4
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
@@ -66,8 +66,8 @@ jobs:
         run: |
           cd helpers/csharp
           dotnet publish scip-csharp.csproj -c Release -r linux-x64 --self-contained -p:PublishSingleFile=true -o bin/Release/net10.0
-      # pin@v1
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+# pin@stable
+- uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       # pin@v4
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
