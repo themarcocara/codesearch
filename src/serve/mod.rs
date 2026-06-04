@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::response::Json as AxumJson;
+use axum::response::{IntoResponse, Json as AxumJson};
 use colored::Colorize;
 use dashmap::{DashMap, DashSet};
 use rmcp::transport::{
@@ -37,7 +37,7 @@ use crate::constants::{
     CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT,
     CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, LANG_CSHARP,
     MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
-    REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
+    REPO_IDLE_TIMEOUT_SECS, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -2944,6 +2944,76 @@ async fn remove_repo_handler(
     )
 }
 
+/// Axum middleware that requires API key authentication for management endpoints.
+///
+/// When `CODESEARCH_SERVE_API_KEY` is set, requests must include the key in either:
+/// - `Authorization: Bearer <key>` header
+/// - `X-API-Key: <key>` header
+///
+/// When the env var is unset or empty, all requests pass through (backward compatible).
+///
+/// Management endpoints are: `POST /repos`, `DELETE /repos/:alias`,
+/// `POST /repos/:alias/reindex`, `POST /reload`.
+/// All other routes (health, status, MCP) are always unauthenticated.
+///
+/// Note: key comparison uses standard string equality, not constant-time comparison.
+/// Timing attacks are impractical on a localhost-only service.
+async fn require_admin_auth(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let method = req.method().clone();
+
+    // Only management endpoints require auth.
+    let is_management = matches!(path, "/repos" | "/reload")
+        || path.ends_with("/reindex")
+        || (path.starts_with("/repos/") && method == axum::http::Method::DELETE);
+
+    if !is_management {
+        return next.run(req).await;
+    }
+
+    let configured_key = match std::env::var(SERVE_API_KEY_ENV) {
+        Ok(k) if !k.is_empty() => k,
+        _ => return next.run(req).await,
+    };
+
+    // Check Authorization: Bearer <key>
+    if let Some(auth_header) = req.headers().get(axum::http::header::AUTHORIZATION) {
+        if let Ok(auth_val) = auth_header.to_str() {
+            if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
+                if bearer_key == configured_key {
+                    return next.run(req).await;
+                }
+            }
+        }
+    }
+
+    // Check X-API-Key: <key>
+    if let Some(api_key_header) = req.headers().get("X-API-Key") {
+        if let Ok(key_val) = api_key_header.to_str() {
+            if key_val == configured_key {
+                return next.run(req).await;
+            }
+        }
+    }
+
+    warn!(
+        "Rejected unauthenticated management request: {} {}",
+        method, path
+    );
+
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        axum::response::Json(json!({
+            "error": "Unauthorized: valid API key required",
+            "status": "unauthorized"
+        })),
+    )
+        .into_response()
+}
+
 /// Axum middleware: log MCP requests (method + path, skips /health spam).
 async fn log_mcp_requests(
     req: axum::extract::Request,
@@ -3076,13 +3146,16 @@ pub async fn run_serve(
 
     let mcp_service = StreamableHttpService::new(service_factory, session_manager, config);
 
-    // Build axum router with request logging.
+    // Build axum router with request logging and optional admin auth.
     // Stale-session recovery is handled client-side by the stdio proxy's retry
     // loop in `McpProxyService` (see src/mcp/mod.rs). Remote MCP clients that
     // are not spec-compliant must reconnect themselves — we do not attempt a
     // server-side transparent reconnect because that path opened a session leak
     // and could not actually reach OpenCode (TCP keep-alive failure happens
     // before the request hits this middleware).
+    //
+    // Layer order (outermost → innermost): log_mcp_requests → require_admin_auth → handler.
+    // Auth failures are logged because log_mcp_requests wraps the auth layer.
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
         .route(STATUS_PATH, axum::routing::get(status_handler))
@@ -3094,6 +3167,7 @@ pub async fn run_serve(
             axum::routing::post(reindex_handler),
         )
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
+        .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))
         .with_state(serve_state.clone());
 

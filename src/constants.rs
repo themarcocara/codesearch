@@ -149,6 +149,13 @@ pub const DEFAULT_SERVE_PORT: u16 = 39725;
 /// Environment variable to override the serve port.
 pub const SERVE_PORT_ENV: &str = "CODESEARCH_SERVE_PORT";
 
+/// Environment variable to set the admin API key for management endpoints.
+/// When set, all management routes (`POST /repos`, `DELETE /repos/:alias`,
+/// `POST /repos/:alias/reindex`, `POST /reload`) require this key.
+/// When unset or empty, management routes are unauthenticated (backward compatible).
+/// The key is validated against `Authorization: Bearer <key>` or `X-API-Key: <key>` headers.
+pub const SERVE_API_KEY_ENV: &str = "CODESEARCH_SERVE_API_KEY";
+
 /// Default base URL for connecting to a local `codesearch serve` instance.
 /// Used as the clap `--url` default and in `serve_base_url()`.
 ///
