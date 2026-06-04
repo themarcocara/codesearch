@@ -276,7 +276,8 @@ public static class Program
         var lines = await File.ReadAllLinesAsync(solutionPath).ConfigureAwait(false);
 
         // Parse project entries from .sln: Project("{GUID}") = "Name", "RelativePath", "{GUID}"
-        var projectEntries = ParseSolutionProjects(lines);
+        // Paths that resolve outside solutionDir are rejected (path traversal protection).
+        var projectEntries = ParseSolutionProjects(lines, solutionDir);
 
         // Separate supported vs unsupported projects
         var supported = projectEntries
@@ -330,6 +331,15 @@ public static class Program
         foreach (var entry in supported)
         {
             var csprojPath = Path.GetFullPath(Path.Combine(solutionDir, entry.RelativePath));
+
+            // Defense-in-depth: verify containment even though parsing already validates.
+            if (!IsPathWithinRoot(csprojPath, solutionDir))
+            {
+                Console.Error.WriteLine(
+                    $"[WARN] Skipping project outside solution root: '{csprojPath}'");
+                continue;
+            }
+
             if (!File.Exists(csprojPath))
             {
                 Console.Error.WriteLine($"[WARN] Project file not found: {csprojPath}");
@@ -354,8 +364,10 @@ public static class Program
     /// <summary>
     /// Parses project entries from .sln file lines.
     /// Skips solution folders (GUID {2150E333-...}) which have no file path.
+    /// Rejects project paths that resolve outside the solution directory (path traversal).
     /// </summary>
-    private static List<(int LineIndex, string RelativePath)> ParseSolutionProjects(string[] lines)
+    private static List<(int LineIndex, string RelativePath)> ParseSolutionProjects(
+        string[] lines, string solutionDir)
     {
         var result = new List<(int, string)>();
         for (int i = 0; i < lines.Length; i++)
@@ -371,9 +383,42 @@ public static class Program
             // Skip entries that don't look like file paths.
             if (!Path.HasExtension(relativePath)) continue;
 
+            // Security: reject paths that escape the solution directory.
+            var fullProjectPath = Path.GetFullPath(Path.Combine(solutionDir, relativePath));
+            if (!IsPathWithinRoot(fullProjectPath, solutionDir))
+            {
+                Console.Error.WriteLine(
+                    $"[WARN] Skipping project with path traversal: '{relativePath}' " +
+                    $"resolves to '{fullProjectPath}' which is outside solution root '{solutionDir}'");
+                continue;
+            }
+
             result.Add((i, relativePath));
         }
         return result;
+    }
+
+    /// <summary>
+    /// Checks that <paramref name="path"/> is contained within <paramref name="root"/>.
+    /// Both paths are normalized via <see cref="Path.GetFullPath"/> before comparison.
+    /// Returns true if <paramref name="path"/> equals root or is a descendant.
+    /// </summary>
+    private static bool IsPathWithinRoot(string path, string root)
+    {
+        // Normalize both to handle mixed separators, redundant dots, etc.
+        var normalizedPath = Path.GetFullPath(path);
+        var normalizedRoot = Path.GetFullPath(root);
+
+        // Ensure root ends with separator so "/foo" doesn't match "/foobar"
+        var rootPrefix = normalizedRoot;
+        if (!rootPrefix.EndsWith(Path.DirectorySeparatorChar) &&
+            !rootPrefix.EndsWith(Path.AltDirectorySeparatorChar))
+        {
+            rootPrefix += Path.DirectorySeparatorChar;
+        }
+
+        return normalizedPath.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalizedPath, normalizedRoot, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
