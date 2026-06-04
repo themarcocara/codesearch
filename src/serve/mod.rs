@@ -3895,17 +3895,24 @@ mod tests {
 
     /// Unit tests for `validate_path_within_allowed_roots`.
     ///
-    /// These tests temporarily set/remove the `CODESEARCH_ALLOWED_ROOTS` env var,
-    /// which is safe because the function reads it on every call and the env is
-    /// process-local.
+    /// These tests temporarily set/remove the `CODESEARCH_ALLOWED_ROOTS` env var.
+    /// A static Mutex serializes env mutation to prevent races under parallel test execution.
     #[cfg(test)]
     mod allowed_roots_tests {
         use super::*;
         use std::path::PathBuf;
+        use std::sync::Mutex;
 
-        /// Helper: create a temp dir, return its canonical path.
-        fn temp_root() -> PathBuf {
-            let dir = std::env::temp_dir().join("codesearch_test_roots");
+        /// Global lock to serialize env var mutations across parallel test threads.
+        static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        }
+
+        /// Helper: create a unique temp dir per test, return its canonical path.
+        fn temp_root(suffix: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("codesearch_test_roots_{}", suffix));
             let _ = std::fs::create_dir_all(&dir);
             safe_canonicalize(&dir).unwrap()
         }
@@ -3920,14 +3927,15 @@ mod tests {
 
         #[test]
         fn env_unset_allows_all() {
+            let _guard = lock();
             clear_env();
             let path = PathBuf::from("/some/random/path");
-            // Should pass regardless
             assert!(validate_path_within_allowed_roots(&path).is_ok());
         }
 
         #[test]
         fn env_empty_allows_all() {
+            let _guard = lock();
             set_env("");
             let path = PathBuf::from("/some/random/path");
             assert!(validate_path_within_allowed_roots(&path).is_ok());
@@ -3936,7 +3944,8 @@ mod tests {
 
         #[test]
         fn path_within_root_is_allowed() {
-            let root = temp_root();
+            let _guard = lock();
+            let root = temp_root("within");
             set_env(&root.display().to_string());
             let child = root.join("my-project");
             let _ = std::fs::create_dir_all(&child);
@@ -3947,40 +3956,40 @@ mod tests {
 
         #[test]
         fn exact_root_match_is_allowed() {
-            let root = temp_root();
+            let _guard = lock();
+            let root = temp_root("exact");
             set_env(&root.display().to_string());
-            // The root itself should be allowed (starts_with returns true for self)
             assert!(validate_path_within_allowed_roots(&root).is_ok());
             clear_env();
         }
 
         #[test]
         fn path_outside_root_is_rejected() {
-            let root = temp_root();
+            let _guard = lock();
+            let root = temp_root("outside");
             set_env(&root.display().to_string());
+            // Construct a path guaranteed outside the temp root
             let outside = if cfg!(windows) {
                 PathBuf::from("C:\\Windows\\System32")
             } else {
-                PathBuf::from("/etc/passwd")
+                PathBuf::from("/etc")
             };
-            // The outside path may not exist in all environments, so use a non-canonical check
-            // Just test with a path that definitely isn't under root
+            assert!(
+                !outside.starts_with(&root),
+                "Test setup error: outside path '{}' must not overlap root '{}'",
+                outside.display(),
+                root.display()
+            );
             let result = validate_path_within_allowed_roots(&outside);
-            // If the path doesn't exist it won't be canonical anyway, but the function
-            // receives an already-canonicalized path from callers. Test with the temp root.
-            if outside.starts_with(&root) {
-                // Edge case: unlikely but handle gracefully
-            } else {
-                assert!(result.is_err(), "Expected rejection for path outside root");
-                assert!(result.unwrap_err().contains("outside allowed roots"));
-            }
+            assert!(result.is_err(), "Expected rejection for path outside root");
+            assert!(result.unwrap_err().contains("outside allowed roots"));
             clear_env();
         }
 
         #[test]
         fn all_nonexistent_roots_rejects() {
+            let _guard = lock();
             set_env("/nonexistent/path/abc;/also/nonexistent/xyz");
-            // None of these roots exist, so the function should reject for safety
             let some_path = std::env::temp_dir();
             let canonical = safe_canonicalize(&some_path).unwrap();
             let result = validate_path_within_allowed_roots(&canonical);
@@ -3991,8 +4000,8 @@ mod tests {
 
         #[test]
         fn semicolons_with_empty_segments_works() {
-            let root = temp_root();
-            // Empty segments from leading/trailing/duplicate semicolons should be ignored
+            let _guard = lock();
+            let root = temp_root("semicolons");
             set_env(&format!(";{};;", root.display()));
             let child = root.join("project");
             let _ = std::fs::create_dir_all(&child);
@@ -4003,10 +4012,9 @@ mod tests {
 
         #[test]
         fn multiple_roots_any_match() {
-            let root1 = temp_root();
-            let root2 = std::env::temp_dir().join("codesearch_test_roots_2");
-            let _ = std::fs::create_dir_all(&root2);
-            let root2 = safe_canonicalize(&root2).unwrap();
+            let _guard = lock();
+            let root1 = temp_root("multi1");
+            let root2 = temp_root("multi2");
 
             set_env(&format!("{};{}", root1.display(), root2.display()));
 
