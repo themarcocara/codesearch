@@ -256,17 +256,25 @@ impl CSharpSymbolIndexer {
         if let Ok(path) = std::env::var(HELPER_ENV_VAR) {
             let p = PathBuf::from(&path);
             if p.exists() {
-                tracing::debug!("scip-csharp helper found via {}={}", HELPER_ENV_VAR, path);
-                return Some(p);
+                if let Some(validated) = Self::validate_helper_path(&p) {
+                    tracing::debug!("scip-csharp helper found via {}={}", HELPER_ENV_VAR, path);
+                    return Some(validated);
+                }
+                tracing::warn!(
+                    "{}={} does not point to a valid scip-csharp binary (filename mismatch), falling back",
+                    HELPER_ENV_VAR,
+                    path
+                );
+            } else {
+                tracing::warn!(
+                    "{}={} does not exist, falling back to default search",
+                    HELPER_ENV_VAR,
+                    path
+                );
             }
-            tracing::warn!(
-                "{}={} does not exist, falling back to default search",
-                HELPER_ENV_VAR,
-                path
-            );
         }
 
-        // 2. Next to the codesearch binary
+        // 2. Next to the codesearch binary (trusted — constructed from constant)
         if let Ok(exe) = std::env::current_exe() {
             if let Some(exe_dir) = exe.parent() {
                 let bin_name = if cfg!(windows) {
@@ -297,13 +305,51 @@ impl CSharpSymbolIndexer {
                     .to_string();
                 let p = PathBuf::from(&path_str);
                 if p.exists() {
-                    tracing::debug!("scip-csharp helper found on PATH: {}", path_str);
-                    return Some(p);
+                    if let Some(validated) = Self::validate_helper_path(&p) {
+                        tracing::debug!("scip-csharp helper found on PATH: {}", path_str);
+                        return Some(validated);
+                    }
+                    tracing::warn!(
+                        "PATH-resolved helper at {} has unexpected filename, skipping",
+                        path_str
+                    );
                 }
             }
         }
 
         None
+    }
+
+    /// Validate that the resolved helper path points to a file whose name matches
+    /// the expected `scip-csharp` binary (with platform-appropriate extension).
+    ///
+    /// This prevents command injection where an attacker sets the env var or
+    /// manipulates PATH to point to an arbitrary executable.
+    fn validate_helper_path(path: &Path) -> Option<PathBuf> {
+        if !path.is_file() {
+            tracing::warn!("Helper path is not a regular file: {}", path.display());
+            return None;
+        }
+
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        // Build the expected filename for this platform
+        let expected = if cfg!(windows) {
+            format!("{}.exe", HELPER_BIN_NAME)
+        } else {
+            HELPER_BIN_NAME.to_string()
+        };
+
+        if file_name.eq_ignore_ascii_case(&expected) {
+            Some(path.to_path_buf())
+        } else {
+            tracing::warn!(
+                "Helper filename '{}' does not match expected '{}'",
+                file_name,
+                expected
+            );
+            None
+        }
     }
 
     /// Find the solution file in a repo directory.
