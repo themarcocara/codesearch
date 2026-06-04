@@ -2993,10 +2993,11 @@ fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Res
         ));
     }
 
-    let allowed = canonical_roots.iter().any(|root| {
-        canonical_path.starts_with(root) || canonical_path.as_os_str() == root.as_os_str()
-        // exact match
-    });
+    // Path::starts_with returns true for exact match too (a path starts with itself),
+    // so no separate equality check is needed.
+    let allowed = canonical_roots
+        .iter()
+        .any(|root| canonical_path.starts_with(root));
 
     if allowed {
         Ok(())
@@ -3889,6 +3890,139 @@ mod tests {
             );
             let body: serde_json::Value = resp2.json().await.unwrap();
             assert_eq!(body["status"], "conflict");
+        }
+    }
+
+    /// Unit tests for `validate_path_within_allowed_roots`.
+    ///
+    /// These tests temporarily set/remove the `CODESEARCH_ALLOWED_ROOTS` env var,
+    /// which is safe because the function reads it on every call and the env is
+    /// process-local.
+    #[cfg(test)]
+    mod allowed_roots_tests {
+        use super::*;
+        use std::path::PathBuf;
+
+        /// Helper: create a temp dir, return its canonical path.
+        fn temp_root() -> PathBuf {
+            let dir = std::env::temp_dir().join("codesearch_test_roots");
+            let _ = std::fs::create_dir_all(&dir);
+            safe_canonicalize(&dir).unwrap()
+        }
+
+        fn clear_env() {
+            std::env::remove_var(ALLOWED_ROOTS_ENV);
+        }
+
+        fn set_env(val: &str) {
+            std::env::set_var(ALLOWED_ROOTS_ENV, val);
+        }
+
+        #[test]
+        fn env_unset_allows_all() {
+            clear_env();
+            let path = PathBuf::from("/some/random/path");
+            // Should pass regardless
+            assert!(validate_path_within_allowed_roots(&path).is_ok());
+        }
+
+        #[test]
+        fn env_empty_allows_all() {
+            set_env("");
+            let path = PathBuf::from("/some/random/path");
+            assert!(validate_path_within_allowed_roots(&path).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn path_within_root_is_allowed() {
+            let root = temp_root();
+            set_env(&root.display().to_string());
+            let child = root.join("my-project");
+            let _ = std::fs::create_dir_all(&child);
+            let canonical_child = safe_canonicalize(&child).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn exact_root_match_is_allowed() {
+            let root = temp_root();
+            set_env(&root.display().to_string());
+            // The root itself should be allowed (starts_with returns true for self)
+            assert!(validate_path_within_allowed_roots(&root).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn path_outside_root_is_rejected() {
+            let root = temp_root();
+            set_env(&root.display().to_string());
+            let outside = if cfg!(windows) {
+                PathBuf::from("C:\\Windows\\System32")
+            } else {
+                PathBuf::from("/etc/passwd")
+            };
+            // The outside path may not exist in all environments, so use a non-canonical check
+            // Just test with a path that definitely isn't under root
+            let result = validate_path_within_allowed_roots(&outside);
+            // If the path doesn't exist it won't be canonical anyway, but the function
+            // receives an already-canonicalized path from callers. Test with the temp root.
+            if outside.starts_with(&root) {
+                // Edge case: unlikely but handle gracefully
+            } else {
+                assert!(result.is_err(), "Expected rejection for path outside root");
+                assert!(result.unwrap_err().contains("outside allowed roots"));
+            }
+            clear_env();
+        }
+
+        #[test]
+        fn all_nonexistent_roots_rejects() {
+            set_env("/nonexistent/path/abc;/also/nonexistent/xyz");
+            // None of these roots exist, so the function should reject for safety
+            let some_path = std::env::temp_dir();
+            let canonical = safe_canonicalize(&some_path).unwrap();
+            let result = validate_path_within_allowed_roots(&canonical);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("No valid roots found"));
+            clear_env();
+        }
+
+        #[test]
+        fn semicolons_with_empty_segments_works() {
+            let root = temp_root();
+            // Empty segments from leading/trailing/duplicate semicolons should be ignored
+            set_env(&format!(";{};;", root.display()));
+            let child = root.join("project");
+            let _ = std::fs::create_dir_all(&child);
+            let canonical_child = safe_canonicalize(&child).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn multiple_roots_any_match() {
+            let root1 = temp_root();
+            let root2 = std::env::temp_dir().join("codesearch_test_roots_2");
+            let _ = std::fs::create_dir_all(&root2);
+            let root2 = safe_canonicalize(&root2).unwrap();
+
+            set_env(&format!("{};{}", root1.display(), root2.display()));
+
+            // Path under root1
+            let child1 = root1.join("project");
+            let _ = std::fs::create_dir_all(&child1);
+            let canonical1 = safe_canonicalize(&child1).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical1).is_ok());
+
+            // Path under root2
+            let child2 = root2.join("project");
+            let _ = std::fs::create_dir_all(&child2);
+            let canonical2 = safe_canonicalize(&child2).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical2).is_ok());
+
+            clear_env();
         }
     }
 }
