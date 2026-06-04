@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.0.171] - 2026-06-04
+
+### Security
+
+- **API key authentication for management endpoints** — management HTTP
+  routes (`POST /repos`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex`,
+  `POST /reload`) now require an API key when the `CODESEARCH_SERVE_API_KEY`
+  environment variable is set. Supports both `Authorization: Bearer <key>` and
+  `X-API-Key: <key>` headers. Backward compatible: unset/empty env var = no
+  authentication required. Health, status, and MCP endpoints remain
+  unauthenticated.
+- **Path containment validation for repo registration** — `POST /repos` and
+  `--register` now validate the requested filesystem path against a configurable
+  allowlist. Set `CODESEARCH_ALLOWED_ROOTS` to a semicolon-separated list of
+  allowed root directories. Paths resolving outside any configured root are
+  rejected with 403 Forbidden. Backward compatible: unset/empty env var = all
+  paths allowed. Fails closed when all configured roots are invalid.
+- **Path traversal fix in C# indexing helper** — `ParseSolutionProjects` in
+  `Program.cs` now validates that each `.sln` project path resolves within the
+  repository root, preventing `..` traversal from indexing files outside the
+  repository. Defense-in-depth: the fallback `OpenProjectAsync` path also
+  validates containment.
+- **Command injection fix in C# helper detection** — `validate_helper_path` in
+  `csharp.rs` verifies that helper binaries resolved from the `CODESEARCH_SCIP_CSHARP`
+  env var or PATH lookup have the expected filename (`scip-csharp` /
+  `scip-csharp.exe`), preventing an attacker who controls the env var or PATH
+  from redirecting execution to an arbitrary binary.
+- **GitHub Actions pinned to commit SHAs** — all third-party actions in
+  `release.yml` and `ci.yml` are now referenced by immutable commit SHA instead
+  of mutable version tags, with `# pin@<version>` comments for traceability.
+- **Least-privilege GitHub Actions permissions** — `release.yml` and `ci.yml`
+  now default to `contents: read` at the top level. Only the release job
+  escalates to `contents: write` when publishing a GitHub release.
+
+### Changed
+
+- **C# helper: `ParseSolutionProjects` signature** — now takes an additional
+  `solutionDir` parameter for path containment validation. Callers updated.
+
 
 ## [1.0.162] - 2026-06-02
 
@@ -633,6 +672,21 @@ repositories.
 - `codesearch serve` keeps one writer per database (LMDB invariant). Concurrent
   reindex from a second process is rejected.
 
+[1.0.171]: https://github.com/flupkede/codesearch/compare/v1.0.162...v1.0.171
+[1.0.162]: https://github.com/flupkede/codesearch/compare/v1.0.160...v1.0.162
+[1.0.160]: https://github.com/flupkede/codesearch/compare/v1.0.156...v1.0.160
+[1.0.156]: https://github.com/flupkede/codesearch/compare/v1.0.154...v1.0.156
+[1.0.154]: https://github.com/flupkede/codesearch/compare/v1.0.153...v1.0.154
+[1.0.153]: https://github.com/flupkede/codesearch/compare/v1.0.152...v1.0.153
+[1.0.152]: https://github.com/flupkede/codesearch/compare/v1.0.146...v1.0.152
+[1.0.146]: https://github.com/flupkede/codesearch/compare/v1.0.142...v1.0.146
+[1.0.142]: https://github.com/flupkede/codesearch/compare/v1.0.141...v1.0.142
+[1.0.141]: https://github.com/flupkede/codesearch/compare/v1.0.140...v1.0.141
+[1.0.140]: https://github.com/flupkede/codesearch/compare/v1.0.139...v1.0.140
+[1.0.139]: https://github.com/flupkede/codesearch/compare/v1.0.138...v1.0.139
+[1.0.138]: https://github.com/flupkede/codesearch/compare/v1.0.137...v1.0.138
+[1.0.137]: https://github.com/flupkede/codesearch/compare/v1.0.135...v1.0.137
+[1.0.135]: https://github.com/flupkede/codesearch/compare/v1.0.132...v1.0.135
 [1.0.132]: https://github.com/flupkede/codesearch/compare/v1.0.97...v1.0.132
 [1.0.97]: https://github.com/flupkede/codesearch/compare/v1.0.96...v1.0.97
 [1.0.96]: https://github.com/flupkede/codesearch/compare/v1.0.95...v1.0.96
