@@ -156,6 +156,13 @@ pub const SERVE_PORT_ENV: &str = "CODESEARCH_SERVE_PORT";
 /// The key is validated against `Authorization: Bearer <key>` or `X-API-Key: <key>` headers.
 pub const SERVE_API_KEY_ENV: &str = "CODESEARCH_SERVE_API_KEY";
 
+/// Environment variable to restrict which filesystem roots can be indexed.
+/// Semicolon-separated list of canonical directory paths. When set, `POST /repos`
+/// and `--register` paths must reside under one of the listed roots.
+/// When unset or empty, all paths are allowed (backward compatible).
+/// Example: `CODESEARCH_ALLOWED_ROOTS=/home/user/repos;/opt/code`
+pub const ALLOWED_ROOTS_ENV: &str = "CODESEARCH_ALLOWED_ROOTS";
+
 /// Default base URL for connecting to a local `codesearch serve` instance.
 /// Used as the clap `--url` default and in `serve_base_url()`.
 ///

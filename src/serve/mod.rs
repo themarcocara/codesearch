@@ -34,10 +34,10 @@ use tracing::{info, warn};
 
 use crate::cache::safe_canonicalize;
 use crate::constants::{
-    CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT,
-    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, LANG_CSHARP,
-    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
-    REPO_IDLE_TIMEOUT_SECS, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    ALLOWED_ROOTS_ENV, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
+    CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
+    HEALTH_PATH, LANG_CSHARP, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -2616,6 +2616,18 @@ async fn add_repo_handler(
         }
     };
 
+    // Validate the path is within allowed roots (if configured)
+    if let Err(e) = validate_path_within_allowed_roots(&canonical_path) {
+        warn!("Rejected repo registration: {}", e);
+        return (
+            StatusCode::FORBIDDEN,
+            axum::response::Json(json!({
+                "error": e,
+                "status": "forbidden"
+            })),
+        );
+    }
+
     // Register in repos.json
     let alias = {
         let mut config = match state.config.write() {
@@ -2944,6 +2956,64 @@ async fn remove_repo_handler(
     )
 }
 
+/// Validate that a canonical path falls under one of the allowed root directories.
+///
+/// When `CODESEARCH_ALLOWED_ROOTS` is unset or empty, all paths are allowed (backward compatible).
+/// When set, the path must start with at least one of the semicolon-separated roots.
+/// All comparisons use canonicalized paths with consistent separators.
+///
+/// Returns `Ok(())` if the path is allowed, or an error message describing the rejection.
+fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Result<(), String> {
+    let allowed_roots = match std::env::var(ALLOWED_ROOTS_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(()), // No restriction configured
+    };
+
+    let roots: Vec<PathBuf> = allowed_roots
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    // Canonicalize each root for reliable comparison (ignores roots that don't exist)
+    let canonical_roots: Vec<PathBuf> = roots
+        .into_iter()
+        .filter_map(|r| safe_canonicalize(&r).ok())
+        .collect();
+
+    if canonical_roots.is_empty() {
+        // All configured roots failed to canonicalize — reject for safety
+        return Err(format!(
+            "No valid roots found in {} — all configured paths failed to canonicalize",
+            ALLOWED_ROOTS_ENV
+        ));
+    }
+
+    let allowed = canonical_roots.iter().any(|root| {
+        canonical_path.starts_with(root) || canonical_path.as_os_str() == root.as_os_str()
+        // exact match
+    });
+
+    if allowed {
+        Ok(())
+    } else {
+        let roots_display: Vec<String> = canonical_roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect();
+        Err(format!(
+            "Path '{}' is outside allowed roots: [{}]. Set {} to include this path or leave it empty to allow all paths.",
+            canonical_path.display(),
+            roots_display.join(", "),
+            ALLOWED_ROOTS_ENV
+        ))
+    }
+}
+
 /// Axum middleware that requires API key authentication for management endpoints.
 ///
 /// When `CODESEARCH_SERVE_API_KEY` is set, requests must include the key in either:
@@ -3084,6 +3154,12 @@ pub async fn run_serve(
     let mut config = ReposConfig::load().unwrap_or_default();
     for path in &register_paths {
         let canonical = safe_canonicalize(path).unwrap_or_else(|_| path.clone());
+
+        // Validate path against allowed roots (if configured)
+        if let Err(e) = validate_path_within_allowed_roots(&canonical) {
+            anyhow::bail!("Rejected --register path '{}': {}", path.display(), e);
+        }
+
         let alias = config.register(canonical);
         eprintln!("Registered repo '{}' -> {}", alias, path.display());
         info!("Registered repo '{}' -> {}", alias, path.display());
