@@ -23,6 +23,67 @@ pub enum CheckStatus {
     Fail,
 }
 
+/// Aggregate report returned by [`diagnose`].
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorReport {
+    /// Per-check results in execution order.
+    pub results: Vec<CheckResult>,
+    /// Number of warnings across all checks.
+    pub warnings: usize,
+    /// Number of errors across all checks.
+    pub errors: usize,
+}
+
+impl DoctorReport {
+    fn from_results(results: Vec<CheckResult>) -> Self {
+        let warnings = results
+            .iter()
+            .filter(|r| r.status == CheckStatus::Warn)
+            .count();
+        let errors = results
+            .iter()
+            .filter(|r| r.status == CheckStatus::Fail)
+            .count();
+        Self {
+            results,
+            warnings,
+            errors,
+        }
+    }
+
+    /// Render the report as TUI-friendly lines with ✓/⚠/✗ prefixes.
+    pub fn render_tui(&self) -> Vec<String> {
+        let mut lines = Vec::with_capacity(self.results.len() + 3);
+        for r in &self.results {
+            let prefix = match r.status {
+                CheckStatus::Pass => "✓",
+                CheckStatus::Warn => "⚠",
+                CheckStatus::Fail => "✗",
+            };
+            lines.push(format!("{} {}", prefix, r.message));
+            if let Some(details) = &r.details {
+                lines.push(format!("  {}", details));
+            }
+            if let Some(hint) = &r.hint {
+                lines.push(format!("  {}", hint));
+            }
+        }
+        lines.push(String::new());
+        let summary_color = if self.errors > 0 {
+            "✗"
+        } else if self.warnings > 0 {
+            "⚠"
+        } else {
+            "✓"
+        };
+        lines.push(format!(
+            "{} {} warning(s), {} error(s)",
+            summary_color, self.warnings, self.errors
+        ));
+        lines
+    }
+}
+
 /// Result of a single check
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
@@ -485,24 +546,22 @@ fn check_embedding_cache(_db_path: &Path, model_name: &str) -> CheckResult {
     }
 }
 
-/// Run all checks for a single project path.
-/// Returns (warnings, errors). Does not bail — caller decides.
-async fn run_for_path(project_path: &Path, fix: bool, json: bool) -> Result<(usize, usize)> {
+/// Run all diagnostic checks for a project path and return a structured report.
+///
+/// This is the "diagnose" half of the old [`run_for_path`]. It performs all I/O
+/// and returns a [`DoctorReport`] without printing anything — safe to call from
+/// the TUI or any context where stdout must not be corrupted.
+///
+/// Returns `Err` only when `find_best_database` itself fails (e.g. permission
+/// denied on a directory). A missing database is a normal `DoctorReport` with
+/// one `Fail` result, not an `Err`.
+pub fn diagnose(project_path: &Path) -> Result<DoctorReport> {
     // Find database (single call)
     let db_info = match find_best_database(Some(project_path))? {
         Some(info) => info,
         None => {
             let results = vec![check_find_database(project_path)];
-            if json {
-                let output = serde_json::json!({
-                    "checks": results,
-                    "summary": { "warnings": 0, "errors": 1 }
-                });
-                println!("{}", serde_json::to_string_pretty(&output)?);
-            } else {
-                print_results(&results, false);
-            }
-            return Ok((0, 1));
+            return Ok(DoctorReport::from_results(results));
         }
     };
 
@@ -555,25 +614,23 @@ async fn run_for_path(project_path: &Path, fix: bool, json: bool) -> Result<(usi
 
     results.push(check_embedding_cache(&db_path, &model_name));
 
-    // Print results
-    print_results(&results, json);
+    Ok(DoctorReport::from_results(results))
+}
 
-    // Count warnings and errors
-    let warnings = results
-        .iter()
-        .filter(|r| r.status == CheckStatus::Warn)
-        .count();
-    let errors = results
-        .iter()
-        .filter(|r| r.status == CheckStatus::Fail)
-        .count();
+/// Run all checks for a single project path, print results, optionally fix.
+/// Returns (warnings, errors). Does not bail — caller decides.
+async fn run_for_path(project_path: &Path, fix: bool, json: bool) -> Result<(usize, usize)> {
+    let report = diagnose(project_path)?;
+
+    // Print results
+    print_results(&report.results, json);
 
     if json {
         let output = serde_json::json!({
-            "checks": results,
+            "checks": report.results,
             "summary": {
-                "warnings": warnings,
-                "errors": errors,
+                "warnings": report.warnings,
+                "errors": report.errors,
             }
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -581,10 +638,11 @@ async fn run_for_path(project_path: &Path, fix: bool, json: bool) -> Result<(usi
         println!();
         println!("{}", "Summary".bold());
         println!("{}", "=".repeat(60));
-        println!("  {} warnings, {} errors", warnings, errors);
+        println!("  {} warnings, {} errors", report.warnings, report.errors);
 
-        if warnings > 0 || errors > 0 {
-            if results
+        if report.warnings > 0 || report.errors > 0 {
+            if report
+                .results
                 .iter()
                 .any(|r| r.status == CheckStatus::Warn || r.status == CheckStatus::Fail)
             {
@@ -608,7 +666,7 @@ async fn run_for_path(project_path: &Path, fix: bool, json: bool) -> Result<(usi
         }
     }
 
-    Ok((warnings, errors))
+    Ok((report.warnings, report.errors))
 }
 
 /// Run diagnostics — default: current directory.

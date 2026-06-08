@@ -858,8 +858,8 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
     Ok(())
 }
 
-mod doctor;
-mod setup;
+pub mod doctor;
+pub mod setup;
 
 #[cfg(test)]
 mod tests {

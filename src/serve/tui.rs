@@ -20,6 +20,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use tokio_util::sync::CancellationToken;
 
 use super::ServeState;
+use crate::cli::doctor;
 use crate::constants::{DB_DIR_NAME, LANG_CSHARP};
 use crate::index::IndexManager;
 
@@ -207,16 +208,55 @@ async fn run_tui_loop(
                         }
                     }
                     KeyAction::RunDoctor(idx) => {
-                        // Placeholder until Stage 4 splits doctor into diagnose()+render()
                         if idx < repos.len() {
                             let alias = repos[idx].0.clone();
-                            overlay = Some(OverlayState::Doctor {
-                                alias,
-                                results: vec![
-                                    "Doctor diagnostics not yet available in TUI.".to_string(),
-                                    "Press Esc to close.".to_string(),
-                                ],
-                            });
+                            // Resolve alias → project_path via config
+                            let project_path =
+                                state.config.read().ok().and_then(|c| c.resolve(&alias));
+                            if let Some(project_path) = project_path {
+                                // diagnose() is sync I/O — run on blocking thread
+                                let report = tokio::task::spawn_blocking(move || {
+                                    doctor::diagnose(&project_path)
+                                })
+                                .await;
+                                match report {
+                                    Ok(Ok(r)) => {
+                                        overlay = Some(OverlayState::Doctor {
+                                            alias,
+                                            results: r.render_tui(),
+                                        });
+                                    }
+                                    Ok(Err(e)) => {
+                                        overlay = Some(OverlayState::Doctor {
+                                            alias,
+                                            results: vec![
+                                                format!("✗ Doctor failed: {}", e),
+                                                String::new(),
+                                                "  [Esc] close".to_string(),
+                                            ],
+                                        });
+                                    }
+                                    Err(e) => {
+                                        overlay = Some(OverlayState::Doctor {
+                                            alias,
+                                            results: vec![
+                                                format!("✗ Task error: {}", e),
+                                                String::new(),
+                                                "  [Esc] close".to_string(),
+                                            ],
+                                        });
+                                    }
+                                }
+                            } else {
+                                overlay = Some(OverlayState::Doctor {
+                                    alias,
+                                    results: vec![
+                                        "✗ Cannot resolve alias to path".to_string(),
+                                        String::new(),
+                                        "  [Esc] close".to_string(),
+                                    ],
+                                });
+                            }
                         }
                     }
                     KeyAction::ForceReindex(idx) => {
