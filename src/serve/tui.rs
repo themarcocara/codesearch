@@ -940,7 +940,10 @@ fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState) {
 /// Render a centered modal with a title and content lines.
 fn render_centered_modal(f: &mut ratatui::Frame, area: Rect, title: &str, lines: Vec<Line<'_>>) {
     let content_height = lines.len() as u16 + 2; // +2 for border
-    let content_width = 42u16.max(title.len() as u16 + 4);
+                                                 // Compute width from actual content lines to avoid truncation
+    let max_line_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(20);
+    let title_w = title.len() as u16;
+    let content_width = (max_line_w + 4).max(title_w + 4).max(30);
 
     // Center the modal
     let modal_area = Rect {
@@ -1072,12 +1075,10 @@ fn build_info_overlay(
 
 /// Format an ISO 8601 timestamp as a human-readable age string.
 fn format_age(iso_ts: &str) -> String {
-    // Parse the timestamp and compute elapsed time
     let parsed = chrono::DateTime::parse_from_rfc3339(iso_ts).or_else(|_| {
-        chrono::NaiveDateTime::parse_from_str(iso_ts, "%Y-%m-%dT%H:%M:%S%.f").map(|dt| {
-            chrono::DateTime::parse_from_rfc3339(&dt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
-                .unwrap_or_else(|_| chrono::Utc::now().into())
-        })
+        // Try without timezone (assume UTC)
+        chrono::NaiveDateTime::parse_from_str(iso_ts, "%Y-%m-%dT%H:%M:%S%.f")
+            .map(|dt| dt.and_utc().fixed_offset())
     });
 
     match parsed {
