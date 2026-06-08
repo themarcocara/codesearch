@@ -7603,15 +7603,25 @@ pub async fn run_mcp_server(
         let model_name = format!("{:?}", model_type);
         let dimensions = model_type.dimensions();
 
-        // Create minimal metadata.json (matching format used by build_index)
-        let metadata_path = db_path.join("metadata.json");
-        let metadata = serde_json::json!({
-            "model_short_name": model_short_name,
-            "model_name": model_name,
-            "dimensions": dimensions,
-            "indexed_at": chrono::Utc::now().to_rfc3339()
-        });
-        tokio::fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?).await?;
+        // Create minimal metadata.json (atomic read-modify-write, matching format used by build_index)
+        crate::vectordb::merge_metadata_atomic(&db_path, |obj| {
+            obj.insert(
+                "model_short_name".to_string(),
+                serde_json::Value::String(model_short_name.clone()),
+            );
+            obj.insert(
+                "model_name".to_string(),
+                serde_json::Value::String(model_name),
+            );
+            obj.insert(
+                "dimensions".to_string(),
+                serde_json::Value::Number(dimensions.into()),
+            );
+            obj.insert(
+                "indexed_at".to_string(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+        })?;
 
         // Create minimal file_meta.json (matching FileMetaStore format)
         let file_meta = crate::cache::FileMetaStore::new(model_short_name.clone(), dimensions);
