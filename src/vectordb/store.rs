@@ -60,22 +60,56 @@ fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
     json.get(key).and_then(|v| v.as_u64()).map(|v| v as u32)
 }
 
-/// Write a metadata field into metadata.json (creates/updates key in existing JSON).
-fn write_metadata_u32(db_path: &Path, key: &str, value: u32) -> Result<()> {
+/// Atomically write a JSON file using temp+rename pattern.
+/// Writes to `<path>.tmp` first, then renames to `<path>`.
+/// On failure the temp file is best-effort removed.
+fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
+    let tmp_path = path.with_extension("json.tmp");
+    if let Err(e) = fs::write(&tmp_path, serde_json::to_string_pretty(json)?) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Read-modify-write metadata.json atomically.
+/// Reads existing metadata (or starts with empty object), applies `merge_fn`,
+/// then writes via temp+rename so a crash mid-write never leaves an empty file.
+pub fn merge_metadata_atomic(
+    db_path: &Path,
+    merge_fn: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<()> {
     let metadata_path = db_path.join("metadata.json");
+
+    // Read existing metadata or start fresh
     let mut json: serde_json::Value = if metadata_path.exists() {
         let content = fs::read_to_string(&metadata_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::Value::Object(Default::default()))
+        serde_json::from_str(&content)
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()))
     } else {
         serde_json::Value::Object(Default::default())
     };
 
+    // Apply merge
     if let Some(obj) = json.as_object_mut() {
-        obj.insert(key.to_string(), serde_json::Value::Number(value.into()));
+        merge_fn(obj);
     }
 
-    fs::write(&metadata_path, serde_json::to_string_pretty(&json)?)?;
+    // Write atomically
+    atomic_write_json(&metadata_path, &json)?;
     Ok(())
+}
+
+/// Write a metadata field into metadata.json (atomic read-modify-write).
+fn write_metadata_u32(db_path: &Path, key: &str, value: u32) -> Result<()> {
+    let key = key.to_string();
+    merge_metadata_atomic(db_path, move |obj| {
+        obj.insert(key, serde_json::Value::Number(value.into()));
+    })
 }
 
 /// Ensure the database schema version matches the current version.
@@ -137,27 +171,14 @@ fn ensure_schema_version(db_path: &Path) -> Result<()> {
     }
 }
 
-/// Persist the current LMDB map size into metadata.json so that subsequent
-/// opens in the same process use the same value (avoids "already opened with
-/// different options" errors from LMDB when multiple repos have been resized).
+/// Persist the current LMDB map size into metadata.json (atomic read-modify-write).
 fn persist_map_size(db_path: &Path, map_size_mb: usize) -> Result<()> {
-    let metadata_path = db_path.join("metadata.json");
-    let mut json: serde_json::Value = if metadata_path.exists() {
-        let content = fs::read_to_string(&metadata_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::Value::Object(Default::default()))
-    } else {
-        serde_json::Value::Object(Default::default())
-    };
-
-    if let Some(obj) = json.as_object_mut() {
+    merge_metadata_atomic(db_path, |obj| {
         obj.insert(
             "lmdb_map_size_mb".to_string(),
             serde_json::Value::Number(map_size_mb.into()),
         );
-    }
-
-    fs::write(&metadata_path, serde_json::to_string_pretty(&json)?)?;
-    Ok(())
+    })
 }
 
 /// Chunk metadata stored in the database

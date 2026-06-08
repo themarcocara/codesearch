@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.0.163"
+version = "1.0.164"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -116,6 +116,10 @@ pretty_assertions = "1.4"
 # [[bench]]
 # name = "chunking_bench"
 # harness = false
+
+[profile.dev]
+debug = 1               # line-tables-only: enough for backtraces, ~70% smaller than debug=2
+incremental = true      # keep incremental for dev iteration speed, but target-dir is now outside repo
 
 [profile.release]
 opt-level = 3
