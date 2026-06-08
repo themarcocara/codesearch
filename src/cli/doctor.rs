@@ -69,7 +69,7 @@ impl DoctorReport {
             }
         }
         lines.push(String::new());
-        let summary_color = if self.errors > 0 {
+        let summary_icon = if self.errors > 0 {
             "✗"
         } else if self.warnings > 0 {
             "⚠"
@@ -78,7 +78,7 @@ impl DoctorReport {
         };
         lines.push(format!(
             "{} {} warning(s), {} error(s)",
-            summary_color, self.warnings, self.errors
+            summary_icon, self.warnings, self.errors
         ));
         lines
     }
@@ -579,9 +579,12 @@ pub fn diagnose(project_path: &Path) -> Result<DoctorReport> {
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Open VectorStore once for checks that need it
+    // Open VectorStore once for checks that need it.
+    // In serve context (TUI), a write handle may already be open via SharedStores,
+    // so we fall back to read-only to avoid double-open errors from TrackedEnv.
     let dims = read_dimensions(&db_path);
-    let vector_store = VectorStore::new(&db_path, dims);
+    let vector_store =
+        VectorStore::new(&db_path, dims).or_else(|_| VectorStore::open_readonly(&db_path, dims));
 
     // Run all checks in order
     let mut results = vec![
