@@ -2505,6 +2505,13 @@ fn read_model_metadata(db_path: &Path) -> (String, usize) {
 
 /// Read chunk/file counts from metadata.json (written after each indexing operation).
 /// Returns `(total_chunks, total_files)` defaulting to `(0, 0)`.
+///
+/// When metadata.json reports `total_chunks == 0` but the LMDB database exists,
+/// falls back to opening the store read-only and counting live chunks.
+/// This catches the case where a metadata writer clobbered the stats fields
+/// (see `merge_metadata_atomic` for the definitive fix). The fallback is lazy —
+/// only triggered when metadata reports zero — so it does not unnecessarily
+/// open databases for repos that already have correct metadata.
 fn read_metadata_stats(db_path: &Path) -> (usize, usize) {
     let metadata_path = db_path.join("metadata.json");
     if let Ok(content) = std::fs::read_to_string(&metadata_path) {
@@ -2517,10 +2524,59 @@ fn read_metadata_stats(db_path: &Path) -> (usize, usize) {
                 .get("total_files")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
+
+            if total_chunks > 0 {
+                return (total_chunks, total_files);
+            }
+
+            // Metadata says 0 chunks — try live LMDB count as fallback.
+            // This is safe in serve context: `read_metadata_stats` is only called
+            // for repos NOT yet opened in SharedStores (opened repos use vs.stats()
+            // directly), so no double-open risk.
+            if let Some((live_chunks, live_files)) = live_chunk_count(db_path) {
+                tracing::info!(
+                    "metadata.json reports 0 chunks for {}, but LMDB has {} chunks / {} files — using live count",
+                    db_path.display(), live_chunks, live_files
+                );
+                return (live_chunks, live_files);
+            }
+
             return (total_chunks, total_files);
         }
     }
     (0, 0)
+}
+
+/// Open the LMDB read-only and count chunks/files.
+/// Returns `None` if the database cannot be opened (missing, corrupt, or
+/// already locked by another handle).
+fn live_chunk_count(db_path: &Path) -> Option<(usize, usize)> {
+    let (model_name, dims) = read_model_metadata(db_path);
+    if model_name == "unknown" {
+        return None;
+    }
+    match VectorStore::open_readonly(db_path, dims) {
+        Ok(store) => match store.stats() {
+            Ok(stats) if stats.total_chunks > 0 => Some((stats.total_chunks, stats.total_files)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::debug!(
+                    "live_chunk_count: stats() failed for {}: {}",
+                    db_path.display(),
+                    e
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!(
+                "live_chunk_count: open_readonly failed for {}: {}",
+                db_path.display(),
+                e
+            );
+            None
+        }
+    }
 }
 
 /// RRF score threshold below which results are considered low-confidence.
