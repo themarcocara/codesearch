@@ -20,7 +20,50 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use tokio_util::sync::CancellationToken;
 
 use super::ServeState;
-use crate::constants::LANG_CSHARP;
+use crate::constants::{DB_DIR_NAME, LANG_CSHARP};
+use crate::index::IndexManager;
+
+// ---------------------------------------------------------------------------
+// Key actions
+// ---------------------------------------------------------------------------
+
+/// Actions returned by key handling, replacing the old `bool` return.
+#[derive(Debug)]
+enum KeyAction {
+    /// No action / key not recognized.
+    None,
+    /// User pressed `s` — reload repos config.
+    Reload,
+    /// User pressed `i` — show info overlay for repo at given index.
+    ShowInfo(usize),
+    /// User pressed `d` — run doctor for repo at given index.
+    RunDoctor(usize),
+    /// User pressed `f` — force reindex repo at given index.
+    ForceReindex(usize),
+}
+
+// ---------------------------------------------------------------------------
+// Overlay state (modal shown on top of the table)
+// ---------------------------------------------------------------------------
+
+/// Modal overlay shown on top of the normal TUI content.
+/// `Esc` dismisses it.
+enum OverlayState {
+    /// Info modal: repo name, chunks, files, db size, model, dims, etc.
+    Info {
+        alias: String,
+        chunks: usize,
+        files: usize,
+        max_chunk_id: u32,
+        db_size_human: String,
+        model: String,
+        dims: usize,
+        lock: String,
+        index_age: String,
+    },
+    /// Doctor results: per-check pass/warn/fail lines.
+    Doctor { alias: String, results: Vec<String> },
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -73,6 +116,9 @@ async fn run_tui_loop(
     // can compute a delta between refresh calls (first call always returns 0).
     let mut sys_system: Option<sysinfo::System> = None;
 
+    // Optional modal overlay (dismissed by Esc)
+    let mut overlay: Option<OverlayState> = None;
+
     // Main loop
     loop {
         // Draw the UI
@@ -117,6 +163,11 @@ async fn run_tui_loop(
                 &cpu,
                 csharp_helper,
             );
+
+            // Render overlay on top of everything if active
+            if let Some(ref ov) = overlay {
+                render_overlay(f, size, ov);
+            }
         })?;
 
         // Poll for key events
@@ -128,17 +179,53 @@ async fn run_tui_loop(
                 if key.kind != event::KeyEventKind::Press {
                     continue;
                 }
+
+                // If overlay is active, Esc dismisses it; no other keys processed
+                if overlay.is_some() {
+                    if matches!(key.code, KeyCode::Esc) {
+                        overlay = None;
+                    }
+                    continue;
+                }
+
                 if is_quit_key(key) {
                     should_quit = true;
                     break;
                 }
-                if handle_key(key, &mut table_state, repos.len()) {
-                    // 's' pressed — force reload of repos config
-                    // Clear mtime so reload_if_changed actually reloads
-                    if let Ok(mut mtime_guard) = state.config_mtime.write() {
-                        *mtime_guard = None;
+                match handle_key(key, &mut table_state, repos.len()) {
+                    KeyAction::Reload => {
+                        // 's' pressed — force reload of repos config
+                        // Clear mtime so reload_if_changed actually reloads
+                        if let Ok(mut mtime_guard) = state.config_mtime.write() {
+                            *mtime_guard = None;
+                        }
+                        let _ = state.reload_if_changed();
                     }
-                    let _ = state.reload_if_changed();
+                    KeyAction::ShowInfo(idx) => {
+                        if let Some(ov) = build_info_overlay(idx, &repos, &state) {
+                            overlay = Some(ov);
+                        }
+                    }
+                    KeyAction::RunDoctor(idx) => {
+                        // Placeholder until Stage 4 splits doctor into diagnose()+render()
+                        if idx < repos.len() {
+                            let alias = repos[idx].0.clone();
+                            overlay = Some(OverlayState::Doctor {
+                                alias,
+                                results: vec![
+                                    "Doctor diagnostics not yet available in TUI.".to_string(),
+                                    "Press Esc to close.".to_string(),
+                                ],
+                            });
+                        }
+                    }
+                    KeyAction::ForceReindex(idx) => {
+                        if idx < repos.len() {
+                            let alias = repos[idx].0.clone();
+                            spawn_force_reindex(alias, &state);
+                        }
+                    }
+                    KeyAction::None => {}
                 }
             }
         }
@@ -183,9 +270,9 @@ fn is_quit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('q'))
 }
 
-fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) -> bool {
+fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) -> KeyAction {
     if row_count == 0 {
-        return false;
+        return KeyAction::None;
     }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
@@ -193,25 +280,38 @@ fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) -> 
             if i > 0 {
                 table_state.select(Some(i - 1));
             }
+            KeyAction::None
         }
         KeyCode::Down | KeyCode::Char('j') => {
             let i = table_state.selected().unwrap_or(0);
             if i < row_count - 1 {
                 table_state.select(Some(i + 1));
             }
+            KeyAction::None
         }
         KeyCode::Home => {
             table_state.select(Some(0));
+            KeyAction::None
         }
         KeyCode::End => {
             table_state.select(Some(row_count - 1));
+            KeyAction::None
         }
-        KeyCode::Char('s') => {
-            return true; // signal: reload requested
+        KeyCode::Char('s') => KeyAction::Reload,
+        KeyCode::Char('i') => {
+            let idx = table_state.selected().unwrap_or(0);
+            KeyAction::ShowInfo(idx)
         }
-        _ => {}
+        KeyCode::Char('d') => {
+            let idx = table_state.selected().unwrap_or(0);
+            KeyAction::RunDoctor(idx)
+        }
+        KeyCode::Char('f') => {
+            let idx = table_state.selected().unwrap_or(0);
+            KeyAction::ForceReindex(idx)
+        }
+        _ => KeyAction::None,
     }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +658,9 @@ fn render_footer(
     let left_line = Line::from(vec![
         Span::styled("[q] quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[↑↓] scroll  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[i] info  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[d] doctor  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[f] reindex  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[s] reload  ", Style::default().fg(Color::DarkGray)),
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
     ]);
@@ -735,6 +838,406 @@ fn lock_cell_from_status(status: super::RepoStateLabel) -> Cell<'static> {
         Error => Cell::from("—".to_string()).style(Style::default().fg(Color::Red)),
         NoIndex => Cell::from("—".to_string()).style(Style::default().fg(Color::Gray)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Overlay rendering
+// ---------------------------------------------------------------------------
+
+/// Render the info/doctor overlay as a centered modal on top of the TUI.
+fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState) {
+    match overlay {
+        OverlayState::Info {
+            alias,
+            chunks,
+            files,
+            max_chunk_id,
+            db_size_human,
+            model,
+            dims,
+            lock,
+            index_age,
+        } => {
+            let title = format!(" {} — Index Info ", alias);
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("  Chunks:      ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{}", chunks), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Files:       ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{}", files), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Max chunk ID:", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}", max_chunk_id),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  DB size:     ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(db_size_human.clone(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Model:       ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(model.clone(), Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Dimensions:  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{}", dims), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Lock:        ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        lock.clone(),
+                        Style::default().fg(if lock == "write" {
+                            Color::Cyan
+                        } else {
+                            Color::White
+                        }),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Index age:   ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(index_age.clone(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [Esc] close",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            render_centered_modal(f, area, &title, lines);
+        }
+        OverlayState::Doctor { alias, results } => {
+            let title = format!(" {} — Doctor ", alias);
+            let mut lines: Vec<Line> = results
+                .iter()
+                .map(|r| {
+                    let color = if r.starts_with("✓") {
+                        Color::Green
+                    } else if r.starts_with("⚠") {
+                        Color::Yellow
+                    } else if r.starts_with("✗") {
+                        Color::Red
+                    } else {
+                        Color::White
+                    };
+                    Line::from(Span::styled(format!("  {}", r), Style::default().fg(color)))
+                })
+                .collect();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Esc] close",
+                Style::default().fg(Color::DarkGray),
+            )));
+            render_centered_modal(f, area, &title, lines);
+        }
+    }
+}
+
+/// Render a centered modal with a title and content lines.
+fn render_centered_modal(f: &mut ratatui::Frame, area: Rect, title: &str, lines: Vec<Line<'_>>) {
+    let content_height = lines.len() as u16 + 2; // +2 for border
+    let content_width = 42u16.max(title.len() as u16 + 4);
+
+    // Center the modal
+    let modal_area = Rect {
+        x: area
+            .width
+            .saturating_sub(content_width)
+            .saturating_div(2)
+            .min(area.width.saturating_sub(content_width)),
+        y: area
+            .height
+            .saturating_sub(content_height)
+            .saturating_div(2)
+            .min(area.height.saturating_sub(content_height)),
+        width: content_width.min(area.width),
+        height: content_height.min(area.height),
+    };
+
+    // Clear the area behind the modal
+    f.render_widget(
+        ratatui::widgets::Block::default().style(Style::default().bg(Color::Rgb(20, 20, 35))),
+        modal_area,
+    );
+
+    let block = ratatui::widgets::Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Rgb(20, 20, 35)));
+    let inner = block.inner(modal_area);
+    f.render_widget(block, modal_area);
+
+    let content = ratatui::widgets::Paragraph::new(lines);
+    f.render_widget(content, inner);
+}
+
+// ---------------------------------------------------------------------------
+// Info overlay builder
+// ---------------------------------------------------------------------------
+
+/// Build an `OverlayState::Info` by gathering live stats from SharedStores or metadata.
+fn build_info_overlay(
+    idx: usize,
+    repos: &[(String, super::RepoStatusInfo)],
+    state: &Arc<ServeState>,
+) -> Option<OverlayState> {
+    if idx >= repos.len() {
+        return None;
+    }
+    let (alias, _info) = &repos[idx];
+    let config = state.config_snapshot();
+    let project_path = config.resolve(alias)?;
+    let db_path = project_path.join(DB_DIR_NAME);
+
+    // Try to get live stats from opened stores
+    let mut chunks = 0usize;
+    let mut files = 0usize;
+    let mut max_chunk_id = 0u32;
+    let mut dims = 0usize;
+    let mut model = String::from("unknown");
+    let mut lock = String::from("—");
+    let mut index_age = String::from("—");
+
+    // Read model + dims from metadata.json
+    if let Ok(content) = std::fs::read_to_string(db_path.join("metadata.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            model = json
+                .get("model_short_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            dims = json.get("dimensions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+            // Total chunks from metadata (may be 0 if clobbered — Stage 2 fix)
+            chunks = json
+                .get("total_chunks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            files = json
+                .get("total_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+
+            // Index age from indexed_at
+            if let Some(indexed_at) = json.get("indexed_at").and_then(|v| v.as_str()) {
+                index_age = format_age(indexed_at);
+            }
+        }
+    }
+
+    // If stores are open, get live stats (overrides metadata)
+    if let Some(stores) = state.get_opened_stores(alias) {
+        if let Ok(vs) = stores.vector_store.try_read() {
+            if let Ok(live_stats) = vs.stats() {
+                chunks = live_stats.total_chunks;
+                files = live_stats.total_files;
+                max_chunk_id = live_stats.max_chunk_id;
+                if dims == 0 {
+                    dims = live_stats.dimensions;
+                }
+            }
+        }
+        lock = if stores.readonly {
+            "read".to_string()
+        } else {
+            "write".to_string()
+        };
+    }
+
+    // DB size on disk
+    let db_size_human = dir_size_human(&db_path);
+
+    Some(OverlayState::Info {
+        alias: alias.clone(),
+        chunks,
+        files,
+        max_chunk_id,
+        db_size_human,
+        model,
+        dims,
+        lock,
+        index_age,
+    })
+}
+
+/// Format an ISO 8601 timestamp as a human-readable age string.
+fn format_age(iso_ts: &str) -> String {
+    // Parse the timestamp and compute elapsed time
+    let parsed = chrono::DateTime::parse_from_rfc3339(iso_ts).or_else(|_| {
+        chrono::NaiveDateTime::parse_from_str(iso_ts, "%Y-%m-%dT%H:%M:%S%.f").map(|dt| {
+            chrono::DateTime::parse_from_rfc3339(&dt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
+                .unwrap_or_else(|_| chrono::Utc::now().into())
+        })
+    });
+
+    match parsed {
+        Ok(dt) => {
+            let now = chrono::Utc::now();
+            let dur = now.signed_duration_since(dt);
+            if dur.num_seconds() < 0 {
+                return "just now".to_string();
+            }
+            let mins = dur.num_minutes();
+            if mins < 1 {
+                "just now".to_string()
+            } else if mins < 60 {
+                format!("{}m ago", mins)
+            } else {
+                let hours = mins / 60;
+                if hours < 24 {
+                    format!("{}h ago", hours)
+                } else {
+                    let days = hours / 24;
+                    format!("{}d ago", days)
+                }
+            }
+        }
+        Err(_) => iso_ts.to_string(),
+    }
+}
+
+/// Compute total size of a directory on disk, formatted as human-readable string.
+fn dir_size_human(path: &std::path::Path) -> String {
+    let total_bytes = walkdir_size(path);
+    if total_bytes == 0 {
+        return "—".to_string();
+    }
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if total_bytes >= GB {
+        format!("{:.1} GB", total_bytes as f64 / GB as f64)
+    } else if total_bytes >= MB {
+        format!("{:.1} MB", total_bytes as f64 / MB as f64)
+    } else {
+        format!("{:.0} KB", total_bytes as f64 / KB as f64)
+    }
+}
+
+/// Walk a directory and sum file sizes. Returns 0 on any error.
+fn walkdir_size(path: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(file_type) = entry.file_type() {
+                if file_type.is_file() {
+                    if let Ok(meta) = entry.metadata() {
+                        total += meta.len();
+                    }
+                } else if file_type.is_dir() {
+                    total += walkdir_size(&entry.path());
+                }
+            }
+        }
+    }
+    total
+}
+
+// ---------------------------------------------------------------------------
+// Force reindex (non-blocking spawn)
+// ---------------------------------------------------------------------------
+
+/// Spawn a background force reindex task for the given repo alias.
+/// Follows the same flow as the HTTP `reindex_handler`.
+fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
+    // Guard against concurrent reindex
+    if !state.active_reindexes.insert(alias.clone()) {
+        tracing::warn!(
+            "Force reindex already in progress for '{}', skipping TUI request",
+            alias
+        );
+        return;
+    }
+
+    let config = match state.config.read() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Config lock poisoned: {}", e);
+            state.active_reindexes.remove(&alias);
+            return;
+        }
+    };
+    let project_path = match config.resolve(&alias) {
+        Some(p) => p,
+        None => {
+            tracing::error!("Cannot resolve alias '{}' for force reindex", alias);
+            state.active_reindexes.remove(&alias);
+            return;
+        }
+    };
+    drop(config); // release read lock
+
+    let db_path = project_path.join(DB_DIR_NAME);
+
+    // Stop FSW
+    let stores = match state.stop_fsw(&alias) {
+        Some(s) => s,
+        None => {
+            // Try to open stores (allow_create=true for recovery)
+            let cancel = CancellationToken::new();
+            match state.try_open_stores(&alias, &db_path, true) {
+                Ok(super::OpenedStores::Write(s)) => {
+                    state.repos.insert(
+                        alias.clone(),
+                        super::RepoState::Write {
+                            stores: s.clone(),
+                            index_manager: None,
+                            cancel_token: cancel,
+                        },
+                    );
+                    state.touch_access(&alias);
+                    s
+                }
+                Ok(super::OpenedStores::Readonly(_)) => {
+                    tracing::error!(
+                        "Repo {} opened read-only; cannot force-reindex from TUI",
+                        alias
+                    );
+                    state.active_reindexes.remove(&alias);
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!("Cannot open stores for '{}': {}", alias, e);
+                    state.active_reindexes.remove(&alias);
+                    return;
+                }
+            }
+        }
+    };
+
+    let alias_bg = alias.clone();
+    let state_bg = state.clone();
+    tokio::spawn(async move {
+        tracing::info!(
+            "TUI: Force reindex for '{}': clearing stores and reindexing",
+            alias_bg
+        );
+
+        match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores).await {
+            Ok(()) => {
+                tracing::info!("TUI: Force reindex complete for '{}'", alias_bg);
+            }
+            Err(e) => {
+                tracing::error!("TUI: Force reindex failed for '{}': {}", alias_bg, e);
+            }
+        }
+
+        // Restart FSW with fresh IndexManager
+        state_bg.restart_fsw(&alias_bg, stores).await;
+
+        // Remove guard
+        state_bg.active_reindexes.remove(&alias_bg);
+    });
 }
 
 // ---------------------------------------------------------------------------
