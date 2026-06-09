@@ -2550,6 +2550,16 @@ fn read_metadata_stats(db_path: &Path) -> (usize, usize) {
 /// Open the LMDB read-only and count chunks/files.
 /// Returns `None` if the database cannot be opened (missing, corrupt, or
 /// already locked by another handle).
+///
+/// # Safety (LMDB double-open)
+///
+/// This function is only called when `get_opened_stores(alias)` returned `None`,
+/// meaning no `SharedStores` handle exists for this repo. There is a theoretical
+/// race window between that check and this `open_readonly` call where another task
+/// could open the repo via `get_or_open_stores`. In practice this is safe because:
+/// 1. The tokio runtime uses a single thread for non-spawned futures.
+/// 2. Even if the race occurs, `open_readonly` returns `Err` (TrackedEnv blocks it),
+///    and we return `None` — no crash, no corruption.
 fn live_chunk_count(db_path: &Path) -> Option<(usize, usize)> {
     let (model_name, dims) = read_model_metadata(db_path);
     if model_name == "unknown" {
