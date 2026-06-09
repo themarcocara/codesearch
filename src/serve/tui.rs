@@ -211,36 +211,44 @@ async fn run_tui_loop(
                         if idx < repos.len() {
                             let alias = repos[idx].0.clone();
                             // Resolve alias → project_path via config
-                            let project_path =
-                                state.config.read().ok().and_then(|c| c.resolve(&alias));
-                            if let Some(project_path) = project_path {
-                                // diagnose() is sync I/O — run on blocking thread
-                                let report = tokio::task::spawn_blocking(move || {
-                                    doctor::diagnose(&project_path)
-                                })
-                                .await;
-                                match report {
-                                    Ok(Ok(r)) => {
-                                        overlay = Some(OverlayState::Doctor {
-                                            alias,
-                                            results: r.render_tui(),
-                                        });
-                                    }
-                                    Ok(Err(e)) => {
-                                        overlay = Some(OverlayState::Doctor {
-                                            alias,
-                                            results: vec![
-                                                format!("✗ Doctor failed: {}", e),
-                                                String::new(),
-                                                "  [Esc] close".to_string(),
-                                            ],
-                                        });
+                            let resolved = state.config.read().ok().and_then(|c| c.resolve(&alias));
+                            if let Some(project_path) = resolved {
+                                // Use the serve's existing VectorStore handle
+                                // to avoid LMDB double-open (TrackedEnv blocks it).
+                                let stores = state.get_or_open_stores(&alias, true);
+                                match stores.await {
+                                    Ok(s) => {
+                                        // Read-lock the VectorStore and run diagnose inline.
+                                        // The checks are fast I/O (file reads, LMDB stat calls)
+                                        // and won't starve the tokio runtime meaningfully.
+                                        let vs = s.vector_store.read().await;
+                                        let report =
+                                            doctor::diagnose_with_store(&project_path, &vs);
+                                        drop(vs); // release lock before building overlay
+                                        match report {
+                                            Ok(r) => {
+                                                overlay = Some(OverlayState::Doctor {
+                                                    alias,
+                                                    results: r.render_tui(),
+                                                });
+                                            }
+                                            Err(e) => {
+                                                overlay = Some(OverlayState::Doctor {
+                                                    alias,
+                                                    results: vec![
+                                                        format!("✗ Doctor failed: {}", e),
+                                                        String::new(),
+                                                        "  [Esc] close".to_string(),
+                                                    ],
+                                                });
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         overlay = Some(OverlayState::Doctor {
                                             alias,
                                             results: vec![
-                                                format!("✗ Task error: {}", e),
+                                                format!("✗ Cannot open database: {}", e),
                                                 String::new(),
                                                 "  [Esc] close".to_string(),
                                             ],

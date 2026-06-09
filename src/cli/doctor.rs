@@ -580,11 +580,9 @@ pub fn diagnose(project_path: &Path) -> Result<DoctorReport> {
         .unwrap_or_else(|| "unknown".to_string());
 
     // Open VectorStore once for checks that need it.
-    // In serve context (TUI), a write handle may already be open via SharedStores,
-    // so we fall back to read-only to avoid double-open errors from TrackedEnv.
+    // In standalone CLI context this is fine (no conflicting handles).
     let dims = read_dimensions(&db_path);
-    let vector_store =
-        VectorStore::new(&db_path, dims).or_else(|_| VectorStore::open_readonly(&db_path, dims));
+    let vector_store = VectorStore::new(&db_path, dims);
 
     // Run all checks in order
     let mut results = vec![
@@ -614,6 +612,51 @@ pub fn diagnose(project_path: &Path) -> Result<DoctorReport> {
             ));
         }
     }
+
+    results.push(check_embedding_cache(&db_path, &model_name));
+
+    Ok(DoctorReport::from_results(results))
+}
+
+/// Run all diagnostic checks using a pre-opened VectorStore.
+///
+/// Use this in serve context where a `SharedStores` handle already holds an
+/// open LMDB environment. Pass the `VectorStore` from `stores.vector_store()`.
+pub fn diagnose_with_store(project_path: &Path, store: &VectorStore) -> Result<DoctorReport> {
+    let db_info = match find_best_database(Some(project_path))? {
+        Some(info) => info,
+        None => {
+            let results = vec![check_find_database(project_path)];
+            return Ok(DoctorReport::from_results(results));
+        }
+    };
+
+    let db_path = db_info.db_path;
+    let project_path = db_info.project_path;
+
+    // Read model name for cache check
+    let model_name = fs::read_to_string(db_path.join("metadata.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("model_short_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let mut results = vec![
+        check_find_database(&project_path),
+        check_database_structure(&db_path),
+        check_model_consistency(&db_path),
+        check_git_root_placement(&db_path, &project_path),
+        check_file_integrity(&db_path, &project_path),
+    ];
+
+    // Use the provided VectorStore (no double-open risk)
+    results.push(check_chunk_integrity(store));
+    results.push(check_fts_health(&db_path));
+    results.push(check_lmdb_bloat(&db_path, store));
 
     results.push(check_embedding_cache(&db_path, &model_name));
 
