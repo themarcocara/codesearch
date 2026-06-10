@@ -397,6 +397,8 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | Variable | Description |
 |----------|-------------|
 | `CODESEARCH_SERVE_PORT` | Serve mode port (default: 39725) |
+| `CODESEARCH_SERVE_API_KEY` | API key for management endpoints (unset = no auth) |
+| `CODESEARCH_ALLOWED_ROOTS` | Semicolon-separated allowed roots for repo registration (unset = all allowed) |
 | `CODESEARCH_MCP_MODE` | MCP mode: auto, client, local |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
@@ -404,6 +406,15 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
+
+### Security
+
+When `codesearch serve` is exposed beyond a single trusted user (e.g. shared dev machines), two environment variables harden access:
+
+- **`CODESEARCH_SERVE_API_KEY`** — when set, management endpoints require this key via `Authorization: Bearer <key>` or `X-API-Key: <key>`. Health, status, and MCP search endpoints remain open.
+- **`CODESEARCH_ALLOWED_ROOTS`** — semicolon-separated list of filesystem roots. Repo registration is rejected for paths outside these roots. Prevents indexing arbitrary directories.
+
+Both are backward compatible: unset means no restriction.
 
 ### `.codesearchignore`
 

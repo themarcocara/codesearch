@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::response::Json as AxumJson;
+use axum::response::{IntoResponse, Json as AxumJson};
 use colored::Colorize;
 use dashmap::{DashMap, DashSet};
 use rmcp::transport::{
@@ -35,10 +35,10 @@ use tracing::{info, warn};
 
 use crate::cache::safe_canonicalize;
 use crate::constants::{
-    CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT,
-    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, LANG_CSHARP,
-    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
-    REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
+    ALLOWED_ROOTS_ENV, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
+    CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
+    HEALTH_PATH, LANG_CSHARP, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -2617,6 +2617,18 @@ async fn add_repo_handler(
         }
     };
 
+    // Validate the path is within allowed roots (if configured)
+    if let Err(e) = validate_path_within_allowed_roots(&canonical_path) {
+        warn!("Rejected repo registration: {}", e);
+        return (
+            StatusCode::FORBIDDEN,
+            axum::response::Json(json!({
+                "error": e,
+                "status": "forbidden"
+            })),
+        );
+    }
+
     // Register in repos.json
     let alias = {
         let mut config = match state.config.write() {
@@ -2945,6 +2957,135 @@ async fn remove_repo_handler(
     )
 }
 
+/// Validate that a canonical path falls under one of the allowed root directories.
+///
+/// When `CODESEARCH_ALLOWED_ROOTS` is unset or empty, all paths are allowed (backward compatible).
+/// When set, the path must start with at least one of the semicolon-separated roots.
+/// All comparisons use canonicalized paths with consistent separators.
+///
+/// Returns `Ok(())` if the path is allowed, or an error message describing the rejection.
+fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Result<(), String> {
+    let allowed_roots = match std::env::var(ALLOWED_ROOTS_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(()), // No restriction configured
+    };
+
+    let roots: Vec<PathBuf> = allowed_roots
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    // Canonicalize each root for reliable comparison (ignores roots that don't exist)
+    let canonical_roots: Vec<PathBuf> = roots
+        .into_iter()
+        .filter_map(|r| safe_canonicalize(&r).ok())
+        .collect();
+
+    if canonical_roots.is_empty() {
+        // All configured roots failed to canonicalize — reject for safety
+        return Err(format!(
+            "No valid roots found in {} — all configured paths failed to canonicalize",
+            ALLOWED_ROOTS_ENV
+        ));
+    }
+
+    // Path::starts_with returns true for exact match too (a path starts with itself),
+    // so no separate equality check is needed.
+    let allowed = canonical_roots
+        .iter()
+        .any(|root| canonical_path.starts_with(root));
+
+    if allowed {
+        Ok(())
+    } else {
+        let roots_display: Vec<String> = canonical_roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect();
+        Err(format!(
+            "Path '{}' is outside allowed roots: [{}]. Set {} to include this path or leave it empty to allow all paths.",
+            canonical_path.display(),
+            roots_display.join(", "),
+            ALLOWED_ROOTS_ENV
+        ))
+    }
+}
+
+/// Axum middleware that requires API key authentication for management endpoints.
+///
+/// When `CODESEARCH_SERVE_API_KEY` is set, requests must include the key in either:
+/// - `Authorization: Bearer <key>` header
+/// - `X-API-Key: <key>` header
+///
+/// When the env var is unset or empty, all requests pass through (backward compatible).
+///
+/// Management endpoints are: `POST /repos`, `DELETE /repos/:alias`,
+/// `POST /repos/:alias/reindex`, `POST /reload`.
+/// All other routes (health, status, MCP) are always unauthenticated.
+///
+/// Note: key comparison uses standard string equality, not constant-time comparison.
+/// Timing attacks are impractical on a localhost-only service.
+async fn require_admin_auth(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let method = req.method().clone();
+
+    // Only management endpoints require auth.
+    let is_management = matches!(path, "/repos" | "/reload")
+        || path.ends_with("/reindex")
+        || (path.starts_with("/repos/") && method == axum::http::Method::DELETE);
+
+    if !is_management {
+        return next.run(req).await;
+    }
+
+    let configured_key = match std::env::var(SERVE_API_KEY_ENV) {
+        Ok(k) if !k.is_empty() => k,
+        _ => return next.run(req).await,
+    };
+
+    // Check Authorization: Bearer <key>
+    if let Some(auth_header) = req.headers().get(axum::http::header::AUTHORIZATION) {
+        if let Ok(auth_val) = auth_header.to_str() {
+            if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
+                if bearer_key == configured_key {
+                    return next.run(req).await;
+                }
+            }
+        }
+    }
+
+    // Check X-API-Key: <key>
+    if let Some(api_key_header) = req.headers().get("X-API-Key") {
+        if let Ok(key_val) = api_key_header.to_str() {
+            if key_val == configured_key {
+                return next.run(req).await;
+            }
+        }
+    }
+
+    warn!(
+        "Rejected unauthenticated management request: {} {}",
+        method, path
+    );
+
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        axum::response::Json(json!({
+            "error": "Unauthorized: valid API key required",
+            "status": "unauthorized"
+        })),
+    )
+        .into_response()
+}
+
 /// Axum middleware: log MCP requests (method + path, skips /health spam).
 async fn log_mcp_requests(
     req: axum::extract::Request,
@@ -3015,6 +3156,12 @@ pub async fn run_serve(
     let mut config = ReposConfig::load().unwrap_or_default();
     for path in &register_paths {
         let canonical = safe_canonicalize(path).unwrap_or_else(|_| path.clone());
+
+        // Validate path against allowed roots (if configured)
+        if let Err(e) = validate_path_within_allowed_roots(&canonical) {
+            anyhow::bail!("Rejected --register path '{}': {}", path.display(), e);
+        }
+
         let alias = config.register(canonical);
         eprintln!("Registered repo '{}' -> {}", alias, path.display());
         info!("Registered repo '{}' -> {}", alias, path.display());
@@ -3077,13 +3224,16 @@ pub async fn run_serve(
 
     let mcp_service = StreamableHttpService::new(service_factory, session_manager, config);
 
-    // Build axum router with request logging.
+    // Build axum router with request logging and optional admin auth.
     // Stale-session recovery is handled client-side by the stdio proxy's retry
     // loop in `McpProxyService` (see src/mcp/mod.rs). Remote MCP clients that
     // are not spec-compliant must reconnect themselves — we do not attempt a
     // server-side transparent reconnect because that path opened a session leak
     // and could not actually reach OpenCode (TCP keep-alive failure happens
     // before the request hits this middleware).
+    //
+    // Layer order (outermost → innermost): log_mcp_requests → require_admin_auth → handler.
+    // Auth failures are logged because log_mcp_requests wraps the auth layer.
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
         .route(STATUS_PATH, axum::routing::get(status_handler))
@@ -3095,6 +3245,7 @@ pub async fn run_serve(
             axum::routing::post(reindex_handler),
         )
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
+        .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))
         .with_state(serve_state.clone());
 
@@ -3740,6 +3891,147 @@ mod tests {
             );
             let body: serde_json::Value = resp2.json().await.unwrap();
             assert_eq!(body["status"], "conflict");
+        }
+    }
+
+    /// Unit tests for `validate_path_within_allowed_roots`.
+    ///
+    /// These tests temporarily set/remove the `CODESEARCH_ALLOWED_ROOTS` env var.
+    /// A static Mutex serializes env mutation to prevent races under parallel test execution.
+    #[cfg(test)]
+    mod allowed_roots_tests {
+        use super::*;
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        /// Global lock to serialize env var mutations across parallel test threads.
+        static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        }
+
+        /// Helper: create a unique temp dir per test, return its canonical path.
+        fn temp_root(suffix: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("codesearch_test_roots_{}", suffix));
+            let _ = std::fs::create_dir_all(&dir);
+            safe_canonicalize(&dir).unwrap()
+        }
+
+        fn clear_env() {
+            std::env::remove_var(ALLOWED_ROOTS_ENV);
+        }
+
+        fn set_env(val: &str) {
+            std::env::set_var(ALLOWED_ROOTS_ENV, val);
+        }
+
+        #[test]
+        fn env_unset_allows_all() {
+            let _guard = lock();
+            clear_env();
+            let path = PathBuf::from("/some/random/path");
+            assert!(validate_path_within_allowed_roots(&path).is_ok());
+        }
+
+        #[test]
+        fn env_empty_allows_all() {
+            let _guard = lock();
+            set_env("");
+            let path = PathBuf::from("/some/random/path");
+            assert!(validate_path_within_allowed_roots(&path).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn path_within_root_is_allowed() {
+            let _guard = lock();
+            let root = temp_root("within");
+            set_env(&root.display().to_string());
+            let child = root.join("my-project");
+            let _ = std::fs::create_dir_all(&child);
+            let canonical_child = safe_canonicalize(&child).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn exact_root_match_is_allowed() {
+            let _guard = lock();
+            let root = temp_root("exact");
+            set_env(&root.display().to_string());
+            assert!(validate_path_within_allowed_roots(&root).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn path_outside_root_is_rejected() {
+            let _guard = lock();
+            let root = temp_root("outside");
+            set_env(&root.display().to_string());
+            // Construct a path guaranteed outside the temp root
+            let outside = if cfg!(windows) {
+                PathBuf::from("C:\\Windows\\System32")
+            } else {
+                PathBuf::from("/etc")
+            };
+            assert!(
+                !outside.starts_with(&root),
+                "Test setup error: outside path '{}' must not overlap root '{}'",
+                outside.display(),
+                root.display()
+            );
+            let result = validate_path_within_allowed_roots(&outside);
+            assert!(result.is_err(), "Expected rejection for path outside root");
+            assert!(result.unwrap_err().contains("outside allowed roots"));
+            clear_env();
+        }
+
+        #[test]
+        fn all_nonexistent_roots_rejects() {
+            let _guard = lock();
+            set_env("/nonexistent/path/abc;/also/nonexistent/xyz");
+            let some_path = std::env::temp_dir();
+            let canonical = safe_canonicalize(&some_path).unwrap();
+            let result = validate_path_within_allowed_roots(&canonical);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("No valid roots found"));
+            clear_env();
+        }
+
+        #[test]
+        fn semicolons_with_empty_segments_works() {
+            let _guard = lock();
+            let root = temp_root("semicolons");
+            set_env(&format!(";{};;", root.display()));
+            let child = root.join("project");
+            let _ = std::fs::create_dir_all(&child);
+            let canonical_child = safe_canonicalize(&child).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn multiple_roots_any_match() {
+            let _guard = lock();
+            let root1 = temp_root("multi1");
+            let root2 = temp_root("multi2");
+
+            set_env(&format!("{};{}", root1.display(), root2.display()));
+
+            // Path under root1
+            let child1 = root1.join("project");
+            let _ = std::fs::create_dir_all(&child1);
+            let canonical1 = safe_canonicalize(&child1).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical1).is_ok());
+
+            // Path under root2
+            let child2 = root2.join("project");
+            let _ = std::fs::create_dir_all(&child2);
+            let canonical2 = safe_canonicalize(&child2).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical2).is_ok());
+
+            clear_env();
         }
     }
 }
