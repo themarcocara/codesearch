@@ -61,10 +61,19 @@ fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
 }
 
 /// Atomically write a JSON file using temp+rename pattern.
-/// Writes to `<path>.tmp` first, then renames to `<path>`.
+/// Writes to a per-process-unique temp file in the same directory, then renames
+/// to `<path>`. The unique temp name (pid + monotonic counter) ensures two
+/// concurrent writers don't clobber a shared temp file; `rename` is atomic on
+/// the same filesystem so a crash mid-write never leaves a partial `<path>`.
 /// On failure the temp file is best-effort removed.
 fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
-    let tmp_path = path.with_extension("json.tmp");
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_name = format!("metadata.json.{}.{}.tmp", std::process::id(), seq);
+    let tmp_path = match path.parent() {
+        Some(dir) => dir.join(tmp_name),
+        None => path.with_extension("json.tmp"),
+    };
     if let Err(e) = fs::write(&tmp_path, serde_json::to_string_pretty(json)?) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e.into());
@@ -76,9 +85,15 @@ fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// Read-modify-write metadata.json atomically.
+/// Read-modify-write metadata.json, crash-atomically.
 /// Reads existing metadata (or starts with empty object), applies `merge_fn`,
-/// then writes via temp+rename so a crash mid-write never leaves an empty file.
+/// then writes via temp+rename so a crash mid-write never leaves a partial file.
+///
+/// NOTE: This protects against torn writes (crash atomicity), not against lost
+/// updates between concurrent writers — the read→mutate→write sequence is not
+/// guarded by a lock. Callers must serialize writes to the same `db_path`
+/// (today they are, via the per-repo vector_store lock). If parallel per-repo
+/// rebuilds are ever introduced, add an explicit per-repo write mutex here.
 pub fn merge_metadata_atomic(
     db_path: &Path,
     merge_fn: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),

@@ -327,10 +327,18 @@ pub fn render_detail(
     // Status label + color
     let (status_label, status_color) = detail_status_style(&repo.status, &repo.csharp_index);
 
-    // Truncate path if too long for the area
+    // Truncate path if too long for the area. Count by chars (not bytes) so a
+    // multi-byte UTF-8 path (e.g. C:\Users\Müller\...) never panics on a slice
+    // that lands inside a char boundary.
     let max_path_len = (area.width as usize).saturating_sub(20);
-    let display_path = if repo.path.len() > max_path_len && max_path_len > 3 {
-        format!("...{}", &repo.path[repo.path.len() - max_path_len + 3..])
+    let path_char_count = repo.path.chars().count();
+    let display_path = if path_char_count > max_path_len && max_path_len > 3 {
+        let tail: String = repo
+            .path
+            .chars()
+            .skip(path_char_count - (max_path_len - 3))
+            .collect();
+        format!("...{tail}")
     } else if repo.path.is_empty() {
         String::new()
     } else {
