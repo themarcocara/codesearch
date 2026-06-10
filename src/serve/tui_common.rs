@@ -512,8 +512,12 @@ pub fn render_footer(
 // Overlay rendering
 // ---------------------------------------------------------------------------
 
-/// Render a semi-transparent dark backdrop over the entire screen.
+/// Render an opaque dark backdrop over the entire screen, hiding content behind it.
 pub fn render_backdrop(f: &mut ratatui::Frame, area: Rect) {
+    // Clear all existing content first — without this, previously rendered text
+    // (table rows, header, etc.) persists in the buffer and shows through the
+    // background color of the Block widget.
+    f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(
         ratatui::widgets::Block::default().style(
             Style::default()
