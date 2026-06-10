@@ -107,16 +107,22 @@ impl ParsedCode {
         node_positions
     }
 
-    /// Walk the entire tree, calling a function for each node
-    fn walk_tree<F>(&self, node: Node, callback: &mut F)
+    /// Walk the entire tree, calling a function for each node.
+    ///
+    /// Uses an explicit stack to avoid deep recursion on large ASTs.
+    fn walk_tree<F>(&self, root: Node, callback: &mut F)
     where
         F: FnMut(Node),
     {
-        callback(node);
-
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            self.walk_tree(child, callback);
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            callback(node);
+            // Push children in reverse so leftmost is processed first (LIFO)
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.children(&mut cursor).collect();
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
         }
     }
 }

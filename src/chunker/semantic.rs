@@ -182,47 +182,59 @@ impl SemanticChunker {
         Ok(final_chunks)
     }
 
-    /// Emit a chunk for one `section` node (heading + direct content), then recurse
+    /// Emit a chunk for one `section` node (heading + direct content), then iterate
     /// into nested subsections with an extended breadcrumb.
+    ///
+    /// Uses an explicit stack to avoid deep recursion on pathological Markdown files.
     fn emit_md_section(
         &self,
-        section: Node,
+        root_section: Node,
         source: &[u8],
         path_str: &str,
-        context_stack: &[String],
+        root_context: &[String],
         chunks: &mut Vec<Chunk>,
     ) {
-        let mut cursor = section.walk();
-        let children: Vec<Node> = section.named_children(&mut cursor).collect();
+        let mut stack: Vec<(Node, Vec<String>)> = vec![(root_section, root_context.to_vec())];
 
-        // Heading text (if the section opens with one) extends the breadcrumb.
-        let heading_text = children
-            .first()
-            .filter(|c| Self::md_is_heading(c.kind()))
-            .map(|h| Self::md_heading_text(*h, source))
-            .unwrap_or_default();
+        while let Some((section, context_stack)) = stack.pop() {
+            let mut cursor = section.walk();
+            let children: Vec<Node> = section.named_children(&mut cursor).collect();
 
-        let mut new_context = context_stack.to_vec();
-        if !heading_text.is_empty() {
-            new_context.push(heading_text);
-        }
+            // Heading text (if the section opens with one) extends the breadcrumb.
+            let heading_text = children
+                .first()
+                .filter(|c| Self::md_is_heading(c.kind()))
+                .map(|h| Self::md_heading_text(*h, source))
+                .unwrap_or_default();
 
-        // Direct content = section start .. first nested subsection (exclusive).
-        let first_sub = children.iter().find(|c| c.kind() == "section");
-        let end_byte = first_sub.map_or_else(|| section.end_byte(), |s| s.start_byte());
-        if let Some(chunk) = Self::md_chunk(
-            source,
-            section.start_byte(),
-            end_byte,
-            section.start_position().row,
-            &new_context,
-            path_str,
-        ) {
-            chunks.push(chunk);
-        }
+            let mut new_context = context_stack;
+            if !heading_text.is_empty() {
+                new_context.push(heading_text);
+            }
 
-        for child in children.iter().filter(|c| c.kind() == "section") {
-            self.emit_md_section(*child, source, path_str, &new_context, chunks);
+            // Direct content = section start .. first nested subsection (exclusive).
+            let first_sub = children.iter().find(|c| c.kind() == "section");
+            let end_byte = first_sub.map_or_else(|| section.end_byte(), |s| s.start_byte());
+            if let Some(chunk) = Self::md_chunk(
+                source,
+                section.start_byte(),
+                end_byte,
+                section.start_position().row,
+                &new_context,
+                path_str,
+            ) {
+                chunks.push(chunk);
+            }
+
+            // Push child sections in reverse so leftmost is processed first
+            let sub_sections: Vec<Node> = children
+                .iter()
+                .filter(|c| c.kind() == "section")
+                .copied()
+                .collect();
+            for child in sub_sections.into_iter().rev() {
+                stack.push((child, new_context.clone()));
+            }
         }
     }
 
@@ -309,110 +321,122 @@ impl SemanticChunker {
         }
     }
 
-    /// Recursively visit AST nodes and extract chunks
+    /// Iterative DFS visit of AST nodes to extract chunks.
+    ///
+    /// Uses an explicit `Vec` stack instead of recursion to avoid stack overflow
+    /// on pathological tree-sitter ASTs. The C++ grammar, for example, represents
+    /// gperf-generated `NameAndGlyph wordlist[N]` as a chain of `comma_expression`
+    /// nodes with depth = N, producing AST depths of 15 000+ on real-world files.
     fn visit_node(
         &self,
-        node: Node,
+        root: Node,
         source: &[u8],
         extractor: &dyn LanguageExtractor,
-        context_stack: &[String],
+        root_context: &[String],
         chunks: &mut Vec<Chunk>,
         gap_tracker: &mut GapTracker,
     ) {
-        // Check if this node is a definition
-        let is_definition = extractor.definition_types().contains(&node.kind());
+        // Each stack entry carries the node and the context breadcrumb to use for
+        // that subtree.  The Vec is owned so the stack never borrows into itself.
+        let mut stack: Vec<(Node, Vec<String>)> = vec![(root, root_context.to_vec())];
 
-        if is_definition {
-            // Mark this range as covered (not a gap)
-            gap_tracker.mark_covered(node.start_position().row, node.end_position().row);
+        while let Some((node, context_stack)) = stack.pop() {
+            let is_definition = extractor.definition_types().contains(&node.kind());
 
-            // Also mark preceding doc comments and attributes as covered
-            // (they belong to this definition, not to a gap)
-            let mut prev = node.prev_named_sibling();
-            while let Some(sibling) = prev {
-                let sib_kind = sibling.kind();
-                if sib_kind == "line_comment"
-                    || sib_kind == "block_comment"
-                    || sib_kind == "attribute_item"
-                    || sib_kind == "attribute"
-                    || sib_kind == "decorator"
-                {
-                    if let Ok(text) = sibling.utf8_text(source) {
-                        let text = text.trim();
-                        // Only mark doc comments (///, //!, /**, /*!), attributes (#[...]),
-                        // and decorators (@...) as covered — not regular comments
-                        if text.starts_with("///")
-                            || text.starts_with("//!")
-                            || text.starts_with("/**")
-                            || text.starts_with("/*!")
-                            || text.starts_with("#[")
-                            || text.starts_with("@")
-                        {
-                            gap_tracker.mark_covered(
-                                sibling.start_position().row,
-                                sibling.end_position().row,
-                            );
-                            prev = sibling.prev_named_sibling();
-                            continue;
+            if is_definition {
+                // Mark this range as covered (not a gap)
+                gap_tracker.mark_covered(node.start_position().row, node.end_position().row);
+
+                // Also mark preceding doc comments and attributes as covered
+                // (they belong to this definition, not to a gap)
+                let mut prev = node.prev_named_sibling();
+                while let Some(sibling) = prev {
+                    let sib_kind = sibling.kind();
+                    if sib_kind == "line_comment"
+                        || sib_kind == "block_comment"
+                        || sib_kind == "attribute_item"
+                        || sib_kind == "attribute"
+                        || sib_kind == "decorator"
+                    {
+                        if let Ok(text) = sibling.utf8_text(source) {
+                            let text = text.trim();
+                            // Only mark doc comments (///, //!, /**, /*!), attributes (#[...]),
+                            // and decorators (@...) as covered — not regular comments
+                            if text.starts_with("///")
+                                || text.starts_with("//!")
+                                || text.starts_with("/**")
+                                || text.starts_with("/*!")
+                                || text.starts_with("#[")
+                                || text.starts_with("@")
+                            {
+                                gap_tracker.mark_covered(
+                                    sibling.start_position().row,
+                                    sibling.end_position().row,
+                                );
+                                prev = sibling.prev_named_sibling();
+                                continue;
+                            }
                         }
+                        break;
                     }
                     break;
                 }
-                break;
-            }
 
-            // Extract metadata using the language extractor
-            let kind = extractor.classify(node);
-            let name = extractor.extract_name(node, source);
-            let signature = extractor.extract_signature(node, source);
-            let docstring = extractor.extract_docstring(node, source);
+                // Extract metadata using the language extractor
+                let kind = extractor.classify(node);
+                let name = extractor.extract_name(node, source);
+                let signature = extractor.extract_signature(node, source);
+                let docstring = extractor.extract_docstring(node, source);
 
-            // Build label for context breadcrumb
-            let label = extractor
-                .build_label(node, source)
-                .or_else(|| name.as_ref().map(|n| format!("{:?}: {}", kind, n)))
-                .unwrap_or_else(|| format!("{:?}", kind));
+                // Build label for context breadcrumb
+                let label = extractor
+                    .build_label(node, source)
+                    .or_else(|| name.as_ref().map(|n| format!("{:?}: {}", kind, n)))
+                    .unwrap_or_else(|| format!("{:?}", kind));
 
-            // Build new context stack
-            let mut new_context = context_stack.to_vec();
-            new_context.push(label);
+                // Build new context stack
+                let mut new_context = context_stack;
+                new_context.push(label);
 
-            // Extract content (without docstring if we have it separate)
-            let content = match node.utf8_text(source) {
-                Ok(text) => text.to_string(),
-                Err(_) => return, // Skip if we can't extract text
-            };
+                // Extract content (without docstring if we have it separate)
+                let content = match node.utf8_text(source) {
+                    Ok(text) => text.to_string(),
+                    Err(_) => continue, // Skip if we can't extract text
+                };
 
-            // Create chunk
-            let path_str = context_stack
-                .first()
-                .map(|s| s.strip_prefix("File: ").unwrap_or(s))
-                .unwrap_or("")
-                .to_string();
+                // Create chunk
+                let path_str = new_context
+                    .first()
+                    .map(|s| s.strip_prefix("File: ").unwrap_or(s))
+                    .unwrap_or("")
+                    .to_string();
 
-            let mut chunk = Chunk::new(
-                content,
-                node.start_position().row,
-                node.end_position().row + 1, // tree-sitter uses 0-based, we use line count
-                kind,
-                path_str,
-            );
-            chunk.context = new_context.clone();
-            chunk.signature = signature;
-            chunk.docstring = docstring;
+                let mut chunk = Chunk::new(
+                    content,
+                    node.start_position().row,
+                    node.end_position().row + 1, // tree-sitter uses 0-based, we use line count
+                    kind,
+                    path_str,
+                );
+                chunk.context = new_context.clone();
+                chunk.signature = signature;
+                chunk.docstring = docstring;
 
-            chunks.push(chunk);
+                chunks.push(chunk);
 
-            // Visit children with updated context
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                self.visit_node(child, source, extractor, &new_context, chunks, gap_tracker);
-            }
-        } else {
-            // Not a definition, just visit children with same context
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                self.visit_node(child, source, extractor, context_stack, chunks, gap_tracker);
+                // Push children in reverse order so leftmost is processed first
+                let mut cursor = node.walk();
+                let children: Vec<Node> = node.named_children(&mut cursor).collect();
+                for child in children.into_iter().rev() {
+                    stack.push((child, new_context.clone()));
+                }
+            } else {
+                // Not a definition — visit children with the same context
+                let mut cursor = node.walk();
+                let children: Vec<Node> = node.named_children(&mut cursor).collect();
+                for child in children.into_iter().rev() {
+                    stack.push((child, context_stack.clone()));
+                }
             }
         }
     }
