@@ -2236,13 +2236,15 @@ mod tests {
 
 pub mod types;
 
-/// Resolve the serve base URL from env or default port.
+/// Resolve the serve base URL from env or default host/port.
 fn serve_url_from_env() -> String {
+    use crate::constants::resolve_serve_host;
+    let host = resolve_serve_host();
     let port = std::env::var(crate::constants::SERVE_PORT_ENV)
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(crate::constants::DEFAULT_SERVE_PORT);
-    format!("http://127.0.0.1:{}", port)
+    format!("http://{}:{}", host, port)
 }
 
 use crate::db_discovery::{find_best_database, load_repos_config};

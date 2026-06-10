@@ -20,6 +20,10 @@ pub enum IndexCommands {
         /// Create global index instead of local
         #[arg(short = 'g', long)]
         global: bool,
+
+        /// Embedding model (overrides global --model for this repo)
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Remove the index (local or global, auto-detected)
@@ -253,6 +257,10 @@ pub enum Commands {
         #[arg(default_value = "start")]
         action: ServeAction,
 
+        /// Host to bind to (default: 127.0.0.1, override with CODESEARCH_SERVE_HOST; use 0.0.0.0 for containers)
+        #[arg(short, long)]
+        host: Option<String>,
+
         /// Port to listen on (default: 39725, override with CODESEARCH_SERVE_PORT)
         #[arg(short, long)]
         port: Option<u16>,
@@ -378,14 +386,15 @@ pub enum Commands {
 // ---------------------------------------------------------------------------
 
 /// Base URL for the codesearch serve instance.
-/// Override via `CODESEARCH_SERVE_PORT` env var (see `constants::SERVE_PORT_ENV`).
+/// Override via `CODESEARCH_SERVE_HOST` and `CODESEARCH_SERVE_PORT` env vars.
 fn serve_base_url() -> String {
-    use crate::constants::DEFAULT_SERVE_PORT;
+    use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT};
+    let host = resolve_serve_host();
     let port = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(DEFAULT_SERVE_PORT);
-    format!("http://127.0.0.1:{port}")
+    format!("http://{host}:{port}")
 }
 
 /// Trigger a symbol reindex by calling the running serve instance's HTTP API.
@@ -537,7 +546,24 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     IndexCommands::Add {
                         path: add_path,
                         global,
-                    } => crate::index::add_to_index(add_path, global, cancel_token.clone()).await,
+                        model,
+                    } => {
+                        let mt = model
+                            .as_deref()
+                            .and_then(|m| {
+                                let parsed = ModelType::parse(m);
+                                if parsed.is_none() {
+                                    eprintln!("Unknown model: '{}'. Available models:", m);
+                                    eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
+                                    eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
+                                    eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large");
+                                    std::process::exit(1);
+                                }
+                                parsed
+                            })
+                            .or(model_type);
+                        crate::index::add_to_index(add_path, global, mt, cancel_token.clone()).await
+                    }
                     IndexCommands::Remove {
                         path: rm_path,
                         keep_config,
@@ -560,7 +586,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
                 if add || is_add_cmd {
                     let effective_path = if is_add_cmd { None } else { path };
-                    crate::index::add_to_index(effective_path, global, cancel_token.clone()).await
+                    crate::index::add_to_index(
+                        effective_path,
+                        global,
+                        model_type,
+                        cancel_token.clone(),
+                    )
+                    .await
                 } else if remove || is_rm_cmd {
                     let effective_path = if is_rm_cmd { None } else { path };
                     crate::index::remove_from_index(effective_path, keep_config).await
@@ -601,6 +633,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Serve {
             action,
+            host,
             port,
             register,
             quiet,
@@ -620,7 +653,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
                         eprintln!("Warning: failed to initialize serve logger: {}", e);
                     }
-                    crate::serve::run_serve(port, register, no_tui, cancel_token.clone()).await
+                    crate::serve::run_serve(host, port, register, no_tui, cancel_token.clone())
+                        .await
                 }
             }
         }

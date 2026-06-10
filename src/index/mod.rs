@@ -1429,6 +1429,7 @@ pub async fn prune_index() -> Result<()> {
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
+    model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
@@ -1444,7 +1445,7 @@ pub async fn add_to_index(
         let path = path.clone();
         // Alias is always derived from the directory name; the CLI no longer
         // lets the user set it. Pass None so serve derives it consistently.
-        async move { try_delegate_add_to_serve(&path, &None, global).await }
+        async move { try_delegate_add_to_serve(&path, &None, global, &model).await }
     })
     .await;
 
@@ -1564,7 +1565,7 @@ pub async fn add_to_index(
             false,
             false,
             true,
-            None,
+            model,
             cancel_token.clone(),
         )
         .await?;
@@ -1577,7 +1578,7 @@ pub async fn add_to_index(
             false,
             false,
             false,
-            None,
+            model,
             cancel_token,
         )
         .await?;
@@ -1937,14 +1938,15 @@ async fn try_delegate_reindex_to_serve(
     path: &Option<PathBuf>,
     force: bool,
 ) -> std::result::Result<(String, PathBuf), DelegateError> {
-    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+    use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SERVE_PORT);
+    let host = resolve_serve_host();
 
-    let base_url = format!("http://127.0.0.1:{}", port);
+    let base_url = format!("http://{}:{}", host, port);
 
     // 1. Health check — is serve running (and responsive)?
     let client = reqwest::Client::builder()
@@ -2151,15 +2153,17 @@ pub(crate) async fn try_delegate_add_to_serve(
     path: &Option<PathBuf>,
     alias: &Option<String>,
     global: bool,
+    model: &Option<ModelType>,
 ) -> std::result::Result<(String, PathBuf), DelegateError> {
-    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+    use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SERVE_PORT);
+    let host = resolve_serve_host();
 
-    let base_url = format!("http://127.0.0.1:{}", port);
+    let base_url = format!("http://{}:{}", host, port);
 
     // 1. Health check — is serve running (and responsive)?
     let client = reqwest::Client::builder()
@@ -2194,6 +2198,9 @@ pub(crate) async fn try_delegate_add_to_serve(
     });
     if let Some(a) = alias {
         body["alias"] = serde_json::Value::String(a.clone());
+    }
+    if let Some(m) = model {
+        body["model"] = serde_json::Value::String(m.short_name().to_string());
     }
 
     // 4. POST /repos
@@ -2233,14 +2240,15 @@ pub(crate) async fn try_delegate_add_to_serve(
 pub(crate) async fn try_delegate_rm_to_serve(
     path: &Option<PathBuf>,
 ) -> std::result::Result<(String, PathBuf), String> {
-    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+    use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SERVE_PORT);
+    let host = resolve_serve_host();
 
-    let base_url = format!("http://127.0.0.1:{}", port);
+    let base_url = format!("http://{}:{}", host, port);
 
     // 1. Health check
     let client = reqwest::Client::builder()
