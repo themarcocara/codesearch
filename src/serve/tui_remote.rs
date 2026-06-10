@@ -108,8 +108,11 @@ async fn run_remote_tui_loop(
     // Optional overlay
     let mut overlay: Option<OverlayState> = None;
 
-    // Channel for async doctor results
-    let (doctor_tx, mut doctor_rx) = tokio::sync::mpsc::channel::<OverlayState>(1);
+    // Channel for async doctor/info results, tagged with a request generation
+    // so a late result from a dismissed or superseded request is discarded.
+    let (doctor_tx, mut doctor_rx) = tokio::sync::mpsc::channel::<(u64, OverlayState)>(1);
+    // Monotonic id of the most recent doctor/info request; bumped on every spawn.
+    let mut doctor_gen: u64 = 0;
 
     loop {
         // Fetch status from serve
@@ -142,9 +145,13 @@ async fn run_remote_tui_loop(
             }
         }
 
-        // Check if doctor result arrived
-        if let Ok(result) = doctor_rx.try_recv() {
-            overlay = Some(result);
+        // Check if doctor/info result arrived. Only apply it if the user is
+        // still waiting on the current request (spinner showing and generation
+        // matches); otherwise it is stale — drain and drop it.
+        if let Ok((gen, result)) = doctor_rx.try_recv() {
+            if gen == doctor_gen && matches!(overlay, Some(OverlayState::DoctorRunning { .. })) {
+                overlay = Some(result);
+            }
         }
 
         // Render
@@ -239,6 +246,8 @@ async fn run_remote_tui_loop(
                             overlay = Some(OverlayState::DoctorRunning {
                                 alias: alias.clone(),
                             });
+                            doctor_gen += 1;
+                            let gen = doctor_gen;
                             let tx = doctor_tx.clone();
                             tokio::spawn(async move {
                                 let result = match reqwest::Client::new()
@@ -285,7 +294,7 @@ async fn run_remote_tui_loop(
                                         }
                                     }
                                 };
-                                let _ = tx.send(result).await;
+                                let _ = tx.send((gen, result)).await;
                             });
                         }
                     }
@@ -295,6 +304,8 @@ async fn run_remote_tui_loop(
                             overlay = Some(OverlayState::DoctorRunning {
                                 alias: alias.clone(),
                             });
+                            doctor_gen += 1;
+                            let gen = doctor_gen;
                             let tx = doctor_tx.clone();
                             let serve = serve_url.to_string();
                             tokio::spawn(async move {
@@ -342,7 +353,7 @@ async fn run_remote_tui_loop(
                                         ],
                                     },
                                 };
-                                let _ = tx.send(result).await;
+                                let _ = tx.send((gen, result)).await;
                             });
                         }
                     }

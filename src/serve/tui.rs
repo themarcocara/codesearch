@@ -78,8 +78,12 @@ async fn run_tui_loop(
     // Optional modal overlay (dismissed by Esc)
     let mut overlay: Option<OverlayState> = None;
 
-    // Channel to receive doctor results from background task
-    let (doctor_tx, mut doctor_rx) = tokio::sync::mpsc::channel::<OverlayState>(1);
+    // Channel to receive doctor results from background task. The payload is
+    // tagged with a request generation so a late result from a request the
+    // user already dismissed (or superseded with a newer one) is ignored.
+    let (doctor_tx, mut doctor_rx) = tokio::sync::mpsc::channel::<(u64, OverlayState)>(1);
+    // Monotonic id of the most recent doctor request; bumped on every spawn.
+    let mut doctor_gen: u64 = 0;
 
     // Main loop
     loop {
@@ -134,9 +138,13 @@ async fn run_tui_loop(
             }
         })?;
 
-        // Check if doctor result arrived from background task
-        if let Ok(result) = doctor_rx.try_recv() {
-            overlay = Some(result);
+        // Check if doctor result arrived from background task. Only apply it if
+        // the user is still waiting on the current request (spinner showing and
+        // generation matches); otherwise the result is stale — drain and drop it.
+        if let Ok((gen, result)) = doctor_rx.try_recv() {
+            if gen == doctor_gen && matches!(overlay, Some(OverlayState::DoctorRunning { .. })) {
+                overlay = Some(result);
+            }
         }
 
         // Poll for key events
@@ -182,8 +190,11 @@ async fn run_tui_loop(
                             overlay = Some(OverlayState::DoctorRunning {
                                 alias: alias.clone(),
                             });
-                            // Spawn background task to run diagnostics
-                            spawn_doctor(alias, state.clone(), doctor_tx.clone());
+                            // Spawn background task to run diagnostics, tagged
+                            // with a fresh generation so its result is only
+                            // applied if this request is still the current one.
+                            doctor_gen += 1;
+                            spawn_doctor(alias, state.clone(), doctor_tx.clone(), doctor_gen);
                         }
                     }
                     KeyAction::ForceReindex(idx) => {
@@ -486,24 +497,29 @@ fn walkdir_size(path: &std::path::Path) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Spawn a background task to run doctor diagnostics for the given repo alias.
-/// Sends the result overlay back via `tx` when done.
+/// Sends the result overlay back via `tx` when done, tagged with `gen` so the
+/// receiver can discard results from dismissed or superseded requests.
 fn spawn_doctor(
     alias: String,
     state: Arc<ServeState>,
-    tx: tokio::sync::mpsc::Sender<OverlayState>,
+    tx: tokio::sync::mpsc::Sender<(u64, OverlayState)>,
+    gen: u64,
 ) {
     let resolved = state.config.read().ok().and_then(|c| c.resolve(&alias));
     let project_path = match resolved {
         Some(p) => p,
         None => {
-            let _ = tx.try_send(OverlayState::Doctor {
-                alias,
-                results: vec![
-                    "✗ Cannot resolve alias to path".to_string(),
-                    String::new(),
-                    "  [Esc] close".to_string(),
-                ],
-            });
+            let _ = tx.try_send((
+                gen,
+                OverlayState::Doctor {
+                    alias,
+                    results: vec![
+                        "✗ Cannot resolve alias to path".to_string(),
+                        String::new(),
+                        "  [Esc] close".to_string(),
+                    ],
+                },
+            ));
             return;
         }
     };
@@ -544,7 +560,7 @@ fn spawn_doctor(
         .await;
 
         // Send result back to TUI loop (non-blocking — if channel closed, just drop it)
-        let _ = tx.send(result_overlay).await;
+        let _ = tx.send((gen, result_overlay)).await;
     });
 }
 
