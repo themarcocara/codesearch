@@ -1087,4 +1087,53 @@ impl MyStruct {
             assert!(chunk.context[0].contains("File:"));
         }
     }
+
+    /// Build source whose tree-sitter AST is `depth` levels deep, using nested
+    /// parenthesized expressions (`((( ... 0 ... )))`). Each pair of parens adds
+    /// one AST level, so this deterministically produces a very deep tree
+    /// regardless of grammar-specific list/comma representations.
+    fn deeply_nested_rust_source(depth: usize) -> String {
+        let mut src = String::with_capacity(depth * 2 + 32);
+        src.push_str("fn deep() -> i32 {\n    ");
+        for _ in 0..depth {
+            src.push('(');
+        }
+        src.push('0');
+        for _ in 0..depth {
+            src.push(')');
+        }
+        src.push_str("\n}\n");
+        src
+    }
+
+    /// Regression test for #112: indexing a file with a pathologically deep AST
+    /// (the original report was a ClickHouse gperf table ~17.7k nodes deep) used
+    /// to overflow the stack in the recursive `visit_node`. The traversal is now
+    /// iterative (heap-allocated stack), so it must complete even on a tiny
+    /// thread stack. We run it on a 1 MiB stack with a 50k-deep AST: the
+    /// iterative walk lives on the heap and succeeds, while any reintroduction of
+    /// recursion would blow this stack and fail the test deterministically.
+    #[test]
+    fn test_deeply_nested_ast_does_not_overflow() {
+        let src = deeply_nested_rust_source(50_000);
+
+        let handle = std::thread::Builder::new()
+            .stack_size(1024 * 1024) // 1 MiB — far too small for 50k recursive frames
+            .spawn(move || {
+                let mut chunker = SemanticChunker::new(100, 2000, 10);
+                let path = Path::new("deep.rs");
+                chunker
+                    .chunk_semantic(Language::Rust, path, &src)
+                    .map(|chunks| chunks.len())
+            })
+            .expect("spawn chunker thread");
+
+        let result = handle
+            .join()
+            .expect("chunker thread must not overflow the stack on a deep AST");
+        assert!(
+            result.is_ok(),
+            "deep-AST semantic chunking should succeed, got {result:?}"
+        );
+    }
 }
