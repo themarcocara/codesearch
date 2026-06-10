@@ -11,6 +11,7 @@
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
 mod tui;
+mod tui_common;
 mod tui_remote;
 
 use std::net::SocketAddr;

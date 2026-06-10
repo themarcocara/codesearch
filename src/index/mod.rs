@@ -15,7 +15,7 @@ use crate::db_discovery::{
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
-use crate::vectordb::VectorStore;
+use crate::vectordb::{merge_metadata_atomic, VectorStore};
 
 // Index manager module
 mod manager;
@@ -50,18 +50,19 @@ pub(crate) fn ensure_hnsw_index_if_needed(
 
 /// Update metadata.json with current chunk/file counts so that `status(projects)`
 /// can report accurate numbers without opening LMDB.
+/// Uses atomic read-modify-write (temp+rename) so a crash never leaves an empty file.
 pub(crate) fn update_metadata_stats(db_path: &Path, total_chunks: usize, total_files: usize) {
-    let metadata_path = db_path.join("metadata.json");
-    if let Ok(content) = fs::read_to_string(&metadata_path) {
-        if let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&content) {
-            metadata["total_chunks"] = serde_json::Value::Number(total_chunks.into());
-            metadata["total_files"] = serde_json::Value::Number(total_files.into());
-            if let Ok(pretty) = serde_json::to_string_pretty(&metadata) {
-                if let Err(e) = fs::write(&metadata_path, pretty) {
-                    tracing::warn!("Failed to update metadata stats: {}", e);
-                }
-            }
-        }
+    if let Err(e) = merge_metadata_atomic(db_path, |obj| {
+        obj.insert(
+            "total_chunks".to_string(),
+            serde_json::Value::Number(total_chunks.into()),
+        );
+        obj.insert(
+            "total_files".to_string(),
+            serde_json::Value::Number(total_files.into()),
+        );
+    }) {
+        tracing::warn!("Failed to update metadata stats: {}", e);
     }
 }
 
@@ -976,26 +977,27 @@ async fn index_with_options(
 
         // Save metadata — best-effort: log and continue on failure so the
         // partial chunks we already built are still searchable.
-        let metadata_json = serde_json::to_string_pretty(&serde_json::json!({
-            "model_short_name": model_type.short_name(),
-            "model_name": model_type.name(),
-            "dimensions": model_type.dimensions(),
-            "indexed_at": chrono::Utc::now().to_rfc3339(),
-            "partial": true,
-        }));
-        match metadata_json {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(db_path.join("metadata.json"), json) {
-                    log_print!("{}   metadata.json write warning: {}", "⚠️ ".yellow(), e);
-                }
-            }
-            Err(e) => {
-                log_print!(
-                    "{}   metadata.json serialise warning: {}",
-                    "⚠️ ".yellow(),
-                    e
-                );
-            }
+        // Uses read-modify-write so existing stats (total_chunks/total_files) are preserved.
+        if let Err(e) = merge_metadata_atomic(&db_path, |obj| {
+            obj.insert(
+                "model_short_name".to_string(),
+                serde_json::Value::String(model_type.short_name().to_string()),
+            );
+            obj.insert(
+                "model_name".to_string(),
+                serde_json::Value::String(model_type.name().to_string()),
+            );
+            obj.insert(
+                "dimensions".to_string(),
+                serde_json::Value::Number(model_type.dimensions().into()),
+            );
+            obj.insert(
+                "indexed_at".to_string(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+            obj.insert("partial".to_string(), serde_json::Value::Bool(true));
+        }) {
+            log_print!("{}   metadata.json write warning: {}", "⚠️ ".yellow(), e);
         }
 
         // Update FileMetaStore with the files that were actually processed.
@@ -1141,20 +1143,29 @@ async fn index_with_options(
     store.build_index()?;
     let _storage_duration = storage_start.elapsed();
 
-    // Save model metadata.  `partial: false` is explicit so the schema matches
-    // the cancel path (which writes `partial: true`); readers can always check
-    // the field regardless of how indexing completed.
-    let metadata = serde_json::json!({
-        "model_short_name": model_short_name,
-        "model_name": model_name,
-        "dimensions": model_dimensions,
-        "indexed_at": chrono::Utc::now().to_rfc3339(),
-        "partial": false,
-    });
-    std::fs::write(
-        db_path.join("metadata.json"),
-        serde_json::to_string_pretty(&metadata)?,
-    )?;
+    // Save model metadata (read-modify-write so existing stats are preserved).
+    // `partial: false` is explicit so the schema matches the cancel path
+    // (which writes `partial: true`); readers can always check the field
+    // regardless of how indexing completed.
+    merge_metadata_atomic(&db_path, |obj| {
+        obj.insert(
+            "model_short_name".to_string(),
+            serde_json::Value::String(model_short_name.to_string()),
+        );
+        obj.insert(
+            "model_name".to_string(),
+            serde_json::Value::String(model_name.to_string()),
+        );
+        obj.insert(
+            "dimensions".to_string(),
+            serde_json::Value::Number(model_dimensions.into()),
+        );
+        obj.insert(
+            "indexed_at".to_string(),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        obj.insert("partial".to_string(), serde_json::Value::Bool(false));
+    })?;
 
     // Update FileMetaStore with new chunk IDs (incremental mode)
     if is_incremental {
