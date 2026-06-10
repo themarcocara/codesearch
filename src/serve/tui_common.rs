@@ -512,27 +512,9 @@ pub fn render_footer(
 // Overlay rendering
 // ---------------------------------------------------------------------------
 
-/// Render an opaque dark backdrop over the entire screen, hiding content behind it.
-pub fn render_backdrop(f: &mut ratatui::Frame, area: Rect) {
-    // Clear all existing content first — without this, previously rendered text
-    // (table rows, header, etc.) persists in the buffer and shows through the
-    // background color of the Block widget.
-    f.render_widget(ratatui::widgets::Clear, area);
-    f.render_widget(
-        ratatui::widgets::Block::default().style(
-            Style::default()
-                .bg(Color::Rgb(10, 10, 20))
-                .fg(Color::DarkGray),
-        ),
-        area,
-    );
-}
-
 /// Render the current overlay on top of the frame.
+/// The table/footer remain visible outside the modal — only the modal area itself is cleared.
 pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState) {
-    // Always draw backdrop first to hide content behind modal
-    render_backdrop(f, area);
-
     match overlay {
         OverlayState::Info {
             alias,
@@ -668,11 +650,8 @@ pub fn render_centered_modal(
         height: content_height.min(area.height),
     };
 
-    // Clear the area behind the modal
-    f.render_widget(
-        ratatui::widgets::Block::default().style(Style::default().bg(Color::Rgb(20, 20, 35))),
-        modal_area,
-    );
+    // Clear the modal area so no table text shows through the modal interior
+    f.render_widget(ratatui::widgets::Clear, modal_area);
 
     let block = ratatui::widgets::Block::default()
         .borders(Borders::ALL)
