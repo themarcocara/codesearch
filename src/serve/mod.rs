@@ -2761,10 +2761,21 @@ async fn add_repo_handler(
     }
 
     // Parse optional model override from request body.
-    let model_override: Option<crate::embed::ModelType> = body
-        .model
-        .as_deref()
-        .and_then(crate::embed::ModelType::parse);
+    let model_override: Option<crate::embed::ModelType> = match body.model.as_deref() {
+        Some(model_str) => match crate::embed::ModelType::parse(model_str) {
+            Some(mt) => Some(mt),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::response::Json(json!({
+                        "error": format!("Unknown model: '{}'. Use one of: minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm, bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q, jina-code, e5-multilingual, mxbai-large, modernbert-large", model_str),
+                        "status": "error"
+                    })),
+                );
+            }
+        },
+        None => None,
+    };
 
     // Spawn the heavy indexing work in the background.  Returns 202 immediately.
     let alias_bg = alias.clone();
