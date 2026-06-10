@@ -752,6 +752,7 @@ impl IndexManager {
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
+        model_override: Option<ModelType>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use anyhow::Context;
@@ -763,7 +764,7 @@ impl IndexManager {
         // or clear() may indirectly remove it. We preserve model info so we can
         // write it back before the reindex starts.
         let metadata_path = db_path.join("metadata.json");
-        let preserved_metadata: serde_json::Value = if metadata_path.exists() {
+        let mut preserved_metadata: serde_json::Value = if metadata_path.exists() {
             let content = std::fs::read_to_string(&metadata_path)
                 .with_context(|| format!("Failed to read {}", metadata_path.display()))?;
             serde_json::from_str(&content)
@@ -779,6 +780,19 @@ impl IndexManager {
                 "dimensions": 384,
             })
         };
+
+        // Apply model override if provided (e.g. from `index add --model`)
+        if let Some(ref mt) = model_override {
+            preserved_metadata["model_short_name"] =
+                serde_json::Value::String(mt.short_name().to_string());
+            preserved_metadata["model_name"] = serde_json::Value::String(mt.name().to_string());
+            preserved_metadata["dimensions"] = serde_json::Value::Number(mt.dimensions().into());
+            info!(
+                "📝 Model override applied: {} ({} dims)",
+                mt.short_name(),
+                mt.dimensions()
+            );
+        }
         let model_name = preserved_metadata
             .get("model_short_name")
             .and_then(|v| v.as_str())

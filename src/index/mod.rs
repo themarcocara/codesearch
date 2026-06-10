@@ -1429,6 +1429,7 @@ pub async fn prune_index() -> Result<()> {
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
+    model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
@@ -1444,7 +1445,7 @@ pub async fn add_to_index(
         let path = path.clone();
         // Alias is always derived from the directory name; the CLI no longer
         // lets the user set it. Pass None so serve derives it consistently.
-        async move { try_delegate_add_to_serve(&path, &None, global).await }
+        async move { try_delegate_add_to_serve(&path, &None, global, &model).await }
     })
     .await;
 
@@ -1564,7 +1565,7 @@ pub async fn add_to_index(
             false,
             false,
             true,
-            None,
+            model,
             cancel_token.clone(),
         )
         .await?;
@@ -1577,7 +1578,7 @@ pub async fn add_to_index(
             false,
             false,
             false,
-            None,
+            model,
             cancel_token,
         )
         .await?;
@@ -2151,6 +2152,7 @@ pub(crate) async fn try_delegate_add_to_serve(
     path: &Option<PathBuf>,
     alias: &Option<String>,
     global: bool,
+    model: &Option<ModelType>,
 ) -> std::result::Result<(String, PathBuf), DelegateError> {
     use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
@@ -2194,6 +2196,9 @@ pub(crate) async fn try_delegate_add_to_serve(
     });
     if let Some(a) = alias {
         body["alias"] = serde_json::Value::String(a.clone());
+    }
+    if let Some(m) = model {
+        body["model"] = serde_json::Value::String(m.short_name().to_string());
     }
 
     // 4. POST /repos

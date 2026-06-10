@@ -20,6 +20,10 @@ pub enum IndexCommands {
         /// Create global index instead of local
         #[arg(short = 'g', long)]
         global: bool,
+
+        /// Embedding model (overrides global --model for this repo)
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Remove the index (local or global, auto-detected)
@@ -537,7 +541,24 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     IndexCommands::Add {
                         path: add_path,
                         global,
-                    } => crate::index::add_to_index(add_path, global, cancel_token.clone()).await,
+                        model,
+                    } => {
+                        let mt = model
+                            .as_deref()
+                            .and_then(|m| {
+                                let parsed = ModelType::parse(m);
+                                if parsed.is_none() {
+                                    eprintln!("Unknown model: '{}'. Available models:", m);
+                                    eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
+                                    eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
+                                    eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large");
+                                    std::process::exit(1);
+                                }
+                                parsed
+                            })
+                            .or(model_type);
+                        crate::index::add_to_index(add_path, global, mt, cancel_token.clone()).await
+                    }
                     IndexCommands::Remove {
                         path: rm_path,
                         keep_config,
@@ -560,7 +581,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
                 if add || is_add_cmd {
                     let effective_path = if is_add_cmd { None } else { path };
-                    crate::index::add_to_index(effective_path, global, cancel_token.clone()).await
+                    crate::index::add_to_index(
+                        effective_path,
+                        global,
+                        model_type,
+                        cancel_token.clone(),
+                    )
+                    .await
                 } else if remove || is_rm_cmd {
                     let effective_path = if is_rm_cmd { None } else { path };
                     crate::index::remove_from_index(effective_path, keep_config).await

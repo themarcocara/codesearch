@@ -644,7 +644,8 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
             alias_bg
         );
 
-        match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores).await {
+        match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores, None).await
+        {
             Ok(()) => {
                 tracing::info!("TUI: Force reindex complete for '{}'", alias_bg);
             }

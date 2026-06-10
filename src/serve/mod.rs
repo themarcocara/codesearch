@@ -2503,7 +2503,9 @@ async fn reindex_handler(
             );
 
             // 2. Clear data and reindex
-            match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores).await {
+            match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores, None)
+                .await
+            {
                 Ok(()) => {
                     tracing::info!("Force reindex complete for '{}'", alias_bg);
                 }
@@ -2586,6 +2588,8 @@ struct AddRepoRequest {
     path: PathBuf,
     /// Optional alias to register under. If omitted, the directory name is used.
     alias: Option<String>,
+    /// Optional embedding model override (e.g., "bge-small", "nomic-v1.5").
+    model: Option<String>,
 }
 
 /// Add-repo handler: POST /repos
@@ -2756,6 +2760,12 @@ async fn add_repo_handler(
         );
     }
 
+    // Parse optional model override from request body.
+    let model_override: Option<crate::embed::ModelType> = body
+        .model
+        .as_deref()
+        .and_then(crate::embed::ModelType::parse);
+
     // Spawn the heavy indexing work in the background.  Returns 202 immediately.
     let alias_bg = alias.clone();
     let state_bg = state.clone();
@@ -2768,7 +2778,14 @@ async fn add_repo_handler(
             project_path.display()
         );
 
-        match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores).await {
+        match IndexManager::force_reindex_with_stores(
+            &project_path,
+            &db_path,
+            &stores,
+            model_override,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!(
                     "Index created for '{}' ({})",
