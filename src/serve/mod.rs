@@ -44,6 +44,29 @@ use crate::db_discovery::repos::ReposConfig;
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
+
+// ---------------------------------------------------------------------------
+// Network auth configuration (captured at startup, passed to middleware)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the `require_auth_for_network` middleware.
+///
+/// Captured once at serve startup so the middleware doesn't re-read env vars
+/// on every request. Passed via `axum::Extension`.
+#[derive(Clone)]
+struct NetworkAuthConfig {
+    /// Whether the server is bound to a non-localhost address.
+    is_network_bind: bool,
+    /// The API key to validate (captured from env var at startup).
+    /// `None` means no auth (localhost-only mode).
+    api_key: Option<String>,
+}
+
+/// Check whether a host address is a localhost address.
+fn is_localhost_host(host: &str) -> bool {
+    host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
+}
+
 /// Lightweight repo status label derived from DashMap state only (no DB opens).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepoStateLabel {
@@ -3122,33 +3145,38 @@ async fn require_admin_auth(
 /// Uses the same `CODESEARCH_SERVE_API_KEY` env var and the same
 /// `Authorization: Bearer <key>` / `X-API-Key: <key>` header pattern.
 ///
+/// Configuration is captured at startup via `NetworkAuthConfig` extension,
+/// so env-var changes after startup have no effect (defense in depth).
+///
 /// When the server is bound to localhost (default), this middleware passes
 /// all requests through (backward compatible).
 async fn require_auth_for_network(
+    axum::Extension(auth_config): axum::Extension<NetworkAuthConfig>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let configured_key = match std::env::var(SERVE_API_KEY_ENV) {
-        Ok(k) if !k.is_empty() => k,
-        _ => return next.run(req).await,
-    };
-
-    // Check if bound to localhost — if so, skip (backward compatible).
-    // We rely on the startup check in run_serve() to ensure API key is set
-    // when non-localhost. But if someone removes the env var after startup,
-    // we still check here for defense in depth.
-    let host_env = std::env::var(crate::constants::SERVE_HOST_ENV)
-        .ok()
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| crate::constants::DEFAULT_SERVE_HOST.to_string());
-    let is_localhost =
-        host_env == "127.0.0.1" || host_env == "::1" || host_env.eq_ignore_ascii_case("localhost");
-
-    if is_localhost {
+    // Localhost binding: no auth required.
+    if !auth_config.is_network_bind {
         return next.run(req).await;
     }
 
-    // Non-localhost: require the API key on ALL requests.
+    let configured_key = match &auth_config.api_key {
+        Some(k) => k,
+        None => {
+            // Should never happen — startup check refuses non-localhost without key.
+            // But defense in depth: reject if key somehow missing.
+            warn!("Network bind without API key — rejecting request");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::response::Json(json!({
+                    "error": "Server misconfiguration: API key required but not configured",
+                    "status": "error"
+                })),
+            )
+                .into_response();
+        }
+    };
+
     // Check Authorization: Bearer <key>
     if let Some(auth_header) = req.headers().get(axum::http::header::AUTHORIZATION) {
         if let Ok(auth_val) = auth_header.to_str() {
@@ -3258,9 +3286,7 @@ pub async fn run_serve(
     });
 
     // ── Security check: non-localhost binding requires API key ──
-    let is_localhost = effective_host == "127.0.0.1"
-        || effective_host == "::1"
-        || effective_host.eq_ignore_ascii_case("localhost");
+    let is_localhost = is_localhost_host(&effective_host);
 
     if !is_localhost {
         let api_key = std::env::var(SERVE_API_KEY_ENV)
@@ -3276,6 +3302,14 @@ pub async fn run_serve(
             );
         }
     }
+
+    // Capture auth config at startup for the middleware.
+    let network_auth = NetworkAuthConfig {
+        is_network_bind: !is_localhost,
+        api_key: std::env::var(SERVE_API_KEY_ENV)
+            .ok()
+            .filter(|k| !k.is_empty()),
+    };
 
     // Load repos config (register any --register paths first)
     let mut config = ReposConfig::load().unwrap_or_default();
@@ -3392,6 +3426,7 @@ pub async fn run_serve(
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))
+        .layer(axum::Extension(network_auth))
         .layer(axum::middleware::from_fn(require_auth_for_network))
         .with_state(serve_state.clone());
 
