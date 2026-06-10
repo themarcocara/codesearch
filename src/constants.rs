@@ -142,12 +142,30 @@ pub const DEFAULT_FSW_DEBOUNCE_MS: u64 = 2000;
 /// This prevents multiple processes from writing to the same database
 pub const WRITER_LOCK_FILE: &str = ".writer.lock";
 
+/// Default host for `codesearch serve` (MCP streamable HTTP mode).
+/// Override with `--host` or `CODESEARCH_SERVE_HOST`.
+/// Use `0.0.0.0` to bind on all interfaces (e.g. in Docker containers).
+pub const DEFAULT_SERVE_HOST: &str = "127.0.0.1";
+
+/// Environment variable to override the serve host.
+pub const SERVE_HOST_ENV: &str = "CODESEARCH_SERVE_HOST";
+
 /// Default port for `codesearch serve` (MCP streamable HTTP mode).
 /// Override with `--port` or `CODESEARCH_SERVE_PORT`.
 pub const DEFAULT_SERVE_PORT: u16 = 39725;
 
 /// Environment variable to override the serve port.
 pub const SERVE_PORT_ENV: &str = "CODESEARCH_SERVE_PORT";
+
+/// Resolve the effective serve host from env or default.
+/// Returns owned `String` because env vars are runtime values.
+/// Used by CLI delegation, MCP client, and serve startup to construct URLs.
+pub fn resolve_serve_host() -> String {
+    std::env::var(SERVE_HOST_ENV)
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string())
+}
 
 /// Environment variable to set the admin API key for management endpoints.
 /// When set, all management routes (`POST /repos`, `DELETE /repos/:alias`,

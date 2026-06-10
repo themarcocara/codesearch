@@ -1,6 +1,6 @@
 //! `codesearch serve` — MCP streamable HTTP server mode.
 //!
-//! Binds on `127.0.0.1:{port}` and serves:
+//! Binds on `{host}:{port}` (default `127.0.0.1:39725`) and serves:
 //! - `GET /health` → JSON health check
 //! - `POST /repos` → register + index + warmup a new repo
 //! - `DELETE /repos/:alias` → stop FSW + evict + unregister + delete DB
@@ -3114,6 +3114,78 @@ async fn require_admin_auth(
         .into_response()
 }
 
+/// Axum middleware that requires API key authentication for ALL endpoints
+/// when the server is bound to a non-localhost address.
+///
+/// This is the network-level auth layer — it runs before `require_admin_auth`
+/// and protects MCP, health, status, and every other route.
+/// Uses the same `CODESEARCH_SERVE_API_KEY` env var and the same
+/// `Authorization: Bearer <key>` / `X-API-Key: <key>` header pattern.
+///
+/// When the server is bound to localhost (default), this middleware passes
+/// all requests through (backward compatible).
+async fn require_auth_for_network(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let configured_key = match std::env::var(SERVE_API_KEY_ENV) {
+        Ok(k) if !k.is_empty() => k,
+        _ => return next.run(req).await,
+    };
+
+    // Check if bound to localhost — if so, skip (backward compatible).
+    // We rely on the startup check in run_serve() to ensure API key is set
+    // when non-localhost. But if someone removes the env var after startup,
+    // we still check here for defense in depth.
+    let host_env = std::env::var(crate::constants::SERVE_HOST_ENV)
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| crate::constants::DEFAULT_SERVE_HOST.to_string());
+    let is_localhost =
+        host_env == "127.0.0.1" || host_env == "::1" || host_env.eq_ignore_ascii_case("localhost");
+
+    if is_localhost {
+        return next.run(req).await;
+    }
+
+    // Non-localhost: require the API key on ALL requests.
+    // Check Authorization: Bearer <key>
+    if let Some(auth_header) = req.headers().get(axum::http::header::AUTHORIZATION) {
+        if let Ok(auth_val) = auth_header.to_str() {
+            if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
+                if bearer_key == configured_key {
+                    return next.run(req).await;
+                }
+            }
+        }
+    }
+
+    // Check X-API-Key: <key>
+    if let Some(api_key_header) = req.headers().get("X-API-Key") {
+        if let Ok(key_val) = api_key_header.to_str() {
+            if key_val == configured_key {
+                return next.run(req).await;
+            }
+        }
+    }
+
+    let path = req.uri().path();
+    let method = req.method().clone();
+    warn!(
+        "Rejected unauthenticated request from network: {} {}",
+        method, path
+    );
+
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        axum::response::Json(json!({
+            "error": "Unauthorized: API key required for network access",
+            "status": "unauthorized"
+        })),
+    )
+        .into_response()
+}
+
 /// Axum middleware: log MCP requests (method + path, skips /health spam).
 async fn log_mcp_requests(
     req: axum::extract::Request,
@@ -3168,17 +3240,42 @@ pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
 ///
 /// This is the entry point called from CLI when `codesearch serve` is invoked.
 pub async fn run_serve(
+    host: Option<String>,
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
     no_tui: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
+    use crate::constants::{resolve_serve_host, SERVE_HOST_ENV};
+
+    let effective_host = host.unwrap_or_else(resolve_serve_host);
+
     let effective_port = port.unwrap_or_else(|| {
         std::env::var(SERVE_PORT_ENV)
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_SERVE_PORT)
     });
+
+    // ── Security check: non-localhost binding requires API key ──
+    let is_localhost = effective_host == "127.0.0.1"
+        || effective_host == "::1"
+        || effective_host.eq_ignore_ascii_case("localhost");
+
+    if !is_localhost {
+        let api_key = std::env::var(SERVE_API_KEY_ENV)
+            .ok()
+            .filter(|k| !k.is_empty());
+        if api_key.is_none() {
+            anyhow::bail!(
+                "Refusing to bind to '{}' without authentication. \
+                 Set the {} environment variable to an API key before binding to a non-localhost address. \
+                 This protects MCP and all other endpoints from unauthorized network access.",
+                effective_host,
+                SERVE_API_KEY_ENV
+            );
+        }
+    }
 
     // Load repos config (register any --register paths first)
     let mut config = ReposConfig::load().unwrap_or_default();
@@ -3208,8 +3305,24 @@ pub async fn run_serve(
 
     let serve_state = Arc::new(ServeState::new(config, None));
 
+    // Construct the bind address from resolved host + port.
+    // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.
+    // For IPv6 literals, users should pass e.g. `[::1]` (with brackets).
+    let addr: SocketAddr = format!("{}:{}", effective_host, effective_port)
+        .parse()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid bind address '{}:{}': {}. \
+                 For IPv6, use brackets: `[::1]:port`. \
+                 Override with --host or {}.",
+                effective_host,
+                effective_port,
+                e,
+                SERVE_HOST_ENV
+            )
+        })?;
+
     // Log startup
-    let addr = SocketAddr::from(([127, 0, 0, 1], effective_port));
     info!(
         "🚀 Starting codesearch serve v{} on {}",
         env!("CARGO_PKG_VERSION"),
@@ -3260,8 +3373,12 @@ pub async fn run_serve(
     // and could not actually reach OpenCode (TCP keep-alive failure happens
     // before the request hits this middleware).
     //
-    // Layer order (outermost → innermost): log_mcp_requests → require_admin_auth → handler.
-    // Auth failures are logged because log_mcp_requests wraps the auth layer.
+    // Layer order (outermost → innermost):
+    //   require_auth_for_network → log_mcp_requests → require_admin_auth → handler.
+    // - `require_auth_for_network`: protects ALL routes when non-localhost (network mode).
+    // - `log_mcp_requests`: logs method + path for every request.
+    // - `require_admin_auth`: protects management endpoints only (when API key set).
+    // Auth failures are logged because log_mcp_requests wraps the admin-auth layer.
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
         .route(STATUS_PATH, axum::routing::get(status_handler))
@@ -3275,6 +3392,7 @@ pub async fn run_serve(
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))
+        .layer(axum::middleware::from_fn(require_auth_for_network))
         .with_state(serve_state.clone());
 
     // Bind TCP listener BEFORE spawning background warmup, so we know the port is live.
@@ -3575,6 +3693,7 @@ mod tests {
             axum::extract::Json(AddRepoRequest {
                 path: repo_path.clone(),
                 alias: Some("brandnew".to_string()),
+                model: None,
             }),
         )
         .await;

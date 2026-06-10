@@ -257,6 +257,10 @@ pub enum Commands {
         #[arg(default_value = "start")]
         action: ServeAction,
 
+        /// Host to bind to (default: 127.0.0.1, override with CODESEARCH_SERVE_HOST; use 0.0.0.0 for containers)
+        #[arg(short, long)]
+        host: Option<String>,
+
         /// Port to listen on (default: 39725, override with CODESEARCH_SERVE_PORT)
         #[arg(short, long)]
         port: Option<u16>,
@@ -382,14 +386,15 @@ pub enum Commands {
 // ---------------------------------------------------------------------------
 
 /// Base URL for the codesearch serve instance.
-/// Override via `CODESEARCH_SERVE_PORT` env var (see `constants::SERVE_PORT_ENV`).
+/// Override via `CODESEARCH_SERVE_HOST` and `CODESEARCH_SERVE_PORT` env vars.
 fn serve_base_url() -> String {
-    use crate::constants::DEFAULT_SERVE_PORT;
+    use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT};
+    let host = resolve_serve_host();
     let port = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(DEFAULT_SERVE_PORT);
-    format!("http://127.0.0.1:{port}")
+    format!("http://{host}:{port}")
 }
 
 /// Trigger a symbol reindex by calling the running serve instance's HTTP API.
@@ -628,6 +633,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Serve {
             action,
+            host,
             port,
             register,
             quiet,
@@ -647,7 +653,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
                         eprintln!("Warning: failed to initialize serve logger: {}", e);
                     }
-                    crate::serve::run_serve(port, register, no_tui, cancel_token.clone()).await
+                    crate::serve::run_serve(host, port, register, no_tui, cancel_token.clone())
+                        .await
                 }
             }
         }
