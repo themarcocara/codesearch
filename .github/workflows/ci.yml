@@ -79,4 +79,4 @@ jobs:
       - name: Run C# integration tests
         run: |
           export CODESEARCH_SCIP_CSHARP="$PWD/helpers/csharp/bin/Release/net10.0/scip-csharp"
-          cargo test --features csharp_helper_integration -- --include-ignored --nocapture
+          cargo test --features csharp_helper_integration -- --nocapture
