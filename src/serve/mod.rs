@@ -3408,7 +3408,8 @@ pub async fn run_serve(
     // before the request hits this middleware).
     //
     // Layer order (outermost → innermost):
-    //   require_auth_for_network → log_mcp_requests → require_admin_auth → handler.
+    //   Extension(inject NetworkAuthConfig) → require_auth_for_network → log_mcp_requests → require_admin_auth → handler.
+    // - `Extension`: injects NetworkAuthConfig captured at startup into every request.
     // - `require_auth_for_network`: protects ALL routes when non-localhost (network mode).
     // - `log_mcp_requests`: logs method + path for every request.
     // - `require_admin_auth`: protects management endpoints only (when API key set).
@@ -3426,8 +3427,8 @@ pub async fn run_serve(
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))
-        .layer(axum::Extension(network_auth))
         .layer(axum::middleware::from_fn(require_auth_for_network))
+        .layer(axum::Extension(network_auth))
         .with_state(serve_state.clone());
 
     // Bind TCP listener BEFORE spawning background warmup, so we know the port is live.
