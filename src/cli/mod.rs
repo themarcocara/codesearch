@@ -269,7 +269,7 @@ pub enum Commands {
         action: ServeAction,
 
         /// Host to bind to (default: 127.0.0.1, override with CODESEARCH_SERVE_HOST; use 0.0.0.0 for containers)
-        #[arg(short, long)]
+        #[arg(long)]
         host: Option<String>,
 
         /// Port to listen on (default: 39725, override with CODESEARCH_SERVE_PORT)
