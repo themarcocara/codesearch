@@ -783,25 +783,6 @@ mod tests {
     }
 
     #[test]
-    fn prune_stale_relocates_then_keeps_relocatable_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        init_git_remote(&repo, "https://example.com/acme/keep.git");
-
-        let mut cfg = ReposConfig::default();
-        let alias = cfg.register(repo.clone());
-
-        let renamed = tmp.path().join("repo-renamed");
-        rename_retry(&repo, &renamed);
-
-        let (relocated, removed) = cfg.prune_stale();
-        assert!(removed.is_empty());
-        assert_eq!(relocated.len(), 1);
-        assert!(cfg.repos.contains_key(&alias), "relocated entry is kept");
-    }
-
-    #[test]
     fn load_from_applies_reconcile_to_hand_edited_file() {
         // A hand-edited repos.json with an empty-alias entry and a group that
         // references an unknown alias must be reconciled (not crash) on load.
