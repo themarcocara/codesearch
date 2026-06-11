@@ -54,6 +54,8 @@ pub enum KeyAction {
     RunDoctor(usize),
     /// User pressed `f` — force reindex repo at given index.
     ForceReindex(usize),
+    /// User pressed `r` — request removal of repo at given index (shows confirmation).
+    RequestRemove(usize),
 }
 
 /// Modal overlay shown on top of the normal TUI content.
@@ -75,6 +77,8 @@ pub enum OverlayState {
     DoctorRunning { alias: String },
     /// Doctor results: per-check pass/warn/fail lines.
     Doctor { alias: String, results: Vec<String> },
+    /// Confirmation dialog for removing a repo's index.
+    ConfirmRemove { alias: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +129,43 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::ForceReindex(idx)
         }
+        KeyCode::Char('r') => {
+            let idx = table_state.selected().unwrap_or(0);
+            KeyAction::RequestRemove(idx)
+        }
         _ => KeyAction::None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Overlay key handling
+// ---------------------------------------------------------------------------
+
+/// Actions returned by overlay key handling.
+#[derive(Debug)]
+pub enum OverlayKeyAction {
+    /// Dismiss the overlay (Esc pressed).
+    Dismiss,
+    /// Confirm the removal action (Enter or 'y' pressed on a ConfirmRemove overlay).
+    ConfirmRemove,
+}
+
+/// Handle key events when an overlay is active.
+///
+/// - `Esc` always dismisses.
+/// - `Enter` or `'y'` confirms a `ConfirmRemove` overlay.
+/// - All other keys are ignored (returns `None`).
+pub fn handle_overlay_key(key: KeyEvent, overlay: &OverlayState) -> Option<OverlayKeyAction> {
+    match key.code {
+        KeyCode::Esc => Some(OverlayKeyAction::Dismiss),
+        KeyCode::Enter | KeyCode::Char('y') => {
+            if matches!(overlay, OverlayState::ConfirmRemove { .. }) {
+                Some(OverlayKeyAction::ConfirmRemove)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -492,6 +532,7 @@ pub fn render_footer(
         Span::styled("[i] info  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[d] doctor  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[f] reindex  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[r] remove  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[s] reload  ", Style::default().fg(Color::DarkGray)),
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
     ]);
@@ -627,6 +668,32 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             ];
             render_centered_modal(f, area, &title, lines);
         }
+        OverlayState::ConfirmRemove { alias } => {
+            let title = " ⚠ Delete Index ";
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Delete index for '{}'?", alias),
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    "  This stops the watcher, removes the DB,",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  and unregisters the repo.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  [Enter] ", Style::default().fg(Color::Red)),
+                    Span::styled("confirm  ", Style::default().fg(Color::White)),
+                    Span::styled("[Esc] ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("cancel", Style::default().fg(Color::White)),
+                ]),
+            ];
+            render_centered_modal_with_border_color(f, area, title, lines, Color::Red);
+        }
     }
 }
 
@@ -668,6 +735,56 @@ pub fn render_centered_modal(
             title,
             Style::default()
                 .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Rgb(20, 20, 35)));
+    let inner = block.inner(modal_area);
+    f.render_widget(block, modal_area);
+
+    let content = ratatui::widgets::Paragraph::new(lines);
+    f.render_widget(content, inner);
+}
+
+/// Render a centered modal with a custom border color.
+/// Same as `render_centered_modal` but allows overriding the border/title color.
+pub fn render_centered_modal_with_border_color(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'_>>,
+    border_color: Color,
+) {
+    let content_height = lines.len() as u16 + 2; // +2 for border
+    let max_line_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(20);
+    let title_w = title.len() as u16;
+    let content_width = (max_line_w + 4).max(title_w + 4).max(30);
+
+    // Center the modal
+    let modal_area = Rect {
+        x: area
+            .width
+            .saturating_sub(content_width)
+            .saturating_div(2)
+            .min(area.width.saturating_sub(content_width)),
+        y: area
+            .height
+            .saturating_sub(content_height)
+            .saturating_div(2)
+            .min(area.height.saturating_sub(content_height)),
+        width: content_width.min(area.width),
+        height: content_height.min(area.height),
+    };
+
+    // Clear the modal area so no table text shows through the modal interior
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+
+    let block = ratatui::widgets::Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(border_color)
                 .add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(Color::Rgb(20, 20, 35)));

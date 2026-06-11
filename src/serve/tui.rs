@@ -18,7 +18,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use tokio_util::sync::CancellationToken;
 
-use super::tui_common::{self, KeyAction, OverlayState, RepoRow};
+use super::tui_common::{self, KeyAction, OverlayKeyAction, OverlayState, RepoRow};
 use super::ServeState;
 use crate::cli::doctor;
 use crate::constants::{DB_DIR_NAME, LANG_CSHARP};
@@ -157,10 +157,25 @@ async fn run_tui_loop(
                     continue;
                 }
 
-                // If overlay is active, Esc dismisses it; no other keys processed
-                if overlay.is_some() {
-                    if matches!(key.code, crossterm::event::KeyCode::Esc) {
-                        overlay = None;
+                // If overlay is active, handle overlay-specific keys
+                if let Some(ref ov) = overlay {
+                    if let Some(action) = tui_common::handle_overlay_key(key, ov) {
+                        match action {
+                            OverlayKeyAction::Dismiss => overlay = None,
+                            OverlayKeyAction::ConfirmRemove => {
+                                if let Some(OverlayState::ConfirmRemove { alias }) = overlay.take()
+                                {
+                                    let state_bg = state.clone();
+                                    tokio::spawn(async move {
+                                        tracing::info!(
+                                            "TUI: Removing repo '{}' after confirmation",
+                                            alias
+                                        );
+                                        let _ = state_bg.remove_repo(&alias).await;
+                                    });
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
@@ -201,6 +216,12 @@ async fn run_tui_loop(
                         if idx < repos.len() {
                             let alias = repos[idx].0.clone();
                             spawn_force_reindex(alias, &state);
+                        }
+                    }
+                    KeyAction::RequestRemove(idx) => {
+                        if idx < repos.len() {
+                            let alias = repos[idx].0.clone();
+                            overlay = Some(OverlayState::ConfirmRemove { alias });
                         }
                     }
                     KeyAction::None => {}
