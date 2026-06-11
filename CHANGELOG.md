@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Added
+
+- **TUI 'r' key — Remove repo from index**: Pressing `r` in the TUI shows a
+  confirmation dialog. On confirm, the repo is fully removed (FSW stopped,
+  memory evicted, unregistered from config, database deleted).
+- **Git worktree auto-index hook**: `codesearch hook install` writes a
+  `post-checkout` hook that auto-registers new worktrees with a running serve
+  instance via `POST /repos`.
+- **`ServeState::remove_repo()` method**: extracted from `remove_repo_handler`
+  for reuse by both the HTTP endpoint and the embedded TUI.
+
+### Fixed
+
+- **`.git/info/exclude` broken for worktrees**: `FileWatcher::build_gitignore`
+  now resolves the actual git directory (following `gitdir:` pointers in
+  worktree `.git` files) before accessing `info/exclude`.
+
 ## [1.0.171] - 2026-06-04
 
 ### Security
