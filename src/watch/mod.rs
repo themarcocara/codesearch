@@ -11,7 +11,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::cache::normalize_path;
-use crate::constants::{ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS, ALWAYS_SKIP_FILENAME_SUFFIXES};
+use crate::constants::{
+    global_codesearchignore_path, ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS,
+    ALWAYS_SKIP_FILENAME_SUFFIXES,
+};
 use crate::file::Language;
 
 /// Normalize a path from notify events to a consistent format.
@@ -110,12 +113,25 @@ impl FileWatcher {
         dot_git
     }
 
-    /// Build a `Gitignore` matcher from the repo root's `.gitignore` and
-    /// `.git/info/exclude`. Returns `None` if neither file exists.
+    /// Build a `Gitignore` matcher from the repo root's `.gitignore`,
+    /// `.git/info/exclude`, repo-local `.codesearchignore`, and the global
+    /// `~/.codesearch/.codesearchignore`. Returns `None` if no file exists.
     fn build_gitignore(root: &Path) -> Option<Gitignore> {
         let mut builder = GitignoreBuilder::new(root);
 
         let mut added_any = false;
+
+        // Add global ~/.codesearch/.codesearchignore (lowest precedence)
+        if let Some(global_path) = global_codesearchignore_path() {
+            if global_path.exists() {
+                if let Some(e) = builder.add(&global_path) {
+                    tracing::debug!("Failed to add global codesearchignore: {}", e);
+                } else {
+                    tracing::debug!("Loaded global codesearchignore: {}", global_path.display());
+                    added_any = true;
+                }
+            }
+        }
 
         // Add .git/info/exclude if present (resolves worktree .git files)
         let git_dir = Self::resolve_git_dir(root);
@@ -138,13 +154,24 @@ impl FileWatcher {
             }
         }
 
+        // Add repo-local .codesearchignore if present (highest precedence)
+        let codesearchignore_path = root.join(".codesearchignore");
+        if codesearchignore_path.exists() {
+            if let Some(e) = builder.add(&codesearchignore_path) {
+                tracing::debug!("Failed to add .codesearchignore: {}", e);
+            } else {
+                tracing::debug!("Loaded .codesearchignore for {}", root.display());
+                added_any = true;
+            }
+        }
+
         if !added_any {
             return None;
         }
 
         match builder.build() {
             Ok(gi) => {
-                tracing::debug!("Loaded .gitignore rules for {}", root.display());
+                tracing::debug!("Loaded ignore rules for {}", root.display());
                 Some(gi)
             }
             Err(e) => {

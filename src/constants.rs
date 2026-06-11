@@ -98,6 +98,23 @@ pub fn get_global_cache_dir() -> PathBuf {
     cache_dir
 }
 
+/// Name of the global codesearchignore file in ~/.codesearch/
+pub const GLOBAL_CODESEARCHIGNORE_FILE: &str = ".codesearchignore";
+
+/// Get the path to the global .codesearchignore file (~/.codesearch/.codesearchignore).
+///
+/// This file uses the same gitignore syntax and is applied to all indexed repos,
+/// providing a way to set ignore rules without modifying repo-local files.
+/// Repo-local `.codesearchignore` and `.gitignore` take precedence.
+///
+/// Returns `None` only if the home directory cannot be determined.
+pub fn global_codesearchignore_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| {
+        home.join(CONFIG_DIR_NAME)
+            .join(GLOBAL_CODESEARCHIGNORE_FILE)
+    })
+}
+
 /// Name of the repos configuration file
 pub const REPOS_CONFIG_FILE: &str = "repos.json";
 
