@@ -26,6 +26,7 @@ pub enum Language {
     Html,
     Css,
     Xml,
+    Jupyter,
     Unknown,
 }
 
@@ -84,6 +85,7 @@ impl Language {
             "html" | "htm" => Self::Html,
             "css" | "scss" | "sass" | "less" => Self::Css,
             "xml" | "csproj" | "props" | "targets" | "resx" | "config" => Self::Xml,
+            "ipynb" => Self::Jupyter,
             _ => Self::Unknown,
         }
     }
@@ -144,6 +146,7 @@ impl Language {
             Self::Html => "HTML",
             Self::Css => "CSS",
             Self::Xml => "XML",
+            Self::Jupyter => "Jupyter",
             Self::Unknown => "Unknown",
         }
     }
