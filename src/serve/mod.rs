@@ -40,7 +40,7 @@ use crate::constants::{
     HEALTH_PATH, LANG_CSHARP, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
     REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
-use crate::db_discovery::repos::ReposConfig;
+use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
@@ -1078,6 +1078,82 @@ impl ServeState {
         {
             self.reload_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        Ok(())
+    }
+
+    /// Remove a repo: stop FSW, evict from memory, unregister from config, delete DB.
+    ///
+    /// This is the shared logic used by both the HTTP `DELETE /repos/:alias` handler
+    /// and the TUI confirmation flow.
+    pub(crate) async fn remove_repo(&self, alias: &str) -> Result<()> {
+        // 1. Resolve project path from config
+        let project_path = {
+            let config = self
+                .config
+                .read()
+                .map_err(|e| anyhow::anyhow!("Config lock poisoned: {}", e))?;
+            config
+                .resolve(alias)
+                .ok_or_else(|| anyhow::anyhow!("Unknown alias '{}'", alias))?
+        };
+
+        let db_path = project_path.join(DB_DIR_NAME);
+
+        // 2. Stop FSW and evict from memory.
+        {
+            let stores = self.stop_fsw(alias);
+            drop(stores);
+        }
+        self.repos.remove(alias);
+        self.last_access.remove(alias);
+        tracing::info!("Evicted repo '{}' from memory", alias);
+
+        // 3. Unregister from repos.json
+        {
+            let mut config = self
+                .config
+                .write()
+                .map_err(|e| anyhow::anyhow!("Config lock poisoned: {}", e))?;
+            config.unregister_alias(alias);
+            if let Err(e) = self.persist_config(&config) {
+                tracing::warn!(
+                    "Failed to save repos config after removing '{}': {}",
+                    alias,
+                    e
+                );
+            }
+        }
+
+        // 4. Delete the database directory with retries.
+        if db_path.exists() {
+            for attempt in 0..5 {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                match std::fs::remove_dir_all(&db_path) {
+                    Ok(()) => {
+                        tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
+                        break;
+                    }
+                    Err(e) if attempt < 4 => {
+                        tracing::debug!(
+                            "DB delete attempt {} for '{}' failed (will retry): {}",
+                            attempt + 1,
+                            alias,
+                            e
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to delete database for '{}' after 5 attempts (may be locked): {}",
+                            alias,
+                            e
+                        );
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -2845,116 +2921,35 @@ async fn remove_repo_handler(
 ) {
     use axum::http::StatusCode;
 
-    // 1. Resolve project path from config
-    let project_path = {
-        let config = match state.config.read() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::response::Json(json!({
-                        "error": format!("Config lock poisoned: {}", e),
-                        "status": "error"
-                    })),
-                );
-            }
-        };
-        match config.resolve(&alias) {
-            Some(p) => p,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    axum::response::Json(json!({
-                        "error": format!("Unknown alias '{}'", alias),
-                        "status": "not_found"
-                    })),
-                );
-            }
+    match state.remove_repo(&alias).await {
+        Ok(()) => {
+            let project_path = state.config.read().ok().and_then(|c| c.resolve(&alias));
+            (
+                StatusCode::OK,
+                axum::response::Json(json!({
+                    "status": "removed",
+                    "alias": alias,
+                    "path": project_path,
+                    "message": "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+                })),
+            )
         }
-    };
-
-    let db_path = project_path.join(DB_DIR_NAME);
-
-    // 2. Stop FSW and evict from memory.
-    // Drop the returned stores Arc explicitly so DB handles are released ASAP.
-    {
-        let stores = state.stop_fsw(&alias);
-        drop(stores);
-    }
-    state.repos.remove(&alias);
-    state.last_access.remove(&alias);
-    tracing::info!("Evicted repo '{}' from memory", alias);
-
-    // 3. Unregister from repos.json
-    {
-        let mut config = match state.config.write() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::response::Json(json!({
-                        "error": format!("Config lock poisoned: {}", e),
-                        "status": "error"
-                    })),
-                );
-            }
-        };
-        config.unregister_alias(&alias);
-        if let Err(e) = state.persist_config(&config) {
-            tracing::warn!(
-                "Failed to save repos config after removing '{}': {}",
-                alias,
-                e
-            );
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("Unknown alias") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                axum::response::Json(json!({
+                    "error": msg,
+                    "status": if status == StatusCode::NOT_FOUND { "not_found" } else { "error" }
+                })),
+            )
         }
     }
-
-    // 4. Delete the database directory.
-    //    Background tasks (incremental refresh) may still hold Arc<SharedStores>
-    //    clones for a brief moment after eviction. Retry with a short delay so
-    //    those tasks finish and release their file handles — critical on Windows
-    //    where open file handles block directory deletion (os error 32).
-    if db_path.exists() {
-        let mut deleted = false;
-        for attempt in 0..5 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            }
-            match std::fs::remove_dir_all(&db_path) {
-                Ok(()) => {
-                    tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
-                    deleted = true;
-                    break;
-                }
-                Err(e) if attempt < 4 => {
-                    tracing::debug!(
-                        "DB delete attempt {} for '{}' failed (will retry): {}",
-                        attempt + 1,
-                        alias,
-                        e
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to delete database for '{}' after 5 attempts (may be locked): {}",
-                        alias,
-                        e
-                    );
-                }
-            }
-        }
-        let _ = deleted; // used for logging only
-    }
-
-    (
-        StatusCode::OK,
-        axum::response::Json(json!({
-            "status": "removed",
-            "alias": alias,
-            "path": project_path,
-            "message": "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
-        })),
-    )
 }
 
 /// Validate that a canonical path falls under one of the allowed root directories.
@@ -3260,6 +3255,15 @@ pub async fn run_serve(
     // When a real terminal is attached, launch the fullscreen ratatui TUI.
     // When piped / no TTY, fall back to periodic eprintln dashboard.
     let serve_url = format!("http://{}", addr);
+
+    // Write serve_url to ~/.codesearch/serve_url so git hooks can find us
+    if let Ok(dir) = config_dir() {
+        let url_file = dir.join("serve_url");
+        if let Err(e) = std::fs::write(&url_file, &serve_url) {
+            warn!("Failed to write serve_url file: {}", e);
+        }
+    }
+
     let tui_cancel = cancel_token.clone();
     let tui_state = serve_state.clone();
     let tui_url = serve_url.clone();
@@ -3352,6 +3356,12 @@ pub async fn run_serve(
     // a moment before the process exits.
     if let Some(handle) = tui_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+    }
+
+    // Clean up serve_url file on shutdown
+    if let Ok(dir) = config_dir() {
+        let url_file = dir.join("serve_url");
+        let _ = std::fs::remove_file(&url_file);
     }
 
     Ok(())

@@ -94,6 +94,17 @@ pub enum GroupsCommands {
     },
 }
 
+/// Hook subcommands
+#[derive(Subcommand, Debug)]
+pub enum HookCommands {
+    /// Install a post-checkout hook that auto-registers new git worktrees with codesearch serve
+    Install {
+        /// Path to the git repository (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
 /// Fast, local semantic code search powered by Rust
 #[derive(Parser, Debug)]
 #[command(name = "codesearch")]
@@ -370,6 +381,12 @@ pub enum Commands {
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
+    },
+
+    /// Install git hooks for automatic codesearch integration
+    Hook {
+        #[command(subcommand)]
+        command: HookCommands,
     },
 }
 
@@ -650,6 +667,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
         },
         Commands::Groups { command } => run_groups_command(command).await,
+        Commands::Hook { command } => match command {
+            HookCommands::Install { path } => run_hook_install(path).await,
+        },
     }
 }
 
@@ -855,6 +875,93 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Install the post-checkout git hook for codesearch worktree auto-indexing.
+async fn run_hook_install(path: Option<PathBuf>) -> Result<()> {
+    use colored::Colorize;
+
+    let repo_path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let dot_git = repo_path.join(".git");
+
+    // Resolve the actual .git directory (handle worktrees where .git is a file)
+    let git_dir = if dot_git.is_file() {
+        // Worktree: read "gitdir: <path>" from .git file
+        let content = std::fs::read_to_string(&dot_git)?;
+        let first_line = content.lines().next().unwrap_or("");
+        if let Some(rel) = first_line.strip_prefix("gitdir: ") {
+            let resolved = repo_path.join(rel.trim());
+            if resolved.exists() {
+                resolved
+            } else {
+                anyhow::bail!("Could not resolve git dir from worktree .git file");
+            }
+        } else {
+            anyhow::bail!("Unexpected .git file format (expected 'gitdir: ...')");
+        }
+    } else if dot_git.is_dir() {
+        dot_git
+    } else {
+        anyhow::bail!("Not a git repository: {}", repo_path.display());
+    };
+
+    let hooks_dir = git_dir.join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    let hook_path = hooks_dir.join("post-checkout");
+
+    if hook_path.exists() {
+        // Check if it's already our hook
+        let existing = std::fs::read_to_string(&hook_path)?;
+        if existing.contains("codesearch post-checkout hook") {
+            eprintln!(
+                "{}",
+                "✓ codesearch post-checkout hook already installed.".green()
+            );
+            return Ok(());
+        }
+        anyhow::bail!(
+            "A post-checkout hook already exists at {}.\nRemove it first or merge manually.",
+            hook_path.display()
+        );
+    }
+
+    // Hook script: bash (works in Git Bash on Windows too)
+    let hook_script = r#"#!/bin/bash
+# codesearch post-checkout hook
+# Auto-registers new worktrees with codesearch serve.
+# Installed by: codesearch hook install
+# $1 = prev_ref, $2 = new_ref, $3 = flag (1=branch checkout)
+
+SERVE_URL_FILE="$HOME/.codesearch/serve_url"
+if [ -f "$SERVE_URL_FILE" ]; then
+    SERVE_URL=$(cat "$SERVE_URL_FILE")
+    if [ -n "$SERVE_URL" ]; then
+        curl -s -X POST "$SERVE_URL/repos" \
+            -H "Content-Type: application/json" \
+            -d "{\"path\":\"$(pwd)\"}" &>/dev/null &
+    fi
+fi
+"#;
+
+    std::fs::write(&hook_path, hook_script)?;
+
+    // Make executable (on Unix; on Windows Git Bash this is a no-op but harmless)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
+
+    eprintln!(
+        "{}",
+        format!("✓ Installed post-checkout hook at {}", hook_path.display()).green()
+    );
+    eprintln!("  New worktrees will be auto-registered with codesearch serve.");
+
     Ok(())
 }
 

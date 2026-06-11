@@ -19,7 +19,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use serde::Deserialize;
 
-use super::tui_common::{self, KeyAction, OverlayState, RepoRow};
+use super::tui_common::{self, KeyAction, OverlayKeyAction, OverlayState, RepoRow};
 
 // ---------------------------------------------------------------------------
 // Data model (HTTP JSON response)
@@ -214,10 +214,52 @@ async fn run_remote_tui_loop(
                     continue;
                 }
 
-                // If overlay is active, Esc dismisses it; no other keys processed
-                if overlay.is_some() {
-                    if matches!(key.code, crossterm::event::KeyCode::Esc) {
-                        overlay = None;
+                // If overlay is active, handle overlay-specific keys
+                if let Some(ref ov) = overlay {
+                    if let Some(action) = tui_common::handle_overlay_key(key, ov) {
+                        match action {
+                            OverlayKeyAction::Dismiss => overlay = None,
+                            OverlayKeyAction::ConfirmRemove => {
+                                if let Some(OverlayState::ConfirmRemove { alias }) = overlay.take()
+                                {
+                                    let serve = serve_url.to_string();
+                                    tokio::spawn(async move {
+                                        let remove_url = format!(
+                                            "{}/repos/{}",
+                                            serve.trim_end_matches('/'),
+                                            alias
+                                        );
+                                        match reqwest::Client::new()
+                                            .delete(&remove_url)
+                                            .timeout(Duration::from_secs(10))
+                                            .send()
+                                            .await
+                                        {
+                                            Ok(resp) if resp.status().is_success() => {
+                                                tracing::info!(
+                                                    "Remote TUI: Removed repo '{}'",
+                                                    alias
+                                                );
+                                            }
+                                            Ok(resp) => {
+                                                tracing::warn!(
+                                                    "Remote TUI: Remove '{}' returned HTTP {}",
+                                                    alias,
+                                                    resp.status()
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Remote TUI: Remove '{}' failed: {}",
+                                                    alias,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
@@ -371,6 +413,12 @@ async fn run_remote_tui_loop(
                                 .timeout(Duration::from_secs(5))
                                 .send()
                                 .await;
+                        }
+                    }
+                    KeyAction::RequestRemove(idx) => {
+                        if idx < rows.len() {
+                            let alias = rows[idx].alias.clone();
+                            overlay = Some(OverlayState::ConfirmRemove { alias });
                         }
                     }
                     KeyAction::None => {}

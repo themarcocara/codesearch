@@ -82,6 +82,34 @@ impl FileWatcher {
         }
     }
 
+    /// Resolve the actual `.git` directory for a repo root.
+    ///
+    /// For regular repos, `.git` is a directory and we return `root/.git`.
+    /// For git worktrees, `.git` is a file containing `gitdir: <path>`,
+    /// so we parse and resolve that path.
+    fn resolve_git_dir(root: &Path) -> PathBuf {
+        let dot_git = root.join(".git");
+        if dot_git.is_dir() {
+            return dot_git;
+        }
+        // Worktree: .git is a file with "gitdir: <path>" on the first line
+        if dot_git.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&dot_git) {
+                if let Some(line) = content.lines().next() {
+                    if let Some(path_str) = line.strip_prefix("gitdir: ") {
+                        let resolved = root.join(path_str.trim());
+                        // Normalize the path
+                        if resolved.exists() {
+                            return resolved;
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: return the default path even if it doesn't exist
+        dot_git
+    }
+
     /// Build a `Gitignore` matcher from the repo root's `.gitignore` and
     /// `.git/info/exclude`. Returns `None` if neither file exists.
     fn build_gitignore(root: &Path) -> Option<Gitignore> {
@@ -89,8 +117,9 @@ impl FileWatcher {
 
         let mut added_any = false;
 
-        // Add .git/info/exclude if present
-        let exclude_path = root.join(".git").join("info").join("exclude");
+        // Add .git/info/exclude if present (resolves worktree .git files)
+        let git_dir = Self::resolve_git_dir(root);
+        let exclude_path = git_dir.join("info").join("exclude");
         if exclude_path.exists() {
             if let Some(e) = builder.add(&exclude_path) {
                 tracing::debug!("Failed to add .git/info/exclude: {}", e);

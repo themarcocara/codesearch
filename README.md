@@ -309,6 +309,18 @@ This starts a background HTTP server with:
 - **Idle eviction** (30min) — unused repos are unloaded from memory
 - **Session tracking** via MCP keep-alive
 
+### TUI Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Navigate repo list |
+| `i` | Show info overlay (chunks, files, model, DB size) |
+| `d` | Run doctor diagnostics on selected repo |
+| `f` | Force reindex selected repo |
+| `r` | Remove selected repo (with confirmation dialog) |
+| `s` | Reload repos config from disk |
+| `q` | Quit serve |
+
 ### Repository Registration
 
 Repos are registered via `codesearch index add`:
@@ -359,6 +371,23 @@ codesearch groups list
 
 Then in MCP tools: `group="my-group"` fans out the query to all repos in the group.
 
+### Git Worktree Auto-Index
+
+When using `git worktree add` to create parallel working directories, codesearch can auto-register new worktrees via a `post-checkout` git hook.
+
+**Setup** (run inside any repo you want worktree auto-indexing for):
+
+```bash
+codesearch hook install
+```
+
+This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
+
+**How it works:**
+1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` on startup (deletes on shutdown)
+2. The `post-checkout` hook reads that file and POSTs the working directory to `POST /repos`
+3. Serve registers the worktree path and begins indexing (deduped — won't re-register existing paths)
+
 ### MCP Connection Modes
 
 The `codesearch mcp` command supports three modes:
@@ -389,6 +418,7 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | `codesearch setup` | Download embedding models |
 | `codesearch cache stats\|clear` | Manage embedding cache |
 | `codesearch groups list\|add\|remove` | Manage repository groups |
+| `codesearch hook install` | Install git post-checkout hook for worktree auto-indexing |
 
 ## Configuration
 

@@ -1,218 +1,122 @@
-# AGENTS.md — codesearch
+# AGENTS.md — codesearch (feature/tui-rm-worktree-hook)
 
 ## Current state
 
-- **Branch:** `develop`
+- **Branch:** `feature/tui-rm-worktree-hook` (based on `develop` at 7931749)
+- **Parent repo:** `C:\WorkArea\AI\codesearch\codesearch.git` (on `feature/host-binding`)
 - **Version:** v1.0.178
-- **Status:** `cargo check` + `cargo clippy` clean
-- **Last deployed:** v1.0.124 via `..\copy-to-common.ps1`
+- **Status:** `cargo check` + `cargo clippy` clean (starting point)
+- **Validation:** `cargo check` for iteration, `cargo clippy` for lint. No `--release` builds.
 
-## GitHub Issues — Backlog (2026-06-10)
+## Features for this branch
 
-### #115 — More codesearchignore options → ASKED FOR JUSTIFICATION (polite reply posted)
+### Feature 1: TUI 'r' key — Remove DB with Confirmation Dialog
 
-User wants external ignore files for cloned dependencies. Verified that `.gitignore` (repo-local, global `~/.gitignore`, `.git/info/exclude`) and `.codesearchignore` both work hierarchically via `ignore` crate. Posted polite comment asking for concrete example. If niche → won't fix.
+**Goal:** Pressing `'r'` in the TUI shows a confirmation dialog "Delete <alias>?". On confirm (Enter/y), the repo's index is removed (FSW stopped, evicted from memory, unregistered from repos.json, .codesearch.db deleted). On cancel (Esc), dialog dismisses.
 
-### #118 — `--model` flag silently ignored by `index add` → BUG FIX (priority: next)
+**Implementation steps (in order):**
 
-**Bug:** Global `--model` CLI flag exists but is silently ignored by `index add`. Every repo gets default model (`AllMiniLML6V2Q`).
+| Step | File | What |
+|------|------|------|
+| 1 | `src/serve/tui_common.rs` | Add `KeyAction::RequestRemove(usize)` + `KeyAction::ConfirmRemove` to `KeyAction` enum (line 45-57) |
+| 2 | `src/serve/tui_common.rs` | Add `OverlayState::ConfirmRemove { alias: String }` to `OverlayState` enum (line 60-78) |
+| 3 | `src/serve/tui_common.rs` | Add `'r'` → `RequestRemove(idx)` in `handle_key()` (line 87-130) |
+| 4 | `src/serve/tui_common.rs` | New `OverlayKeyAction` enum + `handle_overlay_key()` function. Returns: `Dismiss` (Esc), `ConfirmRemove` (Enter/y for ConfirmRemove overlay), `None` (all other keys). This replaces the inline overlay key handling in both event loops. |
+| 5 | `src/serve/tui.rs` + `src/serve/tui_remote.rs` | Replace inline overlay key handling (tui.rs:160-166, tui_remote.rs:217-223) with `handle_overlay_key()` |
+| 6 | `src/serve/tui_common.rs` | Add `ConfirmRemove` rendering in `render_overlay()` (line 525-627) — red-bordered warning modal with "⚠ Delete <alias>?" and "[Enter] confirm [Esc] cancel" |
+| 7 | `src/serve/tui_common.rs` | Add `[r] remove` span to footer (line 499-504, after `[f] reindex`) |
+| 8 | `src/serve/mod.rs` | Extract `ServeState::remove_repo(&self, alias: &str)` from `remove_repo_handler()` (line 2838-2958). Logic: resolve path from config → stop_fsw + evict from DashMaps → unregister from config + persist → delete .codesearch.db with 5 retries at 300ms. The handler then just calls this method. |
+| 9 | `src/serve/tui.rs` | Handle `RequestRemove(idx)` → show `ConfirmRemove` overlay. Handle `ConfirmRemove` → spawn tokio task calling `state.remove_repo(&alias)`. Also handle `OverlayKeyAction::ConfirmRemove` from `handle_overlay_key()`. |
+| 10 | `src/serve/tui_remote.rs` | Handle `RequestRemove(idx)` → show `ConfirmRemove` overlay. Handle `ConfirmRemove` → HTTP `DELETE /repos/{alias}`. Also handle `OverlayKeyAction::ConfirmRemove` from `handle_overlay_key()`. |
 
-**Root cause — 6 gaps in the plumbing:**
+**Key architectural details:**
 
-| # | Gap | File:Line | Fix |
-|---|-----|-----------|-----|
-| 1 | `IndexCommands::Add` has no `--model` field | `src/cli/mod.rs:16-23` | Add `model: Option<String>` field |
-| 2 | `add_to_index()` has no `model` param | `src/index/mod.rs:1429` | Add `model: Option<ModelType>` param |
-| 3 | CLI dispatch ignores `model_type` at Add | `src/cli/mod.rs:537-540` | Pass `model_type` to `add_to_index()` |
-| 4 | `try_delegate_add_to_serve()` omits model from HTTP body | `src/index/mod.rs:2191` | Add `model` to JSON body |
-| 5 | `AddRepoRequest` has no `model` field | `src/serve/mod.rs:2583-2589` | Add `model: Option<String>` |
-| 6 | `force_reindex_with_stores()` defaults to hardcoded model | `src/index/manager.rs:776` | Add `model_override: Option<ModelType>` |
+- **KeyAction enum** (tui_common.rs:45-57): `None`, `Reload`, `ShowInfo(usize)`, `RunDoctor(usize)`, `ForceReindex(usize)`
+- **OverlayState enum** (tui_common.rs:60-78): `Info{...}`, `DoctorRunning{alias}`, `Doctor{alias, results}`
+- **handle_key()** (tui_common.rs:87-130): maps keys to KeyAction. `'r'` is currently unbound (falls to `_ => None`)
+- **Overlay key blocking** (tui.rs:160-166, tui_remote.rs:217-223): `if overlay.is_some() { if Esc { overlay=None; } continue; }` — ALL keys blocked except Esc. Must be changed to also allow Enter/y for ConfirmRemove.
+- **render_centered_modal()** (tui_common.rs:633-679): generic modal renderer, accepts title + Vec<Line>. Reusable for confirmation.
+- **render_overlay()** (tui_common.rs:525-627): match on OverlayState variants, calls render_centered_modal()
+- **render_footer()** (tui_common.rs:459-517): left_line has spans for keybindings
+- **remove_repo_handler** (mod.rs:2838-2958): resolve path → stop_fsw → evict from repos/last_access DashMaps → unregister from config + persist → delete DB with 5 retries at 300ms
+- **stop_fsw()** (mod.rs:1090): returns Option<Arc<SharedStores>>
+- **ServeState fields:** config (RwLock<ReposConfig>), repos (DashMap<String, RepoState>), last_access (DashMap)
+- **RepoRow struct** (tui_common.rs:23-42): has `alias`, `status`, `changes`, etc.
 
-**Thread:** `ModelType::parse(s)` (src/embed/embedder.rs:177) → `add_to_index(path, global, model, cancel_token)` → both `index()` calls pass `model` instead of `None` → `try_delegate_add_to_serve(path, alias, global, model)` includes model in JSON → `AddRepoRequest.model` → `add_repo_handler` parses via `ModelType::parse()` → `force_reindex_with_stores(path, db, stores, model_override)`.
+### Feature 2: Git Worktree Auto-Index via post-checkout Hook
 
-**Implementation plan:**
-1. Add `model: Option<String>` to `IndexCommands::Add` variant
-2. Update Add dispatch (line 537) to parse model and pass through
-3. Update backward-compat add path (line 561-563) similarly
-4. Add `model: Option<ModelType>` param to `add_to_index()` (line 1429)
-5. Pass `model` instead of `None` in both `index()` calls (lines 1562, 1575)
-6. Add `model: Option<ModelType>` param to `try_delegate_add_to_serve()` (line 2150)
-7. Include model in JSON body: `body["model"] = model.map(|m| m.short_name().to_string())`
-8. Add `model: Option<String>` to `AddRepoRequest` struct (line 2583)
-9. Parse model in `add_repo_handler` (line 2597), write metadata.json with chosen model before force_reindex
-10. Add `model_override: Option<ModelType>` to `force_reindex_with_stores()` (line 751)
+**Goal:** When `git worktree add` creates a new worktree, a git `post-checkout` hook auto-registers it with codesearch serve.
 
-**Branch:** `fix/model-flag-ignored`
+**Implementation steps:**
 
-### #114 — Let serve also bind non-localhost → FEATURE + SECURITY
+| Step | File | What |
+|------|------|------|
+| 11 | `src/serve/mod.rs` | On serve startup, write `~/.codesearch/serve_url` with the serve URL (e.g. `http://127.0.0.1:39725`). On shutdown (Drop or cancel), delete the file. |
+| 12 | `src/cli/mod.rs` | Add `codesearch hook install` subcommand that writes a `post-checkout` hook script into `.git/hooks/`. The hook reads `~/.codesearch/serve_url` and POSTs the worktree path to `POST /repos`. |
+| 13 | Inline in hook script | Script template (bash + PowerShell): reads serve_url file, checks if it's a worktree checkout (prev_head ≠ new_head and branch flag = 1), then POSTs the working directory to serve |
+| 14 | Update AGENTS.md | Document worktree workflow |
 
-**Problem:** `codesearch serve` hardcodes `127.0.0.1` in 7 locations. No `--host` flag or env var.
-
-**Feature (5 files, ~60 lines):**
-
-| # | Location | Current | Fix |
-|---|----------|---------|-----|
-| 1 | `src/constants.rs` | No host constants | Add `DEFAULT_SERVE_HOST = "127.0.0.1"`, `SERVE_HOST_ENV = "CODESEARCH_SERVE_HOST"` |
-| 2 | `src/cli/mod.rs:258` | `Serve` has `--port` only | Add `--host` flag |
-| 3 | `src/serve/mod.rs:3184` | `([127,0,0,1], port)` | Dynamic `SocketAddr` from host+port |
-| 4 | `src/serve/mod.rs:3142` | `run_serve(port, ...)` | Add `host: Option<String>` param |
-| 5 | 5 URL helpers | `"http://127.0.0.1:{port}"` | Use `serve_host()` helper (env→default) |
-
-**URL helpers that need `serve_host()`:**
-- `serve_base_url()` — `src/cli/mod.rs:382`
-- `serve_url_from_env()` — `src/mcp/mod.rs:2240`
-- `try_delegate_reindex_to_serve()` — `src/index/mod.rs:1947`
-- `try_delegate_add_to_serve()` — `src/index/mod.rs:2162`
-- `try_delegate_rm_to_serve()` — `src/index/mod.rs:2243`
-
-**Security additions:**
-- Startup check: if host ≠ `127.0.0.1`/`::1`/`localhost` → **refuse** without `CODESEARCH_SERVE_API_KEY`
-- New `require_auth_for_network` middleware: when non-localhost, protect ALL routes (including MCP) with API key
-- Same Bearer/X-API-Key pattern as existing `require_admin_auth` (src/serve/mod.rs:3033)
-- Existing `require_admin_auth` stays for management-only auth when localhost with API key
-
-**Key constants:** `DEFAULT_SERVE_PORT: u16 = 39725`, `SERVE_PORT_ENV`, `SERVE_API_KEY_ENV`, `DEFAULT_SERVE_URL = "http://127.0.0.1:39725"` — all in `src/constants.rs`.
-
-**Current router setup:** Lines 3237-3250 — routes, layers: `log_mcp_requests` → `require_admin_auth` → handler.
-
-**Branch:** `feature/host-binding`
-
-## Implemented Features
-
-- **`find_impact` MCP tool** — returns transitive call-sites for a symbol (name/position-based), C# via `scip-csharp`
-- **`scip-csharp` helper** — .NET 10 CLI wrapping Roslyn. Subcommands: `index` (definitions only), `find-refs` (lazy, per-symbol), `batch-find-refs` (Phase 3 pre-warm)
-- **Lazy reference resolution** — rebuild stores definitions only; refs resolved on first `find_impact`, cached in `scip_ref_cache` LMDB
-- **Incremental merge** — `RebuildScope::Files`: reverse-maps stale symbol keys, merges new defs (partial-class safe)
-- **O(1) lookups** — `scip_positions` (file:line → symbols), `scip_simple_names` (identifier → full keys)
-- **Startup phases** — Phase 1: text/vector warmup; Phase 2: C# SCIP definitions (gated by `Semaphore(CSHARP_SCIP_CONCURRENCY)`); Phase 3: batch ref cache pre-warm
-- **`repos_meta` tracking** — `RepoMeta` persisted in `repos.json`, stale-path resilience with auto-relocation
-- **Alias always derived** — directory name via `ReposConfig::register()`, no user override
-- **TUI C# indicator** — green `C#·` ready, yellow `C#…` indexing, red `C#!` error
-- **SCIP LMDB map_size 512 MB** — override with `CODESEARCH_SCIP_LMDB_MAP_MB`
-- **Watcher .csproj grouping** — incremental rebuild per project instead of full solution
-
-## Architecture
-
-### Per-language adapter pattern
-
-`src/symbols/` hosts the adapter layer:
-
-- `mod.rs` — `SymbolIndexer` trait + `SymbolIndexerRegistry` dispatch
-- `csharp.rs` — C# adapter (rebuild, find_references, find_references_by_position)
-- `scip_parse.rs` — JSON parser for scip-csharp output
-
-### LMDB tables
-
-| Table | Key | Value |
-|---|---|---|
-| `scip_symbols` | full SCIP key | definitions only (after lazy-refs refactor) |
-| `scip_positions` | `<file>:<line>` | `[symbol_keys]` |
-| `scip_simple_names` | last segment identifier | `[full_keys]` |
-| `scip_ref_cache` | full SCIP key | lazy-resolved references |
-| `scip_meta` | `last_rebuild_ts`, `symbol_count` | `Str` |
-
-### Helper detection
-
-1. `CODESEARCH_SCIP_CSHARP` env var
-2. `<codesearch-exe-dir>/helpers/csharp/scip-csharp[.exe]`
-3. `$PATH`
-
-### Startup phases
-
-| Phase | What | Gating |
-|---|---|---|
-| Phase 1 | Sequential text/vector warmup | `run_phase_1_warmup_all()` |
-| Phase 2 | C# SCIP definitions-only | `Semaphore(CSHARP_SCIP_CONCURRENCY, default 2)` |
-| Phase 3 | Batch reference cache pre-warm | `CSHARP_PREWARM_ENABLED` (default: true) |
-
-### `SymbolIndexerRegistry` ownership
-
-4 `Arc::new(SymbolIndexerRegistry::new())` sites: `IndexManager::new()`, `IndexManager::new_for_path()`, `ServeState::new()`, `CodesearchService::new_with_stores()`. `CodesearchService::new_for_serve()` clones from `ServeState`.
-
-## Known Bugs
-
-### Bug 1 — `.gitignore` not respected → ✅ FIXED
-
-Was: build artifacts indexed as source. Fixed — `FileWalker` now uses `WalkBuilder` with `git_ignore(true)`, `git_global(true)`, `git_exclude(true)`, `add_custom_ignore_filename(".codesearchignore")` (src/file/mod.rs:95-99).
-
-### Bug 2 — MSBuildWorkspace picks up `obj/` generated files (HIGH — scip-csharp)
-
-**Workaround:** Add `Directory.Build.props` at solution root with `<Compile Remove="obj\**" />`.
-**Proper fix:** Pass `DesignTimeBuild=true` + `SkipCompilerExecution=true` MSBuild properties in scip-csharp.
-
-### Bug 3 — `--filter-project` selects wrong project when workspace fails to load (MEDIUM)
-
-When a .csproj fails to load, changed files are silently reassigned to a sibling that did compile. No warning. Fix: log warning + don't reassign.
-
-### Field-tested bugs (2026-05-08)
-
-| ID | Severity | Title | Status |
-|----|----------|-------|--------|
-| B1 | 🔴 CRITICAL | Double chunks (2× indexed) in one repo | Fix: `codesearch index -f <alias>` |
-| B2 | 🔴 CRITICAL | `status(kind="projects")` reports 0 chunks | Open — aggregation bug |
-| B3 | 🟡 MEDIUM | Regex `\w+`/`\b` doesn't work in literal mode | Open — BM25 tokenizes before regex |
-| B4 | 🟡 MEDIUM | Duplicate defs in find_impact (src/ prefix) | Open — path dedup needed |
-| B5 | 🟠 LOW | JS noise in `find definition` group-scope | Open — language filter |
-| B6 | 🟠 LOW | BM25 prefix-matching (TestPlan ≠ TestPlanCache) | Open — need subword tokenization |
-| B7 | 🔴 HIGH | Stale chunks after delete (caused by B1) | Fixed by B1 force reindex |
-
-## ⚠️ Canonical Path Policy — MANDATORY
-
-**NEVER call `.canonicalize()` directly. Always use `safe_canonicalize()`.**
-
-```rust
-// ❌ FORBIDDEN
-let p = path.canonicalize()?;
-// ✅ REQUIRED
-use crate::cache::safe_canonicalize;
-let p = safe_canonicalize(path)?;
+**Hook template logic:**
+```bash
+#!/bin/bash
+# codesearch post-checkout hook
+# $1 = prev_ref, $2 = new_ref, $3 = flag (1=branch checkout)
+SERVE_URL_FILE="$HOME/.codesearch/serve_url"
+if [ -f "$SERVE_URL_FILE" ]; then
+    SERVE_URL=$(cat "$SERVE_URL_FILE")
+    curl -s -X POST "$SERVE_URL/repos" -H "Content-Type: application/json" \
+      -d "{\"path\":\"$(pwd)\"}" &>/dev/null &
+fi
 ```
 
-Defined in `src/cache/file_meta.rs`, exported via `crate::cache`. Calls `canonicalize()` then `strip_unc_prefix()`.
+**Key details:**
+- `POST /repos` endpoint already exists (add_repo_handler, mod.rs ~line 2597)
+- `ReposConfig::register()` handles dedup (won't re-register existing path)
+- serve_url file is simple: just the URL string, one line
+- Hook must be executable (`chmod +x`)
+- For Windows: also provide a `.ps1` version or handle in the bash script via Git Bash
 
-### ⚠️ LMDB Access Rule — CRITICAL
+### Bug Fix: `.git/info/exclude` broken for worktrees
 
-LMDB does not allow two `EnvOpenOptions::open()` handles on the same directory in the same process.
+**Problem:** `src/watch/mod.rs:93` — `root.join(".git").join("info").join("exclude")` fails for worktrees because `.git` is a file (containing `gitdir: <path>`), not a directory.
 
-- **Serve context:** ALL LMDB access through `get_or_open_stores()` → `Arc<SharedStores>`
-- **Forbidden:** `VectorStore::new()`, `VectorStore::open_readonly()`, direct `heed::EnvOpenOptions::open()` on `.codesearch.db`
-- **Allowed in CLI/stdio:** `VectorStore::new()` is fine (own process)
+**Fix:** Add `resolve_git_dir(root: &Path) -> PathBuf` helper to `FileWatcher` (same file, before `build_gitignore`). Logic:
+1. Check if `root.join(".git")` is a file
+2. If yes: read it, parse `gitdir: <path>` from first line, resolve relative to root
+3. If no: return `root.join(".git")`
 
-**4 LMDB environments:**
-1. Vector DB — `.codesearch.db/` via `VectorStore`
-2. SCIP — `.codesearch.db/scip/` via `open_scip_env()` (separate dir)
-3. Embed cache — `~/.codesearch/embed_cache/` via `EmbeddingCache`
-4. FTS — `.codesearch.db/fts/` — Tantivy (NOT LMDB)
+Then in `build_gitignore()` (line 93), replace:
+```rust
+let exclude_path = root.join(".git").join("info").join("exclude");
+```
+with:
+```rust
+let git_dir = Self::resolve_git_dir(root);
+let exclude_path = git_dir.join("info").join("exclude");
+```
 
-## Remaining work
+## Architecture (relevant parts only)
 
-- [ ] **Warmup blocks tokio runtime** — sync I/O in `perform_incremental_refresh_with_stores` starves executor. Fix: `spawn_blocking`
-- [ ] Verify cached `find_impact` < 100ms (currently 216ms via HTTP)
-- [ ] CI green on `csharp-integration-tests` job
-- [ ] Warn if `--filter-project` passed to `find-refs` CLI
-- [ ] Standalone `index symbol` without serve
+### TUI files
+- `src/serve/tui.rs` — Embedded TUI (runs in serve process, direct Arc<ServeState> access)
+- `src/serve/tui_common.rs` — Shared types + rendering (KeyAction, OverlayState, RepoRow, all render_ functions)
+- `src/serve/tui_remote.rs` — Remote TUI (connects via HTTP to running serve)
+
+### Key types
+- `ServeState` (src/serve/mod.rs) — config: RwLock<ReposConfig>, repos: DashMap<String, RepoState>, last_access: DashMap
+- `ReposConfig` (src/db_discovery/repos.rs) — repos: HashMap<String, PathBuf>, groups, repos_meta
+- `SharedStores` — wraps VectorStore + FTS, shared via Arc
+
+### Existing remove flow
+- HTTP: `DELETE /repos/:alias` → `remove_repo_handler()` (mod.rs:2838)
+- CLI: `remove_from_index()` (src/index/mod.rs:1614)
+- Both: stop FSW → evict from memory → unregister from repos.json → delete .codesearch.db (5 retries, 300ms, handles Windows file locks)
 
 ## Notes for OpenCode
 
-- **Validation:** `cargo check` and `cargo clippy` for iteration. **No `--release` builds — always dev/debug.**
-- `scip-csharp` is self-contained single-file .NET 10 publish (no runtime required)
-- Symbol resolution: exact match first, then fuzzy via `scip_simple_names`
-- Position lookup matches `start_line` only
-
-### Runtime vs build locations
-
+- **Validation:** `cargo check` and `cargo clippy` for iteration. No `--release` builds — always dev/debug.
 - **Runtime:** `C:\Users\develterf\.local\bin\` — `codesearch.exe` + `helpers/csharp/scip-csharp.exe`
-- **Build:** `target/release/` — outside repo (via `CARGO_TARGET_DIR`). For compilation only.
-- **Logs:** `~\.codesearch\logs\` — structured logs during serve
-
-### Deploying to runtime
-
-- `..\copy-to-common.ps1` — builds + copies both binaries to `~/.local/bin/`
-- Helper: `dotnet publish helpers/csharp/scip-csharp.csproj -r win-x64 --self-contained -c Release`
-- Only copy single `.exe` — no DLLs, no `BuildHost-*` dirs
-
-## Release workflow — `/merge` and `/release`
-
-- **`/merge`** — land feature branch on `develop`: checks → commit → validate → push → PR → auto-merge
-- **`/release`** — `/merge` + promote `develop` → `master` via PR + push tag → triggers release workflow (6 archives)
-- **Version rule:** pre-commit hook bumps patch only on `feature/*`/`fix/*` branches; `develop`/`master` get `cargo fmt` only
+- **Build:** `target/release/` — outside repo (via `CARGO_TARGET_DIR`)
+- **Deploy:** `..\copy-to-common.ps1` — builds + copies both binaries to `~/.local/bin/`
+- **Canonical paths:** NEVER call `.canonicalize()` directly. Always use `safe_canonicalize()`.
+- **LMDB rule:** No two `EnvOpenOptions::open()` on same dir in same process. All access via `get_or_open_stores()` → `Arc<SharedStores>`.
