@@ -88,6 +88,7 @@ pub fn get_extractor(language: Language) -> Option<Box<dyn LanguageExtractor>> {
         Language::CSharp => Some(Box::new(CSharpExtractor)),
         Language::Go => Some(Box::new(GoExtractor)),
         Language::Java => Some(Box::new(JavaExtractor)),
+        Language::Dart => Some(Box::new(DartExtractor)),
         _ => None,
     }
 }
@@ -976,6 +977,158 @@ impl LanguageExtractor for JavaExtractor {
             _ => ChunkKind::Other,
         }
     }
+}
+
+/// Dart language extractor
+pub struct DartExtractor;
+
+impl LanguageExtractor for DartExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        &[
+            "class_declaration",
+            "enum_declaration",
+            "mixin_declaration",
+            "extension_declaration",
+            "extension_type_declaration",
+            "type_alias",
+            "function_declaration",
+            "method_declaration",
+            "getter_declaration",
+            "setter_declaration",
+            "constructor_signature",
+        ]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            // Types with a direct "name" field
+            "class_declaration"
+            | "enum_declaration"
+            | "mixin_declaration"
+            | "extension_declaration"
+            | "constructor_signature" => node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok().map(String::from)),
+            // Functions/methods/getters/setters: name is inside the "signature" child
+            "function_declaration"
+            | "method_declaration"
+            | "getter_declaration"
+            | "setter_declaration" => {
+                let sig = node.child_by_field_name("signature")?;
+                // function_signature, getter_signature, setter_signature have a "name" field
+                if let Some(name) = sig.child_by_field_name("name") {
+                    return name.utf8_text(source).ok().map(String::from);
+                }
+                // method_signature has no named fields — find identifier child
+                find_dart_identifier(&sig, source)
+            }
+            "type_alias" => find_dart_identifier(&node, source),
+            "extension_type_declaration" => node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok().map(String::from)),
+            _ => None,
+        }
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "function_declaration"
+            | "method_declaration"
+            | "getter_declaration"
+            | "setter_declaration" => {
+                // Signature is everything up to the body
+                let body = node.child_by_field_name("body");
+                let sig_end = body.map(|b| b.start_byte()).unwrap_or(node.end_byte());
+                let sig_text = std::str::from_utf8(&source[node.start_byte()..sig_end]).ok()?;
+                Some(sig_text.trim().to_string())
+            }
+            "class_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("class {}", name))
+            }
+            "enum_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("enum {}", name))
+            }
+            "mixin_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("mixin {}", name))
+            }
+            "extension_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("extension {}", name))
+            }
+            "extension_type_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("extension type {}", name))
+            }
+            "constructor_signature" => {
+                let sig_text =
+                    std::str::from_utf8(&source[node.start_byte()..node.end_byte()]).ok()?;
+                Some(sig_text.trim().to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        // Dart uses /// doc comments
+        let parent = node.parent()?;
+        let node_index = (0..parent.named_child_count())
+            .find(|&i| parent.named_child(i as u32).map(|c| c.id()) == Some(node.id()))?;
+
+        if node_index > 0 {
+            if let Some(prev) = parent.named_child((node_index - 1) as u32) {
+                if prev.kind() == "documentation_comment" || prev.kind() == "comment" {
+                    if let Ok(text) = prev.utf8_text(source) {
+                        let trimmed = text.trim_start();
+                        if trimmed.starts_with("///") || trimmed.starts_with("/**") {
+                            return Some(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        match node.kind() {
+            "function_declaration" => {
+                if let Some(parent) = node.parent() {
+                    if parent.kind() == "class_body"
+                        || parent.kind() == "enum_body"
+                        || parent.kind() == "extension_body"
+                        || parent.kind() == "mixin_application"
+                    {
+                        return ChunkKind::Method;
+                    }
+                }
+                ChunkKind::Function
+            }
+            "method_declaration"
+            | "getter_declaration"
+            | "setter_declaration"
+            | "constructor_signature" => ChunkKind::Method,
+            "class_declaration" | "extension_type_declaration" => ChunkKind::Class,
+            "enum_declaration" => ChunkKind::Enum,
+            "mixin_declaration" => ChunkKind::Class,
+            "extension_declaration" => ChunkKind::Other,
+            "type_alias" => ChunkKind::TypeAlias,
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
+/// Helper: find first `identifier` child in a Dart node (for method_signature, type_alias)
+fn find_dart_identifier(node: &Node, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "identifier" {
+            return child.utf8_text(source).ok().map(String::from);
+        }
+    }
+    None
 }
 
 /// Helper: recursively find the first identifier in a declarator chain (for C/C++)
