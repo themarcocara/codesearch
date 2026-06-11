@@ -16,6 +16,7 @@ pub enum Language {
     Php,
     Swift,
     Kotlin,
+    Dart,
     Shell,
     Markdown,
     Json,
@@ -73,6 +74,7 @@ impl Language {
             "php" => Self::Php,
             "swift" => Self::Swift,
             "kt" | "kts" => Self::Kotlin,
+            "dart" => Self::Dart,
             "sh" | "bash" | "zsh" => Self::Shell,
             "md" | "markdown" | "txt" => Self::Markdown, // Treat txt as markdown-like
             "json" => Self::Json,
@@ -100,6 +102,8 @@ impl Language {
                 | Self::CSharp
                 | Self::Go
                 | Self::Java
+                | Self::Kotlin
+                | Self::Dart
                 | Self::Shell
                 | Self::Ruby
                 | Self::Php
@@ -130,6 +134,7 @@ impl Language {
             Self::Php => "PHP",
             Self::Swift => "Swift",
             Self::Kotlin => "Kotlin",
+            Self::Dart => "Dart",
             Self::Shell => "Shell",
             Self::Markdown => "Markdown",
             Self::Json => "JSON",

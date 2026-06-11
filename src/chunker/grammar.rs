@@ -77,6 +77,7 @@ impl GrammarManager {
             // boundaries only need block structure, and the block grammar runs on a
             // plain `Parser` like every other language here.
             Language::Markdown => Ok(tree_sitter_md::LANGUAGE.into()),
+            Language::Dart => Ok(tree_sitter_dart::LANGUAGE.into()),
             _ => Err(anyhow!(
                 "Language {} does not support tree-sitter",
                 language.name()
@@ -102,6 +103,7 @@ impl GrammarManager {
             Language::Yaml,
             Language::Json,
             Language::Markdown,
+            Language::Dart,
         ]
     }
 
