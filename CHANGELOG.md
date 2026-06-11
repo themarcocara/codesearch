@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dart language support**: Tree-sitter semantic chunking for Dart — classes,
+  mixins, enums, extensions, extension types, and top-level functions are
+  extracted as definition chunks with full breadcrumb context.
 - **TUI 'r' key — Remove repo from index**: Pressing `r` in the TUI shows a
   confirmation dialog. On confirm, the repo is fully removed (FSW stopped,
   memory evicted, unregistered from config, database deleted).
