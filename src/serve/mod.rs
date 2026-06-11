@@ -220,6 +220,8 @@ pub(crate) struct ServeState {
     /// Test-only counter for reload invocations that actually swapped config.
     #[cfg(test)]
     reload_count: std::sync::atomic::AtomicUsize,
+    /// Instant when ServeState was created — used to compute uptime for TUI header.
+    started_at: std::time::Instant,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -284,6 +286,7 @@ impl ServeState {
             persist_worker_started: AtomicBool::new(false),
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -293,6 +296,11 @@ impl ServeState {
     /// helper-detection cache instead of creating fresh instances per request.
     pub(crate) fn symbol_registry(&self) -> Arc<SymbolIndexerRegistry> {
         Arc::clone(&self.symbol_registry)
+    }
+
+    /// Return the instant when serve started, used to compute uptime.
+    pub(crate) fn started_at(&self) -> std::time::Instant {
+        self.started_at
     }
 
     /// Build a `CSharpRebuildNotifier` for the given repo `alias`.
@@ -2278,6 +2286,8 @@ async fn status_handler(
         })
         .collect();
 
+    let uptime_secs = state.started_at().elapsed().as_secs();
+
     // CPU usage — reuse shared System instance so cpu_usage() can compute delta
     let cpu = {
         use sysinfo::ProcessesToUpdate;
@@ -2289,6 +2299,7 @@ async fn status_handler(
                     "repos": repo_json,
                     "active_sessions": active_sessions,
                     "cpu_percent": "—",
+                    "uptime_secs": uptime_secs,
                 }));
             }
         };
@@ -2300,6 +2311,7 @@ async fn status_handler(
                     "repos": repo_json,
                     "active_sessions": active_sessions,
                     "cpu_percent": "—",
+                    "uptime_secs": uptime_secs,
                 }));
             }
         };
@@ -2326,6 +2338,7 @@ async fn status_handler(
         "active_sessions": active_sessions,
         "cpu_percent": cpu,
         "csharp_helper": csharp_helper,
+        "uptime_secs": uptime_secs,
     }))
 }
 

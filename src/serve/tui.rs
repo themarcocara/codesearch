@@ -103,6 +103,7 @@ async fn run_tui_loop(
         let active = state.active_session_count();
         let cpu = cpu_usage_str(&mut sys_system);
         let version = env!("CARGO_PKG_VERSION");
+        let uptime = tui_common::format_uptime(state.started_at());
         let csharp_helper = state
             .symbol_registry
             .get(LANG_CSHARP)
@@ -119,7 +120,7 @@ async fn run_tui_loop(
             ])
             .split(size);
 
-            tui_common::render_header(f, chunks[0], serve_url, version, false);
+            tui_common::render_header(f, chunks[0], serve_url, version, false, &uptime);
             tui_common::render_table(f, chunks[1], &rows, &mut table_state);
             tui_common::render_detail(f, chunks[2], &rows, &table_state, 4);
             tui_common::render_footer(

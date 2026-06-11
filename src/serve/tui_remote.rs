@@ -32,6 +32,8 @@ struct StatusResponse {
     active_sessions: u64,
     cpu_percent: String,
     csharp_helper: bool,
+    #[serde(default)]
+    uptime_secs: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -63,6 +65,28 @@ impl RepoInfo {
             path: self.path.clone(),
         }
     }
+}
+
+/// Format uptime from seconds into "Up xxd xxh xxm xxs".
+fn format_uptime_from_secs(total_secs: u64) -> String {
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{}d", days));
+    }
+    if hours > 0 || !parts.is_empty() {
+        parts.push(format!("{:2}h", hours));
+    }
+    if mins > 0 || !parts.is_empty() {
+        parts.push(format!("{:2}m", mins));
+    }
+    parts.push(format!("{:2}s", secs));
+
+    format!("Up {}", parts.join(" "))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +183,10 @@ async fn run_remote_tui_loop(
         let active = data.as_ref().map(|d| d.active_sessions).unwrap_or(0);
         let cpu = data.as_ref().map(|d| d.cpu_percent.as_str()).unwrap_or("—");
         let csharp_helper = data.as_ref().map(|d| d.csharp_helper).unwrap_or(false);
+        let uptime_str = data
+            .as_ref()
+            .map(|d| format_uptime_from_secs(d.uptime_secs))
+            .unwrap_or_else(|| "Up  0s".to_string());
 
         terminal.draw(|f| {
             let size = f.area();
@@ -171,7 +199,7 @@ async fn run_remote_tui_loop(
             .split(size);
 
             if data.is_some() {
-                tui_common::render_header(f, chunks[0], serve_url, version, true);
+                tui_common::render_header(f, chunks[0], serve_url, version, true, &uptime_str);
                 tui_common::render_table(f, chunks[1], &rows, &mut table_state);
                 tui_common::render_detail(f, chunks[2], &rows, &table_state, 3);
                 tui_common::render_footer(
@@ -184,7 +212,7 @@ async fn run_remote_tui_loop(
                     csharp_helper,
                 );
             } else {
-                tui_common::render_header(f, chunks[0], serve_url, "?", true);
+                tui_common::render_header(f, chunks[0], serve_url, "?", true, &uptime_str);
                 let msg = if connection_errors >= 3 {
                     "Connection lost — will retry..."
                 } else {

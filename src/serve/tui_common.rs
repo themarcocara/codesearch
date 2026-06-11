@@ -13,6 +13,31 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 
+/// Format elapsed time since `started_at` as "Up xxd xxh xxm xxs".
+/// Omits days/hours/minutes when zero.
+pub fn format_uptime(started_at: std::time::Instant) -> String {
+    let elapsed = started_at.elapsed();
+    let total_secs = elapsed.as_secs();
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{}d", days));
+    }
+    if hours > 0 || !parts.is_empty() {
+        parts.push(format!("{:2}h", hours));
+    }
+    if mins > 0 || !parts.is_empty() {
+        parts.push(format!("{:2}m", mins));
+    }
+    parts.push(format!("{:2}s", secs));
+
+    format!("Up {}", parts.join(" "))
+}
+
 use crossterm::event::{KeyCode, KeyEvent};
 
 // ---------------------------------------------------------------------------
@@ -189,9 +214,8 @@ pub fn render_header(
     serve_url: &str,
     version: &str,
     is_remote: bool,
+    uptime: &str,
 ) {
-    let now = chrono::Local::now().format("%H:%M:%S").to_string();
-
     let mut spans = vec![
         Span::styled(
             format!(" codesearch serve v{} · ", version),
@@ -200,7 +224,10 @@ pub fn render_header(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(serve_url.to_string(), Style::default().fg(Color::White)),
-        Span::styled(format!("  {} ", now), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("  {} ", uptime),
+            Style::default().fg(Color::DarkGray),
+        ),
     ];
 
     if is_remote {
