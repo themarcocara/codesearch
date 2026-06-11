@@ -46,13 +46,13 @@ pub struct RepoRow {
 pub enum KeyAction {
     /// No action / key not recognized.
     None,
-    /// User pressed `s` — reload repos config.
+    /// User pressed `l` — reload repos config.
     Reload,
     /// User pressed `i` — show info overlay for repo at given index.
     ShowInfo(usize),
     /// User pressed `d` — run doctor for repo at given index.
     RunDoctor(usize),
-    /// User pressed `f` — force reindex repo at given index.
+    /// User pressed `n` — force reindex repo at given index.
     ForceReindex(usize),
     /// User pressed `r` — request removal of repo at given index (shows confirmation).
     RequestRemove(usize),
@@ -116,7 +116,7 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
             table_state.select(Some(row_count - 1));
             KeyAction::None
         }
-        KeyCode::Char('s') => KeyAction::Reload,
+        KeyCode::Char('l') => KeyAction::Reload,
         KeyCode::Char('i') => {
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::ShowInfo(idx)
@@ -125,7 +125,7 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::RunDoctor(idx)
         }
-        KeyCode::Char('f') => {
+        KeyCode::Char('n') => {
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::ForceReindex(idx)
         }
@@ -508,7 +508,7 @@ pub fn render_footer(
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
-        format!("[{}/{}]", selected + 1, repos.len())
+        format!(" {}/{}", selected + 1, repos.len())
     } else {
         String::new()
     };
@@ -527,13 +527,56 @@ pub fn render_footer(
             .areas(footer_inner);
 
     let left_line = Line::from(vec![
-        Span::styled("[q] quit  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[↑↓] scroll  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[i] info  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[d] doctor  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[f] reindex  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[r] remove  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[s] reload  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "i",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled("nfo  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "d",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled("octor  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("rei", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "n",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled("dex  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "r",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled("emove  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("re", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "l",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled("oad  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "q",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled("uit  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "↑↓",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
     ]);
 
