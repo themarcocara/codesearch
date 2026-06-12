@@ -14,7 +14,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::Terminal;
 
 use crossterm::event::{self, Event, KeyEventKind};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{self, EnterAlternateScreen};
 
 use tokio_util::sync::CancellationToken;
 
@@ -54,7 +54,7 @@ pub async fn run_tui(
     let result = run_tui_loop(&mut terminal, state, cancel_token, &serve_url).await;
 
     // Always restore terminal, even on error
-    restore_terminal(&mut terminal)?;
+    tui_common::restore_terminal(&mut terminal)?;
 
     result
 }
@@ -187,7 +187,7 @@ async fn run_tui_loop(
                 }
                 match tui_common::handle_key(key, &mut table_state, rows.len()) {
                     KeyAction::Reload => {
-                        // 's' pressed — force reload of repos config
+                        // 'l' pressed — force reload of repos config
                         // Clear mtime so reload_if_changed actually reloads
                         if let Ok(mut mtime_guard) = state.config_mtime.write() {
                             *mtime_guard = None;
@@ -274,7 +274,7 @@ fn map_repo_rows(
                 super::CSharpIndexStatus::Ready => "ready",
                 super::CSharpIndexStatus::Indexing => "indexing",
                 super::CSharpIndexStatus::Error => "error",
-                super::CSharpIndexStatus::None => "",
+                super::CSharpIndexStatus::None => "none",
             }
             .to_string();
 
@@ -303,17 +303,6 @@ fn map_repo_rows(
             }
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Restore helpers
-// ---------------------------------------------------------------------------
-
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    terminal::disable_raw_mode()?;
-    crossterm::execute!(io::stdout(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

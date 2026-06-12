@@ -16,8 +16,12 @@ use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 /// Format elapsed time since `started_at` as "Up xxd xxh xxm xxs".
 /// Omits days/hours/minutes when zero.
 pub fn format_uptime(started_at: std::time::Instant) -> String {
-    let elapsed = started_at.elapsed();
-    let total_secs = elapsed.as_secs();
+    format_uptime_secs(started_at.elapsed().as_secs())
+}
+
+/// Format a duration in seconds as "Up xxd xxh xxm xxs".
+/// Omits days/hours/minutes when zero.
+pub fn format_uptime_secs(total_secs: u64) -> String {
     let days = total_secs / 86400;
     let hours = (total_secs % 86400) / 3600;
     let mins = (total_secs % 3600) / 60;
@@ -50,7 +54,7 @@ pub struct RepoRow {
     pub alias: String,
     /// Human-readable status: "open", "warm", "readonly", "closed", "indexing", "error", "no_index"
     pub status: String,
-    /// C# index status: "", "ready", "indexing", "error"
+    /// C# index status: "none", "ready", "indexing", "error" (empty also treated as none)
     pub csharp_index: String,
     /// Optional C# error message
     pub csharp_error: Option<String>,
@@ -768,51 +772,15 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
 }
 
 /// Render a centered modal with a title and content lines.
+/// Uses the default cyan border/title color; delegates to
+/// [`render_centered_modal_with_border_color`].
 pub fn render_centered_modal(
     f: &mut ratatui::Frame,
     area: Rect,
     title: &str,
     lines: Vec<Line<'_>>,
 ) {
-    let content_height = lines.len() as u16 + 2; // +2 for border
-    let max_line_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(20);
-    let title_w = title.len() as u16;
-    let content_width = (max_line_w + 4).max(title_w + 4).max(30);
-
-    // Center the modal
-    let modal_area = Rect {
-        x: area
-            .width
-            .saturating_sub(content_width)
-            .saturating_div(2)
-            .min(area.width.saturating_sub(content_width)),
-        y: area
-            .height
-            .saturating_sub(content_height)
-            .saturating_div(2)
-            .min(area.height.saturating_sub(content_height)),
-        width: content_width.min(area.width),
-        height: content_height.min(area.height),
-    };
-
-    // Clear the modal area so no table text shows through the modal interior
-    f.render_widget(ratatui::widgets::Clear, modal_area);
-
-    let block = ratatui::widgets::Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(Color::Rgb(20, 20, 35)));
-    let inner = block.inner(modal_area);
-    f.render_widget(block, modal_area);
-
-    let content = ratatui::widgets::Paragraph::new(lines);
-    f.render_widget(content, inner);
+    render_centered_modal_with_border_color(f, area, title, lines, Color::Cyan);
 }
 
 /// Render a centered modal with a custom border color.
@@ -1028,4 +996,20 @@ fn detail_status_style(status: &str, csharp: &str) -> (String, Color) {
         "no_index" => ("No Index".to_string(), Color::Gray),
         _ => (status.to_string(), Color::White),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal helpers
+// ---------------------------------------------------------------------------
+
+/// Restore the terminal to its normal state: disable raw mode, leave the
+/// alternate screen, and show the cursor. Shared by both the embedded and
+/// remote TUI on exit.
+pub fn restore_terminal(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> std::io::Result<()> {
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
 }

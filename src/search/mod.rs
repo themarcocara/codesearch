@@ -439,7 +439,13 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     let (model_type, dimensions, primary_language) =
         if let Some(ref model_name) = options.model_override {
             // User specified a model - use it (warning: may not match indexed data!)
-            let mt = ModelType::parse(model_name).unwrap_or_default();
+            let mt = ModelType::parse(model_name).unwrap_or_else(|| {
+                tracing::warn!(
+                    "Unrecognized model override '{}', falling back to default model",
+                    model_name
+                );
+                ModelType::default()
+            });
             (mt, mt.dimensions(), None)
         } else if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
             // Use model from metadata
@@ -447,6 +453,10 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 (mt, dims, lang)
             } else {
                 // Model name not recognized, fall back to default
+                tracing::warn!(
+                    "Unrecognized model '{}' in database metadata, falling back to default model",
+                    model_name
+                );
                 warn_print!(
                     "{}",
                     "⚠️  Unknown model in metadata, using default".yellow()

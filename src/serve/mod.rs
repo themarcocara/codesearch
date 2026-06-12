@@ -4169,6 +4169,89 @@ mod tests {
         );
     }
 
+    /// Verify that the /repos/:alias/info and /repos/:alias/doctor routes are
+    /// registered and reachable. Starts a real axum server on a random port and
+    /// asserts that an unknown alias yields our handler's 404 (not axum's 404).
+    #[tokio::test]
+    async fn info_doctor_routes_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("myrepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+
+        let state = Arc::new(ServeState::new(config, Some(config_file)));
+
+        let app = axum::Router::new()
+            .route(
+                crate::constants::HEALTH_PATH,
+                axum::routing::get(health_handler),
+            )
+            .route("/repos/:alias/info", axum::routing::get(info_handler))
+            .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // GET unknown alias info → 404 from our handler (not axum's built-in 404)
+        let resp = client
+            .get(format!("http://{}/repos/unknown/info", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "expected 404 from info handler"
+        );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("info handler should return JSON body for 404");
+        assert!(
+            body.get("error").is_some(),
+            "expected JSON error body from info handler, got: {}",
+            body
+        );
+
+        // POST unknown alias doctor → 404 from our handler (not axum's built-in 404)
+        let resp = client
+            .post(format!("http://{}/repos/unknown/doctor", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "expected 404 from doctor handler"
+        );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("doctor handler should return JSON body for 404");
+        assert!(
+            body.get("error").is_some(),
+            "expected JSON error body from doctor handler, got: {}",
+            body
+        );
+    }
+
     #[test]
     fn config_reload_tolerates_parse_error() {
         let tmp = tempfile::tempdir().unwrap();

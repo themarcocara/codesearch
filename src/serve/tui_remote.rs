@@ -4,7 +4,8 @@
 //! as the embedded TUI in `tui.rs`, using the shared `tui_common` framework.
 //! This allows the TUI to be opened and closed independently of the server process.
 //!
-//! Actions (i/d/f/s) are routed to HTTP endpoints on the serve.
+//! Actions (i=info, d=doctor, n=reindex, r=remove, l=reload) are routed to
+//! HTTP endpoints on the serve.
 
 use std::io;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::Terminal;
 
 use crossterm::event::{self, Event, KeyEventKind};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{self, EnterAlternateScreen};
 
 use serde::Deserialize;
 
@@ -67,28 +68,6 @@ impl RepoInfo {
     }
 }
 
-/// Format uptime from seconds into "Up xxd xxh xxm xxs".
-fn format_uptime_from_secs(total_secs: u64) -> String {
-    let days = total_secs / 86400;
-    let hours = (total_secs % 86400) / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-
-    let mut parts = Vec::new();
-    if days > 0 {
-        parts.push(format!("{}d", days));
-    }
-    if hours > 0 || !parts.is_empty() {
-        parts.push(format!("{:2}h", hours));
-    }
-    if mins > 0 || !parts.is_empty() {
-        parts.push(format!("{:2}m", mins));
-    }
-    parts.push(format!("{:2}s", secs));
-
-    format!("Up {}", parts.join(" "))
-}
-
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -106,7 +85,7 @@ pub async fn run_remote_tui(serve_url: String) -> Result<()> {
     let result = run_remote_tui_loop(&mut terminal, &serve_url).await;
 
     // Always restore terminal
-    restore_terminal(&mut terminal)?;
+    tui_common::restore_terminal(&mut terminal)?;
 
     result
 }
@@ -138,9 +117,14 @@ async fn run_remote_tui_loop(
     // Monotonic id of the most recent doctor/info request; bumped on every spawn.
     let mut doctor_gen: u64 = 0;
 
+    // Single shared HTTP client reused for the status poll and all action
+    // requests. reqwest::Client is cheap to clone and shares one connection
+    // pool; per-request timeouts are still applied via `.timeout()`.
+    let client = reqwest::Client::new();
+
     loop {
         // Fetch status from serve
-        match reqwest::get(&status_url).await {
+        match client.get(&status_url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<StatusResponse>().await {
                 Ok(d) => {
                     data = Some(d);
@@ -185,7 +169,7 @@ async fn run_remote_tui_loop(
         let csharp_helper = data.as_ref().map(|d| d.csharp_helper).unwrap_or(false);
         let uptime_str = data
             .as_ref()
-            .map(|d| format_uptime_from_secs(d.uptime_secs))
+            .map(|d| tui_common::format_uptime_secs(d.uptime_secs))
             .unwrap_or_else(|| "Up  0s".to_string());
 
         terminal.draw(|f| {
@@ -251,13 +235,14 @@ async fn run_remote_tui_loop(
                                 if let Some(OverlayState::ConfirmRemove { alias }) = overlay.take()
                                 {
                                     let serve = serve_url.to_string();
+                                    let client = client.clone();
                                     tokio::spawn(async move {
                                         let remove_url = format!(
                                             "{}/repos/{}",
                                             serve.trim_end_matches('/'),
                                             alias
                                         );
-                                        match reqwest::Client::new()
+                                        match client
                                             .delete(&remove_url)
                                             .timeout(Duration::from_secs(10))
                                             .send()
@@ -301,7 +286,7 @@ async fn run_remote_tui_loop(
                 match action {
                     KeyAction::Reload => {
                         let reload_url = format!("{}/reload", serve_url.trim_end_matches('/'));
-                        let _ = reqwest::Client::new()
+                        let _ = client
                             .post(&reload_url)
                             .timeout(Duration::from_secs(3))
                             .send()
@@ -319,8 +304,9 @@ async fn run_remote_tui_loop(
                             doctor_gen += 1;
                             let gen = doctor_gen;
                             let tx = doctor_tx.clone();
+                            let client = client.clone();
                             tokio::spawn(async move {
-                                let result = match reqwest::Client::new()
+                                let result = match client
                                     .get(&info_url)
                                     .timeout(Duration::from_secs(10))
                                     .send()
@@ -351,7 +337,6 @@ async fn run_remote_tui_loop(
                                     }
                                     _ => {
                                         // Fallback: show basic info
-                                        let _ = tx; // suppress unused warning
                                         OverlayState::Doctor {
                                             alias,
                                             results: vec![
@@ -378,13 +363,14 @@ async fn run_remote_tui_loop(
                             let gen = doctor_gen;
                             let tx = doctor_tx.clone();
                             let serve = serve_url.to_string();
+                            let client = client.clone();
                             tokio::spawn(async move {
                                 let doctor_url = format!(
                                     "{}/repos/{}/doctor",
                                     serve.trim_end_matches('/'),
                                     alias
                                 );
-                                let result = match reqwest::Client::new()
+                                let result = match client
                                     .post(&doctor_url)
                                     .timeout(Duration::from_secs(60))
                                     .send()
@@ -436,7 +422,7 @@ async fn run_remote_tui_loop(
                                 alias
                             );
                             // Fire-and-forget POST
-                            let _ = reqwest::Client::new()
+                            let _ = client
                                 .post(&reindex_url)
                                 .timeout(Duration::from_secs(5))
                                 .send()
@@ -483,15 +469,4 @@ struct InfoResponse {
 #[derive(Debug, Deserialize)]
 struct DoctorResponse {
     results: Vec<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Terminal helpers
-// ---------------------------------------------------------------------------
-
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    terminal::disable_raw_mode()?;
-    crossterm::execute!(io::stdout(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
 }
