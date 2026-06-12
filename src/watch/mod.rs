@@ -720,6 +720,72 @@ mod tests {
         assert!(!events.is_empty());
     }
 
+    #[test]
+    fn test_codesearchignore_loaded_and_respected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Create repo-local .codesearchignore excluding tests/
+        fs::write(root.join(".codesearchignore"), "tests/\n").unwrap();
+
+        let watcher = FileWatcher::new(root.to_path_buf());
+        assert!(
+            watcher.gitignore.is_some(),
+            "Should have loaded .codesearchignore"
+        );
+
+        assert!(
+            !watcher.is_watchable(&root.join("tests/test_foo.rs")),
+            "tests/ should be ignored by .codesearchignore"
+        );
+        assert!(
+            watcher.is_watchable(&root.join("src/main.rs")),
+            "src/main.rs should be watchable"
+        );
+    }
+
+    #[test]
+    fn test_codesearchignore_overrides_gitignore() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Scenario: .gitignore excludes logs/ but .codesearchignore excludes src/generated/.
+        // Both files are loaded — each contributes its own patterns to the matcher.
+        fs::write(root.join(".gitignore"), "logs/\n").unwrap();
+        fs::write(root.join(".codesearchignore"), "src/generated/\n").unwrap();
+
+        let watcher = FileWatcher::new(root.to_path_buf());
+        assert!(watcher.gitignore.is_some());
+
+        // .gitignore pattern takes effect
+        assert!(
+            !watcher.is_watchable(&root.join("logs/debug.log")),
+            "logs/ should be ignored by .gitignore"
+        );
+        // .codesearchignore pattern takes effect
+        assert!(
+            !watcher.is_watchable(&root.join("src/generated/types.rs")),
+            "src/generated/ should be ignored by .codesearchignore"
+        );
+        // Non-ignored file still watchable
+        assert!(
+            watcher.is_watchable(&root.join("src/main.rs")),
+            "src/main.rs should be watchable"
+        );
+    }
+
+    #[test]
+    fn test_no_ignore_files_returns_none() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let watcher = FileWatcher::new(root.to_path_buf());
+        assert!(
+            watcher.gitignore.is_none(),
+            "Should have no gitignore matcher when no ignore files exist"
+        );
+    }
+
     #[tokio::test]
     async fn test_git_head_watcher_detects_commit_advance_without_head_change() {
         let dir = tempdir().unwrap();

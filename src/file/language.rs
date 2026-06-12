@@ -211,4 +211,21 @@ mod tests {
         assert!(Language::Markdown.is_indexable());
         assert!(!Language::Unknown.is_indexable());
     }
+
+    #[test]
+    fn test_jupyter_detection() {
+        assert_eq!(Language::from_extension("ipynb"), Language::Jupyter);
+        assert_eq!(
+            Language::from_path(&PathBuf::from("analysis.ipynb")),
+            Language::Jupyter
+        );
+        assert!(
+            Language::Jupyter.is_indexable(),
+            "Jupyter should be indexable"
+        );
+        assert!(
+            !Language::Jupyter.supports_tree_sitter(),
+            "Jupyter should NOT support tree-sitter (uses custom JSON extraction)"
+        );
+    }
 }

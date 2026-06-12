@@ -437,4 +437,21 @@ mod tests {
              Update DEFAULT_SERVE_URL to match.",
         );
     }
+
+    #[test]
+    fn global_codesearchignore_path_returns_home_codesearch_dir() {
+        let path = global_codesearchignore_path();
+        assert!(path.is_some(), "Should return Some when home dir exists");
+        let path = path.unwrap();
+        assert!(
+            path.to_string_lossy().contains(".codesearch"),
+            "Path should contain .codesearch directory: {:?}",
+            path
+        );
+        assert_eq!(
+            path.file_name().unwrap(),
+            GLOBAL_CODESEARCHIGNORE_FILE,
+            "Filename should match GLOBAL_CODESEARCHIGNORE_FILE constant"
+        );
+    }
 }
