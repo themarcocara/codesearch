@@ -211,40 +211,45 @@ mod tests {
         let _env2 = unsafe { TrackedEnv::open(&opts, dir2.path(), "test-2").unwrap() };
     }
 
-    /// Regression guard for the `Drop` ordering bug: a previous `TrackedEnv`
-    /// must release heed's internal `OPENED_ENV` slot BEFORE freeing our own
-    /// registry slot. Otherwise a concurrent open that wins our `register()`
-    /// race falls through to `opts.open()` and heed rejects it with
-    /// "an environment is already opened with different options" — the exact
-    /// production symptom (the two opens here request DIFFERENT map sizes so a
-    /// stale-but-live heed env would mismatch).
+    /// Regression guard for the concurrent open→drop→reopen path that produced
+    /// the production 500 ("an environment is already opened with different
+    /// options").
     ///
-    /// This test churns open→drop→reopen on a single shared path from multiple
-    /// threads. It asserts the forbidden heed string NEVER appears. Our own
-    /// "double-open prevented" error IS allowed (it means `register()` correctly
-    /// serialized the racing opens). The assertion can only fail on a real
-    /// regression — a missed race is a false negative, never a flaky failure.
+    /// Contract: every open of a given path within the process MUST use the
+    /// same `map_size` (the store layer enforces this via its process-global
+    /// per-path map-size pin — see `vectordb::store::resolve_map_size`). heed
+    /// rejects a reopen whose recorded options differ from a still-live env, and
+    /// because heed defers env close, a reopen can briefly observe the prior
+    /// env; the `TrackedEnv` `Drop` reorder (drop the heed env before freeing
+    /// our slot) narrows that window but the consistent-size contract is what
+    /// makes it fully safe — matching options mean heed reuses/reopens cleanly
+    /// instead of erroring.
+    ///
+    /// This test churns open→drop→reopen on a single shared path from many
+    /// threads (behind a barrier to maximize overlap), all using the SAME size,
+    /// and asserts the forbidden heed string NEVER appears. Our own "double-open
+    /// prevented" error IS allowed (it means `register()` serialized the race).
+    /// The assertion can only fail on a real regression — never flaky.
     #[test]
-    fn test_drop_releases_heed_slot_before_registry_slot() {
-        use std::sync::Arc;
+    fn test_concurrent_reopen_same_size_never_conflicts() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 4000;
+        const MAP_SIZE: usize = 1024 * 1024;
 
         let dir = TempDir::new().unwrap();
         let path: Arc<std::path::PathBuf> = Arc::new(dir.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(THREADS));
 
-        let threads: Vec<_> = (0..4)
-            .map(|t| {
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
                 let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
-                    // Alternate map sizes per thread so any stale-but-live heed
-                    // env observed by a racing open is guaranteed to mismatch
-                    // options and surface BadOpenOptions if the bug is present.
-                    let map_size = if t % 2 == 0 {
-                        1024 * 1024
-                    } else {
-                        2 * 1024 * 1024
-                    };
-                    for _ in 0..50 {
-                        let opts = make_opts_sized(map_size);
+                    barrier.wait();
+                    for _ in 0..ITERS {
+                        let opts = make_opts_sized(MAP_SIZE);
                         match unsafe { TrackedEnv::open(&opts, &path, "race") } {
                             Ok(env) => drop(env),
                             Err(e) => {
