@@ -3,7 +3,7 @@
 ## Current state
 
 - **Branch:** `feature/global-codesearchignore` (based on `develop` at 7b8cd71)
-- **Version:** v1.0.189
+- **Version:** v1.0.192
 - **Status:** `cargo check` + `cargo clippy` clean
 - **Validation:** `cargo check` for iteration, `cargo clippy` for lint. No `--release` builds.
 

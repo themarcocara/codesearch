@@ -100,11 +100,15 @@ fn extract_cell(cell: &Value) -> Option<RawCell> {
         return None;
     }
 
-    let source = cell["source"].as_array()?;
-
-    // Join source lines — each element is already a string (may or may not
-    // include a trailing newline).
-    let content: String = source.iter().filter_map(|v| v.as_str()).collect();
+    // Source can be either an array of strings (standard) or a single string
+    // (rare: old IPython notebooks, some programmatic generators).
+    let content: String = if let Some(arr) = cell["source"].as_array() {
+        arr.iter().filter_map(|v| v.as_str()).collect()
+    } else if let Some(s) = cell["source"].as_str() {
+        s.to_string()
+    } else {
+        return None;
+    };
 
     let line_count = if content.is_empty() {
         0
