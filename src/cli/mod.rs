@@ -972,11 +972,15 @@ if [ -f "$SERVE_URL_FILE" ]; then
     if [ -n "$SERVE_URL" ]; then
         # JSON-escape the repo path before embedding it in the request body.
         # A path containing a double quote or backslash would otherwise break
-        # out of the JSON string literal (malformed body / injection). Escape
-        # backslashes first, then double quotes (order matters).
+        # out of the JSON string literal (malformed body / injection). Use
+        # quoted variables as the search/replace operands so the patterns match
+        # LITERALLY — bare backslash patterns (${v//\\/..}) are unreliable across
+        # bash/msys builds. Escape backslashes first, then double quotes.
         REPO_PATH="$(pwd)"
-        REPO_PATH="${REPO_PATH//\\/\\\\}"
-        REPO_PATH="${REPO_PATH//\"/\\\"}"
+        BS='\'
+        DQ='"'
+        REPO_PATH=${REPO_PATH//"$BS"/"$BS$BS"}
+        REPO_PATH=${REPO_PATH//"$DQ"/"$BS$DQ"}
         curl -s -X POST "$SERVE_URL/repos" \
             -H "Content-Type: application/json" \
             -d "{\"path\":\"$REPO_PATH\"}" &>/dev/null &
