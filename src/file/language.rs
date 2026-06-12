@@ -26,6 +26,7 @@ pub enum Language {
     Html,
     Css,
     Xml,
+    Jupyter,
     Unknown,
 }
 
@@ -84,6 +85,7 @@ impl Language {
             "html" | "htm" => Self::Html,
             "css" | "scss" | "sass" | "less" => Self::Css,
             "xml" | "csproj" | "props" | "targets" | "resx" | "config" => Self::Xml,
+            "ipynb" => Self::Jupyter,
             _ => Self::Unknown,
         }
     }
@@ -144,6 +146,7 @@ impl Language {
             Self::Html => "HTML",
             Self::Css => "CSS",
             Self::Xml => "XML",
+            Self::Jupyter => "Jupyter",
             Self::Unknown => "Unknown",
         }
     }
@@ -207,5 +210,22 @@ mod tests {
         assert!(Language::Rust.is_indexable());
         assert!(Language::Markdown.is_indexable());
         assert!(!Language::Unknown.is_indexable());
+    }
+
+    #[test]
+    fn test_jupyter_detection() {
+        assert_eq!(Language::from_extension("ipynb"), Language::Jupyter);
+        assert_eq!(
+            Language::from_path(&PathBuf::from("analysis.ipynb")),
+            Language::Jupyter
+        );
+        assert!(
+            Language::Jupyter.is_indexable(),
+            "Jupyter should be indexable"
+        );
+        assert!(
+            !Language::Jupyter.supports_tree_sitter(),
+            "Jupyter should NOT support tree-sitter (uses custom JSON extraction)"
+        );
     }
 }

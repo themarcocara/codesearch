@@ -459,6 +459,8 @@ node_modules/
 **/migrations/**
 ```
 
+A **global** `.codesearchignore` can be placed at `~/.codesearch/.codesearchignore`. It applies to all repos with the lowest priority (repo-local `.codesearchignore`, `.gitignore`, and `.git/info/exclude` all override it). This is useful for patterns you want everywhere without modifying each repo.
+
 ### `repos.json`
 
 Located at `~/.codesearch/repos.json`. Managed by `codesearch index add/rm`. Contains repo aliases → paths and group definitions. See [Serve Mode](#serve-mode-multi-repo).
@@ -490,9 +492,13 @@ Tree-sitter AST-aware chunking:
 | YAML | `.yaml`, `.yml` |
 | JSON | `.json` |
 | Markdown | `.md`, `.markdown`, `.txt` |
+| Jupyter | `.ipynb` |
 
 Markdown uses the tree-sitter-md **block** grammar — chunks align to sections,
-headings, and code fences. All other text files use line-based chunking as fallback.
+headings, and code fences. Jupyter notebooks are parsed as JSON; code and
+markdown cells are extracted, tagged with `[code]` or `[markdown]`, and
+adjacent same-type cells under 50 lines are merged into single chunks.
+All other text files use line-based chunking as fallback.
 
 ## Core Technology
 

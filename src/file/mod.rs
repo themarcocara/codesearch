@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
-use crate::constants::{ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS, ALWAYS_SKIP_FILENAME_SUFFIXES};
+use crate::constants::{
+    global_codesearchignore_path, ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS,
+    ALWAYS_SKIP_FILENAME_SUFFIXES,
+};
 
 mod binary;
 mod language;
@@ -99,7 +102,20 @@ impl FileWalker {
             .git_exclude(self.respect_gitignore)
             .hidden(!self.include_hidden)
             .add_custom_ignore_filename(".codesearchignore")
-            .add_custom_ignore_filename(".osgrepignore") // Compatibility with osgrep
+            .add_custom_ignore_filename(".osgrepignore"); // Compatibility with osgrep
+
+        // Add global ~/.codesearch/.codesearchignore (applies to all repos)
+        if let Some(global_ignore) = global_codesearchignore_path() {
+            if global_ignore.exists() {
+                debug!(
+                    "Loading global codesearchignore: {}",
+                    global_ignore.display()
+                );
+                builder.add_ignore(&global_ignore);
+            }
+        }
+
+        builder
             // Filter out excluded directories BEFORE descending into them
             .filter_entry(|entry| {
                 // Always allow the root entry
