@@ -863,15 +863,21 @@ impl IndexManager {
 
         // ── Step 4: Ensure metadata.json exists before reindex ──
         // perform_incremental_refresh_with_stores() hard-fails without it.
-        // Write back the preserved metadata (with updated timestamp).
+        // Write back the preserved metadata (with updated timestamp) via the
+        // atomic read-modify-write helper so a crash here can never leave a
+        // truncated/partial metadata.json (the failure mode the atomic writer
+        // exists to prevent).
         {
-            let mut metadata_to_write = preserved_metadata.clone();
-            metadata_to_write["indexed_at"] =
-                serde_json::Value::String(chrono::Utc::now().to_rfc3339());
-            std::fs::write(
-                &metadata_path,
-                serde_json::to_string_pretty(&metadata_to_write)?,
-            )
+            let indexed_at = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+            let preserved = preserved_metadata.clone();
+            crate::vectordb::merge_metadata_atomic(db_path, move |obj| {
+                if let Some(src) = preserved.as_object() {
+                    for (k, v) in src {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+                obj.insert("indexed_at".to_string(), indexed_at);
+            })
             .with_context(|| format!("Failed to write {}", metadata_path.display()))?;
         }
 

@@ -61,12 +61,17 @@ fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
 }
 
 /// Atomically write a JSON file using temp+rename pattern.
-/// Writes to a per-process-unique temp file in the same directory, then renames
-/// to `<path>`. The unique temp name (pid + monotonic counter) ensures two
-/// concurrent writers don't clobber a shared temp file; `rename` is atomic on
-/// the same filesystem so a crash mid-write never leaves a partial `<path>`.
+/// Writes to a per-process-unique temp file in the same directory, fsyncs it,
+/// then renames to `<path>`. The unique temp name (pid + monotonic counter)
+/// ensures two concurrent writers don't clobber a shared temp file. The temp
+/// file is flushed to disk with `sync_all` BEFORE the rename, so a power-loss
+/// cannot leave a zero-length or garbage file in place of the old metadata;
+/// combined with `rename` being atomic on the same filesystem, a reader always
+/// observes either the complete old or the complete new content.
 /// On failure the temp file is best-effort removed.
 fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+
     static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp_name = format!("metadata.json.{}.{}.tmp", std::process::id(), seq);
@@ -74,10 +79,20 @@ fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
         Some(dir) => dir.join(tmp_name),
         None => path.with_extension("json.tmp"),
     };
-    if let Err(e) = fs::write(&tmp_path, serde_json::to_string_pretty(json)?) {
+    let data = serde_json::to_string_pretty(json)?;
+
+    // Write + fsync the temp file before the atomic rename.
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(data.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp_path);
         return Err(e.into());
     }
+
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e.into());
