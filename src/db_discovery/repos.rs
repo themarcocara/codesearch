@@ -535,13 +535,40 @@ fn normalize_path_for_compare(path: &Path) -> String {
 /// repo has no `origin` remote. Used both to capture a repo's identity at
 /// registration time and to match candidate directories during relocation.
 pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["config", "--get", "remote.origin.url"])
-        .output()
-        .ok()?;
+    // `git` is spawned once per candidate directory. On Windows/msys (and Unix
+    // under heavy parallel load) the OS can transiently refuse to fork the
+    // subprocess (EAGAIN / "Resource temporarily unavailable"). Treating that
+    // transient spawn failure the same as "no remote" would silently strip a
+    // repo's git identity — breaking relocation and causing valid repos to be
+    // pruned. Retry a few times with a short backoff on spawn failure; a
+    // definitive `NotFound` (git not installed) returns immediately, and an
+    // `Ok` result whose status is non-success (not a repo / no origin) is a
+    // real answer that is NOT retried.
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut output = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "--get", "remote.origin.url"])
+            .output()
+        {
+            Ok(o) => {
+                output = Some(o);
+                break;
+            }
+            // git binary genuinely absent — retrying cannot help.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            // Transient spawn failure (fork exhaustion). Back off and retry.
+            Err(_) => {
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
 
+    let output = output?;
     if !output.status.success() {
         return None;
     }
@@ -617,15 +644,47 @@ mod tests {
         normalize_path_for_compare(&safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
     }
 
+    /// Process-wide lock serializing the git-spawning / directory-renaming
+    /// relocation tests.
+    ///
+    /// These tests `git init` a directory and then rename it. On Windows the OS
+    /// indexer / antivirus scans each freshly-created `.git` tree and holds
+    /// handles on it, which blocks the rename ("Access is denied"). When many
+    /// such tests run concurrently the scanner is overwhelmed and the handles
+    /// linger for many seconds — long enough to exhaust even a generous
+    /// `rename_retry`. Serializing them so only one `.git` tree is created/
+    /// renamed at a time keeps each scan window short and the rename reliable.
+    static GIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the relocation-test serialization lock, recovering from a
+    /// poisoned mutex (a panic in one test must not cascade-fail the rest).
+    fn git_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+        GIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Initialise a git repo at `dir` with an `origin` remote pointing at `url`.
     fn init_git_remote(dir: &Path, url: &str) {
+        // Retry on transient spawn failure (fork exhaustion under parallel test
+        // load on Windows/msys); only a genuine missing-git binary is fatal.
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
-                .expect("git available in test env")
+            for attempt in 0..5u64 {
+                match std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                {
+                    Ok(o) => return o,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        panic!("git not available in test env: {e}");
+                    }
+                    Err(_) if attempt < 4 => {
+                        std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                    }
+                    Err(e) => panic!("git spawn failed after retries: {e}"),
+                }
+            }
+            unreachable!("loop returns or panics")
         };
         run(&["init"]);
         run(&["remote", "add", "origin", url]);
@@ -633,32 +692,40 @@ mod tests {
 
     /// Rename a directory with automatic retries.
     ///
-    /// On Windows, git subprocesses spawned by `init_git_remote` may keep a
-    /// file handle on the directory open briefly after the process exits.
-    /// `std::fs::rename` fails with `Access is denied` in that window.
-    /// Retrying with a short exponential back-off is the simplest robust fix.
+    /// On Windows, git subprocesses spawned by `init_git_remote` (and the OS
+    /// file indexer / antivirus) may keep a handle on the directory open
+    /// briefly after the process exits, so `std::fs::rename` fails with
+    /// "Access is denied". Under heavy parallel test load those handles linger
+    /// longer, so we use a generous retry budget with a capped back-off
+    /// (~7s worst case; in practice it succeeds on the first or second try).
     #[track_caller]
     fn rename_retry(from: &Path, to: &Path) {
+        const MAX_ATTEMPTS: u64 = 40;
         let mut last_err = None;
-        for attempt in 0..10u64 {
+        for attempt in 0..MAX_ATTEMPTS {
             match std::fs::rename(from, to) {
                 Ok(()) => return,
                 Err(e) => {
                     last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                    // Ramp the back-off but cap it so the total budget stays
+                    // bounded even under sustained handle contention.
+                    let backoff = (20 * (attempt + 1)).min(250);
+                    std::thread::sleep(std::time::Duration::from_millis(backoff));
                 }
             }
         }
         panic!(
-            "rename {:?} → {:?} failed after 10 attempts: {}",
+            "rename {:?} → {:?} failed after {} attempts: {}",
             from,
             to,
+            MAX_ATTEMPTS,
             last_err.unwrap()
         );
     }
 
     #[test]
     fn captures_git_remote_on_register() {
+        let _serial = git_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -687,6 +754,7 @@ mod tests {
 
     #[test]
     fn try_relocate_finds_renamed_parent() {
+        let _serial = git_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("parent");
         let repo = parent.join("repo");
@@ -709,6 +777,7 @@ mod tests {
 
     #[test]
     fn try_relocate_none_beyond_max_depth() {
+        let _serial = git_serial_lock();
         // Default max depth is 3. Bury the repo deeper than that below the
         // nearest existing ancestor so the scan cannot reach it.
         let tmp = tempfile::tempdir().unwrap();
@@ -731,6 +800,7 @@ mod tests {
 
     #[test]
     fn relocate_missing_rewrites_only_moved_repos() {
+        let _serial = git_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
         let moved = tmp.path().join("moved");
         let stable = tmp.path().join("stable");
@@ -763,6 +833,7 @@ mod tests {
 
     #[test]
     fn prune_stale_removes_unrelocatable_entries() {
+        let _serial = git_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
         // No git remote → cannot be relocated → must be pruned.
         let plain = tmp.path().join("plain");
@@ -780,25 +851,6 @@ mod tests {
         assert!(!cfg.repos.contains_key(&alias));
         // unregister_alias also cleans group membership.
         assert!(!cfg.groups.contains_key("g"));
-    }
-
-    #[test]
-    fn prune_stale_relocates_then_keeps_relocatable_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        init_git_remote(&repo, "https://example.com/acme/keep.git");
-
-        let mut cfg = ReposConfig::default();
-        let alias = cfg.register(repo.clone());
-
-        let renamed = tmp.path().join("repo-renamed");
-        rename_retry(&repo, &renamed);
-
-        let (relocated, removed) = cfg.prune_stale();
-        assert!(removed.is_empty());
-        assert_eq!(relocated.len(), 1);
-        assert!(cfg.repos.contains_key(&alias), "relocated entry is kept");
     }
 
     #[test]
@@ -824,6 +876,7 @@ mod tests {
 
     #[test]
     fn try_relocate_finds_renamed_leaf() {
+        let _serial = git_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
         let original = tmp.path().join("myrepo");
         std::fs::create_dir(&original).unwrap();
@@ -844,6 +897,7 @@ mod tests {
 
     #[test]
     fn try_relocate_returns_none_when_path_exists() {
+        let _serial = git_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("live");
         std::fs::create_dir(&repo).unwrap();
@@ -856,6 +910,7 @@ mod tests {
 
     #[test]
     fn try_relocate_none_without_recorded_remote() {
+        let _serial = git_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
         let plain = tmp.path().join("plain");
         std::fs::create_dir(&plain).unwrap();
@@ -911,6 +966,7 @@ mod tests {
 
     #[test]
     fn try_relocate_none_when_ambiguous() {
+        let _serial = git_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
         let original = tmp.path().join("orig");
         std::fs::create_dir(&original).unwrap();

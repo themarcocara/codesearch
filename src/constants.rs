@@ -98,6 +98,23 @@ pub fn get_global_cache_dir() -> PathBuf {
     cache_dir
 }
 
+/// Name of the global codesearchignore file in ~/.codesearch/
+pub const GLOBAL_CODESEARCHIGNORE_FILE: &str = ".codesearchignore";
+
+/// Get the path to the global .codesearchignore file (~/.codesearch/.codesearchignore).
+///
+/// This file uses the same gitignore syntax and is applied to all indexed repos,
+/// providing a way to set ignore rules without modifying repo-local files.
+/// Repo-local `.codesearchignore` and `.gitignore` take precedence.
+///
+/// Returns `None` only if the home directory cannot be determined.
+pub fn global_codesearchignore_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| {
+        home.join(CONFIG_DIR_NAME)
+            .join(GLOBAL_CODESEARCHIGNORE_FILE)
+    })
+}
+
 /// Name of the repos configuration file
 pub const REPOS_CONFIG_FILE: &str = "repos.json";
 
@@ -142,12 +159,44 @@ pub const DEFAULT_FSW_DEBOUNCE_MS: u64 = 2000;
 /// This prevents multiple processes from writing to the same database
 pub const WRITER_LOCK_FILE: &str = ".writer.lock";
 
+/// Default host for `codesearch serve` (MCP streamable HTTP mode).
+/// Override with `--host` or `CODESEARCH_SERVE_HOST`.
+/// Use `0.0.0.0` to bind on all interfaces (e.g. in Docker containers).
+pub const DEFAULT_SERVE_HOST: &str = "127.0.0.1";
+
+/// Environment variable to override the serve host.
+pub const SERVE_HOST_ENV: &str = "CODESEARCH_SERVE_HOST";
+
 /// Default port for `codesearch serve` (MCP streamable HTTP mode).
 /// Override with `--port` or `CODESEARCH_SERVE_PORT`.
 pub const DEFAULT_SERVE_PORT: u16 = 39725;
 
 /// Environment variable to override the serve port.
 pub const SERVE_PORT_ENV: &str = "CODESEARCH_SERVE_PORT";
+
+/// Resolve the effective serve host from env or default.
+/// Returns owned `String` because env vars are runtime values.
+/// Used by CLI delegation, MCP client, and serve startup to construct URLs.
+pub fn resolve_serve_host() -> String {
+    std::env::var(SERVE_HOST_ENV)
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string())
+}
+
+/// Environment variable to set the admin API key for management endpoints.
+/// When set, all management routes (`POST /repos`, `DELETE /repos/:alias`,
+/// `POST /repos/:alias/reindex`, `POST /reload`) require this key.
+/// When unset or empty, management routes are unauthenticated (backward compatible).
+/// The key is validated against `Authorization: Bearer <key>` or `X-API-Key: <key>` headers.
+pub const SERVE_API_KEY_ENV: &str = "CODESEARCH_SERVE_API_KEY";
+
+/// Environment variable to restrict which filesystem roots can be indexed.
+/// Semicolon-separated list of canonical directory paths. When set, `POST /repos`
+/// and `--register` paths must reside under one of the listed roots.
+/// When unset or empty, all paths are allowed (backward compatible).
+/// Example: `CODESEARCH_ALLOWED_ROOTS=/home/user/repos;/opt/code`
+pub const ALLOWED_ROOTS_ENV: &str = "CODESEARCH_ALLOWED_ROOTS";
 
 /// Default base URL for connecting to a local `codesearch serve` instance.
 /// Used as the clap `--url` default and in `serve_base_url()`.
@@ -386,6 +435,23 @@ mod tests {
             DEFAULT_SERVE_URL.contains(&port_str),
             "DEFAULT_SERVE_URL ({DEFAULT_SERVE_URL}) does not contain DEFAULT_SERVE_PORT ({DEFAULT_SERVE_PORT}). \
              Update DEFAULT_SERVE_URL to match.",
+        );
+    }
+
+    #[test]
+    fn global_codesearchignore_path_returns_home_codesearch_dir() {
+        let path = global_codesearchignore_path();
+        assert!(path.is_some(), "Should return Some when home dir exists");
+        let path = path.unwrap();
+        assert!(
+            path.to_string_lossy().contains(".codesearch"),
+            "Path should contain .codesearch directory: {:?}",
+            path
+        );
+        assert_eq!(
+            path.file_name().unwrap(),
+            GLOBAL_CODESEARCHIGNORE_FILE,
+            "Filename should match GLOBAL_CODESEARCHIGNORE_FILE constant"
         );
     }
 }

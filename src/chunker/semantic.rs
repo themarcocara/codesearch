@@ -48,6 +48,13 @@ impl SemanticChunker {
             return self.chunk_markdown(path, content);
         }
 
+        // Jupyter notebooks are chunked by extracting cells from the JSON
+        // structure (no tree-sitter grammar for .ipynb).
+        if language == Language::Jupyter {
+            let chunks = super::jupyter::chunk_jupyter(path, content);
+            return Ok(chunks);
+        }
+
         // 1. Check if we have an extractor for this language
         let extractor = match get_extractor(language) {
             Some(ext) => ext,
@@ -182,47 +189,59 @@ impl SemanticChunker {
         Ok(final_chunks)
     }
 
-    /// Emit a chunk for one `section` node (heading + direct content), then recurse
+    /// Emit a chunk for one `section` node (heading + direct content), then iterate
     /// into nested subsections with an extended breadcrumb.
+    ///
+    /// Uses an explicit stack to avoid deep recursion on pathological Markdown files.
     fn emit_md_section(
         &self,
-        section: Node,
+        root_section: Node,
         source: &[u8],
         path_str: &str,
-        context_stack: &[String],
+        root_context: &[String],
         chunks: &mut Vec<Chunk>,
     ) {
-        let mut cursor = section.walk();
-        let children: Vec<Node> = section.named_children(&mut cursor).collect();
+        let mut stack: Vec<(Node, Vec<String>)> = vec![(root_section, root_context.to_vec())];
 
-        // Heading text (if the section opens with one) extends the breadcrumb.
-        let heading_text = children
-            .first()
-            .filter(|c| Self::md_is_heading(c.kind()))
-            .map(|h| Self::md_heading_text(*h, source))
-            .unwrap_or_default();
+        while let Some((section, context_stack)) = stack.pop() {
+            let mut cursor = section.walk();
+            let children: Vec<Node> = section.named_children(&mut cursor).collect();
 
-        let mut new_context = context_stack.to_vec();
-        if !heading_text.is_empty() {
-            new_context.push(heading_text);
-        }
+            // Heading text (if the section opens with one) extends the breadcrumb.
+            let heading_text = children
+                .first()
+                .filter(|c| Self::md_is_heading(c.kind()))
+                .map(|h| Self::md_heading_text(*h, source))
+                .unwrap_or_default();
 
-        // Direct content = section start .. first nested subsection (exclusive).
-        let first_sub = children.iter().find(|c| c.kind() == "section");
-        let end_byte = first_sub.map_or_else(|| section.end_byte(), |s| s.start_byte());
-        if let Some(chunk) = Self::md_chunk(
-            source,
-            section.start_byte(),
-            end_byte,
-            section.start_position().row,
-            &new_context,
-            path_str,
-        ) {
-            chunks.push(chunk);
-        }
+            let mut new_context = context_stack;
+            if !heading_text.is_empty() {
+                new_context.push(heading_text);
+            }
 
-        for child in children.iter().filter(|c| c.kind() == "section") {
-            self.emit_md_section(*child, source, path_str, &new_context, chunks);
+            // Direct content = section start .. first nested subsection (exclusive).
+            let first_sub = children.iter().find(|c| c.kind() == "section");
+            let end_byte = first_sub.map_or_else(|| section.end_byte(), |s| s.start_byte());
+            if let Some(chunk) = Self::md_chunk(
+                source,
+                section.start_byte(),
+                end_byte,
+                section.start_position().row,
+                &new_context,
+                path_str,
+            ) {
+                chunks.push(chunk);
+            }
+
+            // Push child sections in reverse so leftmost is processed first
+            let sub_sections: Vec<Node> = children
+                .iter()
+                .filter(|c| c.kind() == "section")
+                .copied()
+                .collect();
+            for child in sub_sections.into_iter().rev() {
+                stack.push((child, new_context.clone()));
+            }
         }
     }
 
@@ -309,110 +328,122 @@ impl SemanticChunker {
         }
     }
 
-    /// Recursively visit AST nodes and extract chunks
+    /// Iterative DFS visit of AST nodes to extract chunks.
+    ///
+    /// Uses an explicit `Vec` stack instead of recursion to avoid stack overflow
+    /// on pathological tree-sitter ASTs. The C++ grammar, for example, represents
+    /// gperf-generated `NameAndGlyph wordlist[N]` as a chain of `comma_expression`
+    /// nodes with depth = N, producing AST depths of 15 000+ on real-world files.
     fn visit_node(
         &self,
-        node: Node,
+        root: Node,
         source: &[u8],
         extractor: &dyn LanguageExtractor,
-        context_stack: &[String],
+        root_context: &[String],
         chunks: &mut Vec<Chunk>,
         gap_tracker: &mut GapTracker,
     ) {
-        // Check if this node is a definition
-        let is_definition = extractor.definition_types().contains(&node.kind());
+        // Each stack entry carries the node and the context breadcrumb to use for
+        // that subtree.  The Vec is owned so the stack never borrows into itself.
+        let mut stack: Vec<(Node, Vec<String>)> = vec![(root, root_context.to_vec())];
 
-        if is_definition {
-            // Mark this range as covered (not a gap)
-            gap_tracker.mark_covered(node.start_position().row, node.end_position().row);
+        while let Some((node, context_stack)) = stack.pop() {
+            let is_definition = extractor.definition_types().contains(&node.kind());
 
-            // Also mark preceding doc comments and attributes as covered
-            // (they belong to this definition, not to a gap)
-            let mut prev = node.prev_named_sibling();
-            while let Some(sibling) = prev {
-                let sib_kind = sibling.kind();
-                if sib_kind == "line_comment"
-                    || sib_kind == "block_comment"
-                    || sib_kind == "attribute_item"
-                    || sib_kind == "attribute"
-                    || sib_kind == "decorator"
-                {
-                    if let Ok(text) = sibling.utf8_text(source) {
-                        let text = text.trim();
-                        // Only mark doc comments (///, //!, /**, /*!), attributes (#[...]),
-                        // and decorators (@...) as covered — not regular comments
-                        if text.starts_with("///")
-                            || text.starts_with("//!")
-                            || text.starts_with("/**")
-                            || text.starts_with("/*!")
-                            || text.starts_with("#[")
-                            || text.starts_with("@")
-                        {
-                            gap_tracker.mark_covered(
-                                sibling.start_position().row,
-                                sibling.end_position().row,
-                            );
-                            prev = sibling.prev_named_sibling();
-                            continue;
+            if is_definition {
+                // Mark this range as covered (not a gap)
+                gap_tracker.mark_covered(node.start_position().row, node.end_position().row);
+
+                // Also mark preceding doc comments and attributes as covered
+                // (they belong to this definition, not to a gap)
+                let mut prev = node.prev_named_sibling();
+                while let Some(sibling) = prev {
+                    let sib_kind = sibling.kind();
+                    if sib_kind == "line_comment"
+                        || sib_kind == "block_comment"
+                        || sib_kind == "attribute_item"
+                        || sib_kind == "attribute"
+                        || sib_kind == "decorator"
+                    {
+                        if let Ok(text) = sibling.utf8_text(source) {
+                            let text = text.trim();
+                            // Only mark doc comments (///, //!, /**, /*!), attributes (#[...]),
+                            // and decorators (@...) as covered — not regular comments
+                            if text.starts_with("///")
+                                || text.starts_with("//!")
+                                || text.starts_with("/**")
+                                || text.starts_with("/*!")
+                                || text.starts_with("#[")
+                                || text.starts_with("@")
+                            {
+                                gap_tracker.mark_covered(
+                                    sibling.start_position().row,
+                                    sibling.end_position().row,
+                                );
+                                prev = sibling.prev_named_sibling();
+                                continue;
+                            }
                         }
+                        break;
                     }
                     break;
                 }
-                break;
-            }
 
-            // Extract metadata using the language extractor
-            let kind = extractor.classify(node);
-            let name = extractor.extract_name(node, source);
-            let signature = extractor.extract_signature(node, source);
-            let docstring = extractor.extract_docstring(node, source);
+                // Extract metadata using the language extractor
+                let kind = extractor.classify(node);
+                let name = extractor.extract_name(node, source);
+                let signature = extractor.extract_signature(node, source);
+                let docstring = extractor.extract_docstring(node, source);
 
-            // Build label for context breadcrumb
-            let label = extractor
-                .build_label(node, source)
-                .or_else(|| name.as_ref().map(|n| format!("{:?}: {}", kind, n)))
-                .unwrap_or_else(|| format!("{:?}", kind));
+                // Build label for context breadcrumb
+                let label = extractor
+                    .build_label(node, source)
+                    .or_else(|| name.as_ref().map(|n| format!("{:?}: {}", kind, n)))
+                    .unwrap_or_else(|| format!("{:?}", kind));
 
-            // Build new context stack
-            let mut new_context = context_stack.to_vec();
-            new_context.push(label);
+                // Build new context stack
+                let mut new_context = context_stack;
+                new_context.push(label);
 
-            // Extract content (without docstring if we have it separate)
-            let content = match node.utf8_text(source) {
-                Ok(text) => text.to_string(),
-                Err(_) => return, // Skip if we can't extract text
-            };
+                // Extract content (without docstring if we have it separate)
+                let content = match node.utf8_text(source) {
+                    Ok(text) => text.to_string(),
+                    Err(_) => continue, // Skip if we can't extract text
+                };
 
-            // Create chunk
-            let path_str = context_stack
-                .first()
-                .map(|s| s.strip_prefix("File: ").unwrap_or(s))
-                .unwrap_or("")
-                .to_string();
+                // Create chunk
+                let path_str = new_context
+                    .first()
+                    .map(|s| s.strip_prefix("File: ").unwrap_or(s))
+                    .unwrap_or("")
+                    .to_string();
 
-            let mut chunk = Chunk::new(
-                content,
-                node.start_position().row,
-                node.end_position().row + 1, // tree-sitter uses 0-based, we use line count
-                kind,
-                path_str,
-            );
-            chunk.context = new_context.clone();
-            chunk.signature = signature;
-            chunk.docstring = docstring;
+                let mut chunk = Chunk::new(
+                    content,
+                    node.start_position().row,
+                    node.end_position().row + 1, // tree-sitter uses 0-based, we use line count
+                    kind,
+                    path_str,
+                );
+                chunk.context = new_context.clone();
+                chunk.signature = signature;
+                chunk.docstring = docstring;
 
-            chunks.push(chunk);
+                chunks.push(chunk);
 
-            // Visit children with updated context
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                self.visit_node(child, source, extractor, &new_context, chunks, gap_tracker);
-            }
-        } else {
-            // Not a definition, just visit children with same context
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                self.visit_node(child, source, extractor, context_stack, chunks, gap_tracker);
+                // Push children in reverse order so leftmost is processed first
+                let mut cursor = node.walk();
+                let children: Vec<Node> = node.named_children(&mut cursor).collect();
+                for child in children.into_iter().rev() {
+                    stack.push((child, new_context.clone()));
+                }
+            } else {
+                // Not a definition — visit children with the same context
+                let mut cursor = node.walk();
+                let children: Vec<Node> = node.named_children(&mut cursor).collect();
+                for child in children.into_iter().rev() {
+                    stack.push((child, context_stack.clone()));
+                }
             }
         }
     }
@@ -985,6 +1016,58 @@ class Calculator:
     }
 
     #[test]
+    fn test_dart_semantic_chunking() {
+        let mut chunker = SemanticChunker::new(100, 2000, 10);
+        let content = r#"
+int topLevel() => 1;
+
+class Greeter {
+  String greet() => "hi";
+}
+
+mixin Walker {
+  void walk() {}
+}
+"#;
+        let chunks = chunker
+            .chunk_semantic(Language::Dart, Path::new("a.dart"), content)
+            .unwrap();
+        assert!(!chunks.is_empty());
+
+        // A chunk with the given text and exact kind must exist. (We use `any`
+        // rather than `find` because the enclosing class/mixin chunk also
+        // contains its members' text — we want the member-level chunk.)
+        let has_kind = |needle: &str, kind: ChunkKind| {
+            chunks
+                .iter()
+                .any(|c| c.content.contains(needle) && c.kind == kind)
+        };
+        // Top-level function → Function; class & mixin members → Method.
+        assert!(has_kind("int topLevel", ChunkKind::Function));
+        assert!(has_kind("String greet", ChunkKind::Method));
+        // Regression for the mixin_application misclassification: mixin members
+        // must be Method (their parent is class_body, not mixin_application).
+        assert!(has_kind("void walk", ChunkKind::Method));
+    }
+
+    #[test]
+    fn test_dart_unparseable_still_chunks() {
+        // A .dart file that is not valid Dart must still yield fallback chunks
+        // rather than producing nothing (grammar-failure resilience).
+        let mut chunker = SemanticChunker::new(100, 2000, 10);
+        let content = "@@@ not valid dart @@@\n{{{ ][ )(\nlorem ipsum dolor sit amet\n";
+        let chunks = chunker
+            .chunk_semantic(Language::Dart, Path::new("broken.dart"), content)
+            .unwrap();
+        assert!(
+            !chunks.is_empty(),
+            "unparseable Dart should still produce fallback chunks"
+        );
+        let joined: String = chunks.iter().map(|c| c.content.clone()).collect();
+        assert!(joined.contains("lorem ipsum"));
+    }
+
+    #[test]
     fn test_gap_tracking() {
         let content = "line 0\nline 1\nline 2\nline 3\nline 4";
         let mut tracker = GapTracker::new(content);
@@ -1038,6 +1121,83 @@ class Calculator:
     }
 
     #[test]
+    fn test_chunk_bash_script_fallback() {
+        // Shell has a tree-sitter grammar but no BashExtractor,
+        // so it falls back to fallback_chunk (sliding window).
+        // This test verifies bash files are still indexed with usable chunks.
+        let mut chunker = SemanticChunker::new(100, 2000, 10);
+
+        let bash_script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+# Deploy script for the application
+DEPLOY_DIR="/opt/app"
+VERSION=""
+
+deploy_application() {
+    echo "Deploying version $VERSION to $DEPLOY_DIR"
+    mkdir -p "$DEPLOY_DIR"
+    cp -r ./dist/* "$DEPLOY_DIR/"
+    systemctl restart app
+}
+
+rollback() {
+    echo "Rolling back to previous version"
+    cp -r ./backup/* "$DEPLOY_DIR/"
+    systemctl restart app
+}
+
+main() {
+    VERSION="$1"
+    deploy_application
+    echo "Deployment complete"
+}
+
+main "$@"
+"#;
+
+        let path = Path::new("deploy.sh");
+
+        // Verify language detection
+        assert_eq!(
+            crate::file::Language::from_path(path),
+            crate::file::Language::Shell,
+            ".sh files should be detected as Shell language"
+        );
+
+        let chunks = chunker
+            .chunk_semantic(crate::file::Language::Shell, path, bash_script)
+            .unwrap();
+
+        // Should produce chunks (via fallback)
+        assert!(
+            !chunks.is_empty(),
+            "Shell files should produce chunks via fallback, got 0"
+        );
+
+        // All chunks should be Block kind (fallback chunking)
+        assert!(
+            chunks.iter().all(|c| c.kind == ChunkKind::Block),
+            "Fallback chunks should all be Block kind"
+        );
+
+        // Chunks should cover the bash content
+        let all_content: String = chunks.iter().map(|c| c.content.as_str()).collect();
+        assert!(
+            all_content.contains("deploy_application"),
+            "Chunks should contain deploy_application function"
+        );
+        assert!(
+            all_content.contains("rollback"),
+            "Chunks should contain rollback function"
+        );
+        assert!(
+            all_content.contains("main"),
+            "Chunks should contain main function"
+        );
+    }
+
+    #[test]
     fn test_context_breadcrumbs() {
         let mut chunker = SemanticChunker::new(100, 2000, 10);
 
@@ -1062,5 +1222,54 @@ impl MyStruct {
             assert!(chunk.context.len() >= 2, "Should have nested context");
             assert!(chunk.context[0].contains("File:"));
         }
+    }
+
+    /// Build source whose tree-sitter AST is `depth` levels deep, using nested
+    /// parenthesized expressions (`((( ... 0 ... )))`). Each pair of parens adds
+    /// one AST level, so this deterministically produces a very deep tree
+    /// regardless of grammar-specific list/comma representations.
+    fn deeply_nested_rust_source(depth: usize) -> String {
+        let mut src = String::with_capacity(depth * 2 + 32);
+        src.push_str("fn deep() -> i32 {\n    ");
+        for _ in 0..depth {
+            src.push('(');
+        }
+        src.push('0');
+        for _ in 0..depth {
+            src.push(')');
+        }
+        src.push_str("\n}\n");
+        src
+    }
+
+    /// Regression test for #112: indexing a file with a pathologically deep AST
+    /// (the original report was a ClickHouse gperf table ~17.7k nodes deep) used
+    /// to overflow the stack in the recursive `visit_node`. The traversal is now
+    /// iterative (heap-allocated stack), so it must complete even on a tiny
+    /// thread stack. We run it on a 1 MiB stack with a 50k-deep AST: the
+    /// iterative walk lives on the heap and succeeds, while any reintroduction of
+    /// recursion would blow this stack and fail the test deterministically.
+    #[test]
+    fn test_deeply_nested_ast_does_not_overflow() {
+        let src = deeply_nested_rust_source(50_000);
+
+        let handle = std::thread::Builder::new()
+            .stack_size(1024 * 1024) // 1 MiB — far too small for 50k recursive frames
+            .spawn(move || {
+                let mut chunker = SemanticChunker::new(100, 2000, 10);
+                let path = Path::new("deep.rs");
+                chunker
+                    .chunk_semantic(Language::Rust, path, &src)
+                    .map(|chunks| chunks.len())
+            })
+            .expect("spawn chunker thread");
+
+        let result = handle
+            .join()
+            .expect("chunker thread must not overflow the stack on a deep AST");
+        assert!(
+            result.is_ok(),
+            "deep-AST semantic chunking should succeed, got {result:?}"
+        );
     }
 }

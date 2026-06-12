@@ -38,17 +38,60 @@ fn read_persisted_map_size(db_path: &Path) -> usize {
     crate::constants::DEFAULT_LMDB_MAP_SIZE_MB
 }
 
-/// Resolve the effective LMDB map size using the max of persisted, env-var, and default.
-/// This ensures consistency across multiple repo opens in the same process.
+/// Process-global pin of the LMDB map size chosen for each canonical DB path.
+///
+/// heed keeps its OWN process-global registry of opened environments and
+/// rejects a reopen whose recorded `map_size` differs from a still-live env
+/// for that path ("an environment is already opened with different options").
+/// Because heed's env close is *deferred*, a reopen (e.g. the idle reaper
+/// dropping a repo while a force-reindex reopens it) can briefly observe the
+/// prior env. If the two opens disagree on `map_size` — which happens when a
+/// runtime resize grew the map but the persisted/default lookup returns a
+/// different value — heed raises that error and the open fails with a 500.
+///
+/// To make opens deterministic regardless of metadata-persistence state or
+/// runtime resizes, the first resolved size for a path is pinned here and all
+/// subsequent opens reuse it (monotonically non-decreasing, capped at MAX).
+static MAP_SIZE_PINS: std::sync::OnceLock<dashmap::DashMap<std::path::PathBuf, usize>> =
+    std::sync::OnceLock::new();
+
+fn map_size_pins() -> &'static dashmap::DashMap<std::path::PathBuf, usize> {
+    MAP_SIZE_PINS.get_or_init(dashmap::DashMap::new)
+}
+
+/// Stable per-path key for the map-size pin. Uses the canonical path so every
+/// spelling of the same physical directory maps to one pin; falls back to the
+/// lexical path when the directory cannot be canonicalized yet (still stable
+/// for repeated opens of the same alias).
+fn map_size_pin_key(db_path: &Path) -> std::path::PathBuf {
+    crate::cache::safe_canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf())
+}
+
+/// Pin (or raise) the process map size for `db_path` and return the effective
+/// value. Monotonically non-decreasing and capped at `MAX_LMDB_MAP_SIZE_MB`.
+fn pin_map_size(db_path: &Path, candidate: usize) -> usize {
+    let candidate = candidate.min(MAX_LMDB_MAP_SIZE_MB);
+    let pins = map_size_pins();
+    let mut entry = pins.entry(map_size_pin_key(db_path)).or_insert(candidate);
+    if candidate > *entry {
+        *entry = candidate;
+    }
+    *entry
+}
+
+/// Resolve the effective LMDB map size using the max of persisted, env-var, and
+/// default — then pin it per-path for the process lifetime so every open of the
+/// same path uses a consistent size (see [`MAP_SIZE_PINS`]).
 fn resolve_map_size(db_path: &Path) -> usize {
     let persisted = read_persisted_map_size(db_path);
     let from_env = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
-    from_env
+    let candidate = from_env
         .unwrap_or(persisted)
         .max(persisted)
-        .max(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB)
+        .max(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
+    pin_map_size(db_path, candidate)
 }
 
 /// Read a metadata field from metadata.json.
@@ -60,22 +103,86 @@ fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
     json.get(key).and_then(|v| v.as_u64()).map(|v| v as u32)
 }
 
-/// Write a metadata field into metadata.json (creates/updates key in existing JSON).
-fn write_metadata_u32(db_path: &Path, key: &str, value: u32) -> Result<()> {
+/// Atomically write a JSON file using temp+rename pattern.
+/// Writes to a per-process-unique temp file in the same directory, fsyncs it,
+/// then renames to `<path>`. The unique temp name (pid + monotonic counter)
+/// ensures two concurrent writers don't clobber a shared temp file. The temp
+/// file is flushed to disk with `sync_all` BEFORE the rename, so a power-loss
+/// cannot leave a zero-length or garbage file in place of the old metadata;
+/// combined with `rename` being atomic on the same filesystem, a reader always
+/// observes either the complete old or the complete new content.
+/// On failure the temp file is best-effort removed.
+fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_name = format!("metadata.json.{}.{}.tmp", std::process::id(), seq);
+    let tmp_path = match path.parent() {
+        Some(dir) => dir.join(tmp_name),
+        None => path.with_extension("json.tmp"),
+    };
+    let data = serde_json::to_string_pretty(json)?;
+
+    // Write + fsync the temp file before the atomic rename.
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(data.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Read-modify-write metadata.json, crash-atomically.
+/// Reads existing metadata (or starts with empty object), applies `merge_fn`,
+/// then writes via temp+rename so a crash mid-write never leaves a partial file.
+///
+/// NOTE: This protects against torn writes (crash atomicity), not against lost
+/// updates between concurrent writers — the read→mutate→write sequence is not
+/// guarded by a lock. Callers must serialize writes to the same `db_path`
+/// (today they are, via the per-repo vector_store lock). If parallel per-repo
+/// rebuilds are ever introduced, add an explicit per-repo write mutex here.
+pub fn merge_metadata_atomic(
+    db_path: &Path,
+    merge_fn: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<()> {
     let metadata_path = db_path.join("metadata.json");
+
+    // Read existing metadata or start fresh
     let mut json: serde_json::Value = if metadata_path.exists() {
         let content = fs::read_to_string(&metadata_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::Value::Object(Default::default()))
+        serde_json::from_str(&content)
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()))
     } else {
         serde_json::Value::Object(Default::default())
     };
 
+    // Apply merge
     if let Some(obj) = json.as_object_mut() {
-        obj.insert(key.to_string(), serde_json::Value::Number(value.into()));
+        merge_fn(obj);
     }
 
-    fs::write(&metadata_path, serde_json::to_string_pretty(&json)?)?;
+    // Write atomically
+    atomic_write_json(&metadata_path, &json)?;
     Ok(())
+}
+
+/// Write a metadata field into metadata.json (atomic read-modify-write).
+fn write_metadata_u32(db_path: &Path, key: &str, value: u32) -> Result<()> {
+    let key = key.to_string();
+    merge_metadata_atomic(db_path, move |obj| {
+        obj.insert(key, serde_json::Value::Number(value.into()));
+    })
 }
 
 /// Ensure the database schema version matches the current version.
@@ -137,27 +244,14 @@ fn ensure_schema_version(db_path: &Path) -> Result<()> {
     }
 }
 
-/// Persist the current LMDB map size into metadata.json so that subsequent
-/// opens in the same process use the same value (avoids "already opened with
-/// different options" errors from LMDB when multiple repos have been resized).
+/// Persist the current LMDB map size into metadata.json (atomic read-modify-write).
 fn persist_map_size(db_path: &Path, map_size_mb: usize) -> Result<()> {
-    let metadata_path = db_path.join("metadata.json");
-    let mut json: serde_json::Value = if metadata_path.exists() {
-        let content = fs::read_to_string(&metadata_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::Value::Object(Default::default()))
-    } else {
-        serde_json::Value::Object(Default::default())
-    };
-
-    if let Some(obj) = json.as_object_mut() {
+    merge_metadata_atomic(db_path, |obj| {
         obj.insert(
             "lmdb_map_size_mb".to_string(),
             serde_json::Value::Number(map_size_mb.into()),
         );
-    }
-
-    fs::write(&metadata_path, serde_json::to_string_pretty(&json)?)?;
-    Ok(())
+    })
 }
 
 /// Chunk metadata stored in the database
@@ -467,6 +561,12 @@ impl VectorStore {
         }
 
         self.map_size_mb = new_size_mb;
+
+        // Raise the process-global per-path pin so any later reopen of this path
+        // (e.g. after idle eviction) resolves to the grown size and matches the
+        // still-live heed env, instead of racing into "an environment is already
+        // opened with different options".
+        pin_map_size(self.env.path(), new_size_mb);
 
         // Persist the new map size so subsequent opens in the same process
         // use the same value (avoids "already opened with different options").
@@ -1085,6 +1185,45 @@ mod tests {
         let store = store.unwrap();
         assert_eq!(store.dimensions, 384);
         assert!(!store.is_indexed());
+    }
+
+    /// Once a path's map size is pinned, later resolutions for the same path
+    /// return the SAME value even if metadata.json later advertises a smaller
+    /// size — so reopens never request a size that mismatches a still-live heed
+    /// env. This is the core invariant preventing the "already opened with
+    /// different options" 500.
+    #[test]
+    fn pinned_map_size_is_stable_and_monotonic_per_path() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("pinned.db");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        // First resolve pins the default (no metadata yet).
+        let first = resolve_map_size(&db_path);
+        assert_eq!(first, crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
+
+        // A runtime resize raises the pin; subsequent resolves must reflect it.
+        let grown = crate::constants::DEFAULT_LMDB_MAP_SIZE_MB + 256;
+        pin_map_size(&db_path, grown);
+        assert_eq!(resolve_map_size(&db_path), grown);
+
+        // Writing a SMALLER persisted size must NOT shrink the live pin
+        // (a smaller request against a live larger env is exactly what heed
+        // rejects), proving the pin is monotonic.
+        persist_map_size(&db_path, crate::constants::DEFAULT_LMDB_MAP_SIZE_MB).unwrap();
+        assert_eq!(resolve_map_size(&db_path), grown);
+    }
+
+    /// The pin is capped at MAX_LMDB_MAP_SIZE_MB so a hand-edited metadata.json
+    /// (or env var) cannot push the map size past the supported ceiling.
+    #[test]
+    fn pinned_map_size_is_capped_at_max() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("capped.db");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        let pinned = pin_map_size(&db_path, MAX_LMDB_MAP_SIZE_MB + 4096);
+        assert_eq!(pinned, MAX_LMDB_MAP_SIZE_MB);
     }
 
     #[test]

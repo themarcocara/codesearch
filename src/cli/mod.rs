@@ -20,6 +20,10 @@ pub enum IndexCommands {
         /// Create global index instead of local
         #[arg(short = 'g', long)]
         global: bool,
+
+        /// Embedding model (overrides global --model for this repo)
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Remove the index (local or global, auto-detected)
@@ -91,6 +95,17 @@ pub enum GroupsCommands {
     Remove {
         /// Group name
         name: String,
+    },
+}
+
+/// Hook subcommands
+#[derive(Subcommand, Debug)]
+pub enum HookCommands {
+    /// Install a post-checkout hook that auto-registers new git worktrees with codesearch serve
+    Install {
+        /// Path to the git repository (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -253,6 +268,10 @@ pub enum Commands {
         #[arg(default_value = "start")]
         action: ServeAction,
 
+        /// Host to bind to (default: 127.0.0.1, override with CODESEARCH_SERVE_HOST; use 0.0.0.0 for containers)
+        #[arg(long)]
+        host: Option<String>,
+
         /// Port to listen on (default: 39725, override with CODESEARCH_SERVE_PORT)
         #[arg(short, long)]
         port: Option<u16>,
@@ -371,6 +390,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: CacheCommands,
     },
+
+    /// Install git hooks for automatic codesearch integration
+    Hook {
+        #[command(subcommand)]
+        command: HookCommands,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -378,14 +403,15 @@ pub enum Commands {
 // ---------------------------------------------------------------------------
 
 /// Base URL for the codesearch serve instance.
-/// Override via `CODESEARCH_SERVE_PORT` env var (see `constants::SERVE_PORT_ENV`).
+/// Override via `CODESEARCH_SERVE_HOST` and `CODESEARCH_SERVE_PORT` env vars.
 fn serve_base_url() -> String {
-    use crate::constants::DEFAULT_SERVE_PORT;
+    use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT};
+    let host = resolve_serve_host();
     let port = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(DEFAULT_SERVE_PORT);
-    format!("http://127.0.0.1:{port}")
+    format!("http://{host}:{port}")
 }
 
 /// Trigger a symbol reindex by calling the running serve instance's HTTP API.
@@ -537,7 +563,22 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     IndexCommands::Add {
                         path: add_path,
                         global,
-                    } => crate::index::add_to_index(add_path, global, cancel_token.clone()).await,
+                        model,
+                    } => {
+                        let mt = model
+                            .as_deref()
+                            .and_then(|m| {
+                                let parsed = ModelType::parse(m);
+                                if parsed.is_none() {
+                                    eprintln!("Unknown model: '{}'. Available models:", m);
+                                    eprintln!("  {}", ModelType::valid_short_names());
+                                    std::process::exit(1);
+                                }
+                                parsed
+                            })
+                            .or(model_type);
+                        crate::index::add_to_index(add_path, global, mt, cancel_token.clone()).await
+                    }
                     IndexCommands::Remove {
                         path: rm_path,
                         keep_config,
@@ -560,7 +601,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
                 if add || is_add_cmd {
                     let effective_path = if is_add_cmd { None } else { path };
-                    crate::index::add_to_index(effective_path, global, cancel_token.clone()).await
+                    crate::index::add_to_index(
+                        effective_path,
+                        global,
+                        model_type,
+                        cancel_token.clone(),
+                    )
+                    .await
                 } else if remove || is_rm_cmd {
                     let effective_path = if is_rm_cmd { None } else { path };
                     crate::index::remove_from_index(effective_path, keep_config).await
@@ -601,6 +648,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Serve {
             action,
+            host,
             port,
             register,
             quiet,
@@ -620,7 +668,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
                         eprintln!("Warning: failed to initialize serve logger: {}", e);
                     }
-                    crate::serve::run_serve(port, register, no_tui, cancel_token.clone()).await
+                    crate::serve::run_serve(host, port, register, no_tui, cancel_token.clone())
+                        .await
                 }
             }
         }
@@ -650,6 +699,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
         },
         Commands::Groups { command } => run_groups_command(command).await,
+        Commands::Hook { command } => match command {
+            HookCommands::Install { path } => run_hook_install(path).await,
+        },
     }
 }
 
@@ -858,8 +910,106 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
     Ok(())
 }
 
-mod doctor;
-mod setup;
+/// Install the post-checkout git hook for codesearch worktree auto-indexing.
+async fn run_hook_install(path: Option<PathBuf>) -> Result<()> {
+    use colored::Colorize;
+
+    let repo_path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let dot_git = repo_path.join(".git");
+
+    // Resolve the actual .git directory (handle worktrees where .git is a file)
+    let git_dir = if dot_git.is_file() {
+        // Worktree: read "gitdir: <path>" from .git file
+        let content = std::fs::read_to_string(&dot_git)?;
+        let first_line = content.lines().next().unwrap_or("");
+        if let Some(rel) = first_line.strip_prefix("gitdir: ") {
+            let resolved = repo_path.join(rel.trim());
+            if resolved.exists() {
+                resolved
+            } else {
+                anyhow::bail!("Could not resolve git dir from worktree .git file");
+            }
+        } else {
+            anyhow::bail!("Unexpected .git file format (expected 'gitdir: ...')");
+        }
+    } else if dot_git.is_dir() {
+        dot_git
+    } else {
+        anyhow::bail!("Not a git repository: {}", repo_path.display());
+    };
+
+    let hooks_dir = git_dir.join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    let hook_path = hooks_dir.join("post-checkout");
+
+    if hook_path.exists() {
+        // Check if it's already our hook
+        let existing = std::fs::read_to_string(&hook_path)?;
+        if existing.contains("codesearch post-checkout hook") {
+            eprintln!(
+                "{}",
+                "✓ codesearch post-checkout hook already installed.".green()
+            );
+            return Ok(());
+        }
+        anyhow::bail!(
+            "A post-checkout hook already exists at {}.\nRemove it first or merge manually.",
+            hook_path.display()
+        );
+    }
+
+    // Hook script: bash (works in Git Bash on Windows too)
+    let hook_script = r#"#!/bin/bash
+# codesearch post-checkout hook
+# Auto-registers new worktrees with codesearch serve.
+# Installed by: codesearch hook install
+# $1 = prev_ref, $2 = new_ref, $3 = flag (1=branch checkout)
+
+SERVE_URL_FILE="$HOME/.codesearch/serve_url"
+if [ -f "$SERVE_URL_FILE" ]; then
+    SERVE_URL=$(cat "$SERVE_URL_FILE")
+    if [ -n "$SERVE_URL" ]; then
+        # JSON-escape the repo path before embedding it in the request body.
+        # A path containing a double quote or backslash would otherwise break
+        # out of the JSON string literal (malformed body / injection). Use
+        # quoted variables as the search/replace operands so the patterns match
+        # LITERALLY — bare backslash patterns (${v//\\/..}) are unreliable across
+        # bash/msys builds. Escape backslashes first, then double quotes.
+        REPO_PATH="$(pwd)"
+        BS='\'
+        DQ='"'
+        REPO_PATH=${REPO_PATH//"$BS"/"$BS$BS"}
+        REPO_PATH=${REPO_PATH//"$DQ"/"$BS$DQ"}
+        curl -s -X POST "$SERVE_URL/repos" \
+            -H "Content-Type: application/json" \
+            -d "{\"path\":\"$REPO_PATH\"}" &>/dev/null &
+    fi
+fi
+"#;
+
+    std::fs::write(&hook_path, hook_script)?;
+
+    // Make executable (on Unix; on Windows Git Bash this is a no-op but harmless)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
+
+    eprintln!(
+        "{}",
+        format!("✓ Installed post-checkout hook at {}", hook_path.display()).green()
+    );
+    eprintln!("  New worktrees will be auto-registered with codesearch serve.");
+
+    Ok(())
+}
+
+pub mod doctor;
+pub mod setup;
 
 #[cfg(test)]
 mod tests {

@@ -15,7 +15,7 @@ codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) d
 - **Multi-repo serve mode**: Fan-out queries across repository groups with cross-repo RRF ranking
 - **Hybrid retrieval**: Vector embeddings + BM25 full-text search fused with Reciprocal Rank Fusion
 - **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents — in the same tool
-- **AST-aware chunking**: Tree-sitter parsing for 15 languages — chunks align to functions/classes (and Markdown sections), not arbitrary line ranges
+- **AST-aware chunking**: Tree-sitter parsing for 16 languages — chunks align to functions/classes (and Markdown sections), not arbitrary line ranges
 - **Token-efficient**: Returns metadata by default; agents fetch full code only when needed via `get_chunk`
 - **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only, no runtime model downloads (works behind enterprise proxies)
 - **Zero config for single repos**: `codesearch index && codesearch mcp` — done
@@ -309,6 +309,18 @@ This starts a background HTTP server with:
 - **Idle eviction** (30min) — unused repos are unloaded from memory
 - **Session tracking** via MCP keep-alive
 
+### TUI Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Navigate repo list |
+| `i` | Show info overlay (chunks, files, model, DB size) |
+| `d` | Run doctor diagnostics on selected repo |
+| `f` | Force reindex selected repo |
+| `r` | Remove selected repo (with confirmation dialog) |
+| `s` | Reload repos config from disk |
+| `q` | Quit serve |
+
 ### Repository Registration
 
 Repos are registered via `codesearch index add`:
@@ -359,6 +371,23 @@ codesearch groups list
 
 Then in MCP tools: `group="my-group"` fans out the query to all repos in the group.
 
+### Git Worktree Auto-Index
+
+When using `git worktree add` to create parallel working directories, codesearch can auto-register new worktrees via a `post-checkout` git hook.
+
+**Setup** (run inside any repo you want worktree auto-indexing for):
+
+```bash
+codesearch hook install
+```
+
+This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
+
+**How it works:**
+1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` on startup (deletes on shutdown)
+2. The `post-checkout` hook reads that file and POSTs the working directory to `POST /repos`
+3. Serve registers the worktree path and begins indexing (deduped — won't re-register existing paths)
+
 ### MCP Connection Modes
 
 The `codesearch mcp` command supports three modes:
@@ -389,6 +418,7 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | `codesearch setup` | Download embedding models |
 | `codesearch cache stats\|clear` | Manage embedding cache |
 | `codesearch groups list\|add\|remove` | Manage repository groups |
+| `codesearch hook install` | Install git post-checkout hook for worktree auto-indexing |
 
 ## Configuration
 
@@ -397,6 +427,8 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | Variable | Description |
 |----------|-------------|
 | `CODESEARCH_SERVE_PORT` | Serve mode port (default: 39725) |
+| `CODESEARCH_SERVE_API_KEY` | API key for management endpoints (unset = no auth) |
+| `CODESEARCH_ALLOWED_ROOTS` | Semicolon-separated allowed roots for repo registration (unset = all allowed) |
 | `CODESEARCH_MCP_MODE` | MCP mode: auto, client, local |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
@@ -404,6 +436,15 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
+
+### Security
+
+When `codesearch serve` is exposed beyond a single trusted user (e.g. shared dev machines), two environment variables harden access:
+
+- **`CODESEARCH_SERVE_API_KEY`** — when set, management endpoints require this key via `Authorization: Bearer <key>` or `X-API-Key: <key>`. Health, status, and MCP search endpoints remain open.
+- **`CODESEARCH_ALLOWED_ROOTS`** — semicolon-separated list of filesystem roots. Repo registration is rejected for paths outside these roots. Prevents indexing arbitrary directories.
+
+Both are backward compatible: unset means no restriction.
 
 ### `.codesearchignore`
 
@@ -417,6 +458,8 @@ node_modules/
 *.generated.cs
 **/migrations/**
 ```
+
+A **global** `.codesearchignore` can be placed at `~/.codesearch/.codesearchignore`. It applies to all repos with the lowest priority (repo-local `.codesearchignore`, `.gitignore`, and `.git/info/exclude` all override it). This is useful for patterns you want everywhere without modifying each repo.
 
 ### `repos.json`
 
@@ -443,15 +486,20 @@ Tree-sitter AST-aware chunking:
 | C# | `.cs` |
 | Go | `.go` |
 | Java | `.java` |
+| Dart | `.dart` |
 | Shell | `.sh`, `.bash`, `.zsh` |
 | Ruby | `.rb`, `.rake` |
 | PHP | `.php` |
 | YAML | `.yaml`, `.yml` |
 | JSON | `.json` |
 | Markdown | `.md`, `.markdown`, `.txt` |
+| Jupyter | `.ipynb` |
 
 Markdown uses the tree-sitter-md **block** grammar — chunks align to sections,
-headings, and code fences. All other text files use line-based chunking as fallback.
+headings, and code fences. Jupyter notebooks are parsed as JSON; code and
+markdown cells are extracted, tagged with `[code]` or `[markdown]`, and
+adjacent same-type cells under 50 lines are merged into single chunks.
+All other text files use line-based chunking as fallback.
 
 ## Core Technology
 

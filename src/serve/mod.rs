@@ -1,6 +1,6 @@
 //! `codesearch serve` — MCP streamable HTTP server mode.
 //!
-//! Binds on `127.0.0.1:{port}` and serves:
+//! Binds on `{host}:{port}` (default `127.0.0.1:39725`) and serves:
 //! - `GET /health` → JSON health check
 //! - `POST /repos` → register + index + warmup a new repo
 //! - `DELETE /repos/:alias` → stop FSW + evict + unregister + delete DB
@@ -11,6 +11,7 @@
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
 mod tui;
+mod tui_common;
 mod tui_remote;
 
 use std::net::SocketAddr;
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::response::Json as AxumJson;
+use axum::response::{IntoResponse, Json as AxumJson};
 use colored::Colorize;
 use dashmap::{DashMap, DashSet};
 use rmcp::transport::{
@@ -34,15 +35,38 @@ use tracing::{info, warn};
 
 use crate::cache::safe_canonicalize;
 use crate::constants::{
-    CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT,
-    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, LANG_CSHARP,
-    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
-    REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
+    ALLOWED_ROOTS_ENV, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
+    CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
+    HEALTH_PATH, LANG_CSHARP, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
-use crate::db_discovery::repos::ReposConfig;
+use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
+
+// ---------------------------------------------------------------------------
+// Network auth configuration (captured at startup, passed to middleware)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the `require_auth_for_network` middleware.
+///
+/// Captured once at serve startup so the middleware doesn't re-read env vars
+/// on every request. Passed via `axum::Extension`.
+#[derive(Clone)]
+struct NetworkAuthConfig {
+    /// Whether the server is bound to a non-localhost address.
+    is_network_bind: bool,
+    /// The API key to validate (captured from env var at startup).
+    /// `None` means no auth (localhost-only mode).
+    api_key: Option<String>,
+}
+
+/// Check whether a host address is a localhost address.
+fn is_localhost_host(host: &str) -> bool {
+    host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
+}
+
 /// Lightweight repo status label derived from DashMap state only (no DB opens).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepoStateLabel {
@@ -196,6 +220,8 @@ pub(crate) struct ServeState {
     /// Test-only counter for reload invocations that actually swapped config.
     #[cfg(test)]
     reload_count: std::sync::atomic::AtomicUsize,
+    /// Instant when ServeState was created — used to compute uptime for TUI header.
+    started_at: std::time::Instant,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -260,6 +286,7 @@ impl ServeState {
             persist_worker_started: AtomicBool::new(false),
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -269,6 +296,11 @@ impl ServeState {
     /// helper-detection cache instead of creating fresh instances per request.
     pub(crate) fn symbol_registry(&self) -> Arc<SymbolIndexerRegistry> {
         Arc::clone(&self.symbol_registry)
+    }
+
+    /// Return the instant when serve started, used to compute uptime.
+    pub(crate) fn started_at(&self) -> std::time::Instant {
+        self.started_at
     }
 
     /// Build a `CSharpRebuildNotifier` for the given repo `alias`.
@@ -1082,6 +1114,82 @@ impl ServeState {
         Ok(())
     }
 
+    /// Remove a repo: stop FSW, evict from memory, unregister from config, delete DB.
+    ///
+    /// This is the shared logic used by both the HTTP `DELETE /repos/:alias` handler
+    /// and the TUI confirmation flow.
+    pub(crate) async fn remove_repo(&self, alias: &str) -> Result<()> {
+        // 1. Resolve project path from config
+        let project_path = {
+            let config = self
+                .config
+                .read()
+                .map_err(|e| anyhow::anyhow!("Config lock poisoned: {}", e))?;
+            config
+                .resolve(alias)
+                .ok_or_else(|| anyhow::anyhow!("Unknown alias '{}'", alias))?
+        };
+
+        let db_path = project_path.join(DB_DIR_NAME);
+
+        // 2. Stop FSW and evict from memory.
+        {
+            let stores = self.stop_fsw(alias);
+            drop(stores);
+        }
+        self.repos.remove(alias);
+        self.last_access.remove(alias);
+        tracing::info!("Evicted repo '{}' from memory", alias);
+
+        // 3. Unregister from repos.json
+        {
+            let mut config = self
+                .config
+                .write()
+                .map_err(|e| anyhow::anyhow!("Config lock poisoned: {}", e))?;
+            config.unregister_alias(alias);
+            if let Err(e) = self.persist_config(&config) {
+                tracing::warn!(
+                    "Failed to save repos config after removing '{}': {}",
+                    alias,
+                    e
+                );
+            }
+        }
+
+        // 4. Delete the database directory with retries.
+        if db_path.exists() {
+            for attempt in 0..5 {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                match std::fs::remove_dir_all(&db_path) {
+                    Ok(()) => {
+                        tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
+                        break;
+                    }
+                    Err(e) if attempt < 4 => {
+                        tracing::debug!(
+                            "DB delete attempt {} for '{}' failed (will retry): {}",
+                            attempt + 1,
+                            alias,
+                            e
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to delete database for '{}' after 5 attempts (may be locked): {}",
+                            alias,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Stop the file system watcher for a repo by cancelling its token.
     ///
     /// Returns the stores Arc if the repo was open in write or warm mode (so the caller
@@ -1101,17 +1209,29 @@ impl ServeState {
                 RepoState::Warm { stores } => {
                     return Some(stores.clone());
                 }
-                RepoState::Readonly { .. } => {
-                    // Cannot force-reindex a readonly store; let the caller
-                    // fall through to try_open_stores(allow_create=true)
-                    // which will attempt a write-mode open (and fail with a
-                    // clear error if the write lock is still held).
+                RepoState::Readonly { .. } | RepoState::Conflicted => {
+                    // Cannot force-reindex a readonly or conflicted store.
+                    // Drop the entry from the DashMap so the LMDB TrackedEnv
+                    // is released — the caller will reopen in write mode via
+                    // try_open_stores(allow_create=true).
+                    drop(entry);
+                    self.close_repo(alias);
                     return None;
                 }
-                RepoState::Conflicted => return None,
             }
         }
         None
+    }
+
+    /// Remove a repo from the DashMap, dropping its stores and releasing
+    /// LMDB file handles. Used before force-reindex reopen.
+    fn close_repo(&self, alias: &str) {
+        if self.repos.remove(alias).is_some() {
+            tracing::info!(
+                "Closed repo '{}' (dropped stores, released LMDB handles)",
+                alias
+            );
+        }
     }
 
     /// Spawn the FSW background task for a repo after it has been stopped.
@@ -2174,9 +2294,12 @@ async fn status_handler(
                 "last_tool_call": info.last_tool_call,
                 "tool_call_count": info.tool_call_count,
                 "csharp_index": csharp_str,
+                "csharp_error": info.csharp_error,
             })
         })
         .collect();
+
+    let uptime_secs = state.started_at().elapsed().as_secs();
 
     // CPU usage — reuse shared System instance so cpu_usage() can compute delta
     let cpu = {
@@ -2189,6 +2312,7 @@ async fn status_handler(
                     "repos": repo_json,
                     "active_sessions": active_sessions,
                     "cpu_percent": "—",
+                    "uptime_secs": uptime_secs,
                 }));
             }
         };
@@ -2200,6 +2324,7 @@ async fn status_handler(
                     "repos": repo_json,
                     "active_sessions": active_sessions,
                     "cpu_percent": "—",
+                    "uptime_secs": uptime_secs,
                 }));
             }
         };
@@ -2226,7 +2351,155 @@ async fn status_handler(
         "active_sessions": active_sessions,
         "cpu_percent": cpu,
         "csharp_helper": csharp_helper,
+        "uptime_secs": uptime_secs,
     }))
+}
+
+/// Info handler: GET /repos/{alias}/info
+///
+/// Returns live index stats for a single repo, mirroring the TUI info overlay
+/// (`tui::build_info_overlay`). Used by the remote TUI's `i` key.
+async fn info_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let config = state.config_snapshot();
+    let project_path = match config.resolve(&alias) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                AxumJson(json!({
+                    "error": format!("unknown repo alias: {}", alias),
+                    "status": "error",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let db_path = project_path.join(DB_DIR_NAME);
+
+    // Defaults (overridden by metadata.json then live store stats).
+    let mut chunks = 0usize;
+    let mut files = 0usize;
+    let mut max_chunk_id = 0u32;
+    let mut dims = 0usize;
+    let mut model = String::from("unknown");
+    let mut lock = String::from("—");
+    let mut index_age = String::from("—");
+
+    // Read model + dims + counts from metadata.json.
+    if let Ok(content) = std::fs::read_to_string(db_path.join("metadata.json")) {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+            model = meta
+                .get("model_short_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            dims = meta.get("dimensions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            chunks = meta
+                .get("total_chunks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            files = meta
+                .get("total_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            if let Some(indexed_at) = meta.get("indexed_at").and_then(|v| v.as_str()) {
+                index_age = tui::format_age(indexed_at);
+            }
+        }
+    }
+
+    // If stores are open, live stats override metadata.
+    if let Some(stores) = state.get_opened_stores(&alias) {
+        if let Ok(vs) = stores.vector_store.try_read() {
+            if let Ok(live_stats) = vs.stats() {
+                chunks = live_stats.total_chunks;
+                files = live_stats.total_files;
+                max_chunk_id = live_stats.max_chunk_id;
+                if dims == 0 {
+                    dims = live_stats.dimensions;
+                }
+            }
+        }
+        lock = if stores.readonly {
+            "read".to_string()
+        } else {
+            "write".to_string()
+        };
+    }
+
+    let db_size_human = tui::dir_size_human(&db_path);
+
+    AxumJson(json!({
+        "chunks": chunks,
+        "files": files,
+        "max_chunk_id": max_chunk_id,
+        "db_size_human": db_size_human,
+        "model": model,
+        "dims": dims,
+        "lock": lock,
+        "index_age": index_age,
+    }))
+    .into_response()
+}
+
+/// Doctor handler: POST /repos/{alias}/doctor
+///
+/// Runs doctor diagnostics for a single repo and returns the rendered TUI lines.
+/// Reuses the open LMDB handle via `diagnose_with_store` when stores are open,
+/// to avoid double-opening the environment. Used by the remote TUI's `d` key.
+async fn doctor_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let config = state.config_snapshot();
+    let project_path = match config.resolve(&alias) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                AxumJson(json!({
+                    "error": format!("unknown repo alias: {}", alias),
+                    "status": "error",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // diagnose() walks the repo tree and scans LMDB — synchronous, potentially
+    // slow work. Run it on a blocking thread so it never occupies a tokio worker
+    // (mirrors the reindex path). Reuse the open LMDB handle when available
+    // (via blocking_read inside the blocking task) to avoid double-opening the
+    // env; otherwise diagnose() opens its own read-only handle.
+    let opened = state.get_opened_stores(&alias);
+    let pp = project_path.clone();
+    let report = tokio::task::spawn_blocking(move || match opened {
+        Some(stores) => {
+            let vs = stores.vector_store.blocking_read();
+            crate::cli::doctor::diagnose_with_store(&pp, &vs)
+        }
+        None => crate::cli::doctor::diagnose(&pp),
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("doctor task panicked: {}", e)));
+
+    let results = match report {
+        Ok(report) => report.render_tui(),
+        Err(e) => vec![
+            format!("✗ Doctor failed: {}", e),
+            String::new(),
+            "  [Esc] close".to_string(),
+        ],
+    };
+
+    AxumJson(json!({ "results": results })).into_response()
 }
 
 /// Trigger a symbol index rebuild for a repo (C# etc.).
@@ -2502,7 +2775,9 @@ async fn reindex_handler(
             );
 
             // 2. Clear data and reindex
-            match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores).await {
+            match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores, None)
+                .await
+            {
                 Ok(()) => {
                     tracing::info!("Force reindex complete for '{}'", alias_bg);
                 }
@@ -2585,6 +2860,8 @@ struct AddRepoRequest {
     path: PathBuf,
     /// Optional alias to register under. If omitted, the directory name is used.
     alias: Option<String>,
+    /// Optional embedding model override (e.g., "bge-small", "nomic-v1.5").
+    model: Option<String>,
 }
 
 /// Add-repo handler: POST /repos
@@ -2615,6 +2892,18 @@ async fn add_repo_handler(
             );
         }
     };
+
+    // Validate the path is within allowed roots (if configured)
+    if let Err(e) = validate_path_within_allowed_roots(&canonical_path) {
+        warn!("Rejected repo registration: {}", e);
+        return (
+            StatusCode::FORBIDDEN,
+            axum::response::Json(json!({
+                "error": e,
+                "status": "forbidden"
+            })),
+        );
+    }
 
     // Register in repos.json
     let alias = {
@@ -2743,6 +3032,23 @@ async fn add_repo_handler(
         );
     }
 
+    // Parse optional model override from request body.
+    let model_override: Option<crate::embed::ModelType> = match body.model.as_deref() {
+        Some(model_str) => match crate::embed::ModelType::parse(model_str) {
+            Some(mt) => Some(mt),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::response::Json(json!({
+                        "error": format!("Unknown model: '{}'. Use one of: {}", model_str, crate::embed::ModelType::valid_short_names()),
+                        "status": "error"
+                    })),
+                );
+            }
+        },
+        None => None,
+    };
+
     // Spawn the heavy indexing work in the background.  Returns 202 immediately.
     let alias_bg = alias.clone();
     let state_bg = state.clone();
@@ -2755,7 +3061,14 @@ async fn add_repo_handler(
             project_path.display()
         );
 
-        match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores).await {
+        match IndexManager::force_reindex_with_stores(
+            &project_path,
+            &db_path,
+            &stores,
+            model_override,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!(
                     "Index created for '{}' ({})",
@@ -2832,116 +3145,250 @@ async fn remove_repo_handler(
 ) {
     use axum::http::StatusCode;
 
-    // 1. Resolve project path from config
-    let project_path = {
-        let config = match state.config.read() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::response::Json(json!({
-                        "error": format!("Config lock poisoned: {}", e),
-                        "status": "error"
-                    })),
-                );
+    match state.remove_repo(&alias).await {
+        Ok(()) => {
+            let project_path = state.config.read().ok().and_then(|c| c.resolve(&alias));
+            (
+                StatusCode::OK,
+                axum::response::Json(json!({
+                    "status": "removed",
+                    "alias": alias,
+                    "path": project_path,
+                    "message": "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+                })),
+            )
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("Unknown alias") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                axum::response::Json(json!({
+                    "error": msg,
+                    "status": if status == StatusCode::NOT_FOUND { "not_found" } else { "error" }
+                })),
+            )
+        }
+    }
+}
+
+/// Validate that a canonical path falls under one of the allowed root directories.
+///
+/// When `CODESEARCH_ALLOWED_ROOTS` is unset or empty, all paths are allowed (backward compatible).
+/// When set, the path must start with at least one of the semicolon-separated roots.
+/// All comparisons use canonicalized paths with consistent separators.
+///
+/// Returns `Ok(())` if the path is allowed, or an error message describing the rejection.
+fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Result<(), String> {
+    let allowed_roots = match std::env::var(ALLOWED_ROOTS_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(()), // No restriction configured
+    };
+
+    let roots: Vec<PathBuf> = allowed_roots
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    // Canonicalize each root for reliable comparison (ignores roots that don't exist)
+    let canonical_roots: Vec<PathBuf> = roots
+        .into_iter()
+        .filter_map(|r| safe_canonicalize(&r).ok())
+        .collect();
+
+    if canonical_roots.is_empty() {
+        // All configured roots failed to canonicalize — reject for safety
+        return Err(format!(
+            "No valid roots found in {} — all configured paths failed to canonicalize",
+            ALLOWED_ROOTS_ENV
+        ));
+    }
+
+    // Path::starts_with returns true for exact match too (a path starts with itself),
+    // so no separate equality check is needed.
+    let allowed = canonical_roots
+        .iter()
+        .any(|root| canonical_path.starts_with(root));
+
+    if allowed {
+        Ok(())
+    } else {
+        let roots_display: Vec<String> = canonical_roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect();
+        Err(format!(
+            "Path '{}' is outside allowed roots: [{}]. Set {} to include this path or leave it empty to allow all paths.",
+            canonical_path.display(),
+            roots_display.join(", "),
+            ALLOWED_ROOTS_ENV
+        ))
+    }
+}
+
+/// Constant-time API key comparison.
+///
+/// Hashes both the supplied candidate and the configured key with SHA-256 and
+/// compares the fixed-length 32-byte digests byte-for-byte without early exit.
+/// Because the digests are always the same length and SHA-256 is
+/// preimage-resistant, the comparison time does not depend on how many leading
+/// bytes of the candidate match the secret — closing the timing side-channel
+/// that a raw `==` on the key strings would open on the network-exposed path.
+fn api_key_matches(candidate: &str, configured: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let candidate_digest = Sha256::digest(candidate.as_bytes());
+    let configured_digest = Sha256::digest(configured.as_bytes());
+    let mut diff: u8 = 0;
+    for (a, b) in candidate_digest.iter().zip(configured_digest.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Returns true if the request carries a valid API key in either the
+/// `Authorization: Bearer <key>` or `X-API-Key: <key>` header, compared in
+/// constant time against `configured`. Shared by both auth middlewares so the
+/// constant-time guarantee lives in exactly one place.
+fn request_has_valid_api_key(headers: &axum::http::HeaderMap, configured: &str) -> bool {
+    if let Some(auth_val) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
+            if api_key_matches(bearer_key, configured) {
+                return true;
             }
-        };
-        match config.resolve(&alias) {
-            Some(p) => p,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    axum::response::Json(json!({
-                        "error": format!("Unknown alias '{}'", alias),
-                        "status": "not_found"
-                    })),
-                );
-            }
+        }
+    }
+    if let Some(key_val) = headers.get("X-API-Key").and_then(|v| v.to_str().ok()) {
+        if api_key_matches(key_val, configured) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Axum middleware that requires API key authentication for management endpoints.
+///
+/// When `CODESEARCH_SERVE_API_KEY` is set, requests must include the key in either:
+/// - `Authorization: Bearer <key>` header
+/// - `X-API-Key: <key>` header
+///
+/// When the env var is unset or empty, all requests pass through (backward compatible).
+///
+/// Management endpoints are: `POST /repos`, `DELETE /repos/:alias`,
+/// `POST /repos/:alias/reindex`, `POST /reload`.
+/// All other routes (health, status, MCP) are always unauthenticated.
+///
+/// Key comparison is constant-time (see `api_key_matches`).
+async fn require_admin_auth(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let method = req.method().clone();
+
+    // Only management endpoints require auth.
+    let is_management = matches!(path, "/repos" | "/reload")
+        || path.ends_with("/reindex")
+        || (path.starts_with("/repos/") && method == axum::http::Method::DELETE);
+
+    if !is_management {
+        return next.run(req).await;
+    }
+
+    let configured_key = match std::env::var(SERVE_API_KEY_ENV) {
+        Ok(k) if !k.is_empty() => k,
+        _ => return next.run(req).await,
+    };
+
+    if request_has_valid_api_key(req.headers(), &configured_key) {
+        return next.run(req).await;
+    }
+
+    warn!(
+        "Rejected unauthenticated management request: {} {}",
+        method, path
+    );
+
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        axum::response::Json(json!({
+            "error": "Unauthorized: valid API key required",
+            "status": "unauthorized"
+        })),
+    )
+        .into_response()
+}
+
+/// Axum middleware that requires API key authentication for ALL endpoints
+/// when the server is bound to a non-localhost address.
+///
+/// This is the network-level auth layer — it runs before `require_admin_auth`
+/// and protects MCP, health, status, and every other route.
+/// Uses the same `CODESEARCH_SERVE_API_KEY` env var and the same
+/// `Authorization: Bearer <key>` / `X-API-Key: <key>` header pattern.
+///
+/// Configuration is captured at startup via `NetworkAuthConfig` extension,
+/// so env-var changes after startup have no effect (defense in depth).
+///
+/// When the server is bound to localhost (default), this middleware passes
+/// all requests through (backward compatible).
+async fn require_auth_for_network(
+    axum::Extension(auth_config): axum::Extension<NetworkAuthConfig>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Localhost binding: no auth required.
+    if !auth_config.is_network_bind {
+        return next.run(req).await;
+    }
+
+    let configured_key = match &auth_config.api_key {
+        Some(k) => k,
+        None => {
+            // Should never happen — startup check refuses non-localhost without key.
+            // But defense in depth: reject if key somehow missing.
+            warn!("Network bind without API key — rejecting request");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::response::Json(json!({
+                    "error": "Server misconfiguration: API key required but not configured",
+                    "status": "error"
+                })),
+            )
+                .into_response();
         }
     };
 
-    let db_path = project_path.join(DB_DIR_NAME);
-
-    // 2. Stop FSW and evict from memory.
-    // Drop the returned stores Arc explicitly so DB handles are released ASAP.
-    {
-        let stores = state.stop_fsw(&alias);
-        drop(stores);
-    }
-    state.repos.remove(&alias);
-    state.last_access.remove(&alias);
-    tracing::info!("Evicted repo '{}' from memory", alias);
-
-    // 3. Unregister from repos.json
-    {
-        let mut config = match state.config.write() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::response::Json(json!({
-                        "error": format!("Config lock poisoned: {}", e),
-                        "status": "error"
-                    })),
-                );
-            }
-        };
-        config.unregister_alias(&alias);
-        if let Err(e) = state.persist_config(&config) {
-            tracing::warn!(
-                "Failed to save repos config after removing '{}': {}",
-                alias,
-                e
-            );
-        }
+    if request_has_valid_api_key(req.headers(), configured_key) {
+        return next.run(req).await;
     }
 
-    // 4. Delete the database directory.
-    //    Background tasks (incremental refresh) may still hold Arc<SharedStores>
-    //    clones for a brief moment after eviction. Retry with a short delay so
-    //    those tasks finish and release their file handles — critical on Windows
-    //    where open file handles block directory deletion (os error 32).
-    if db_path.exists() {
-        let mut deleted = false;
-        for attempt in 0..5 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            }
-            match std::fs::remove_dir_all(&db_path) {
-                Ok(()) => {
-                    tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
-                    deleted = true;
-                    break;
-                }
-                Err(e) if attempt < 4 => {
-                    tracing::debug!(
-                        "DB delete attempt {} for '{}' failed (will retry): {}",
-                        attempt + 1,
-                        alias,
-                        e
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to delete database for '{}' after 5 attempts (may be locked): {}",
-                        alias,
-                        e
-                    );
-                }
-            }
-        }
-        let _ = deleted; // used for logging only
-    }
+    let path = req.uri().path();
+    let method = req.method().clone();
+    warn!(
+        "Rejected unauthenticated request from network: {} {}",
+        method, path
+    );
 
     (
-        StatusCode::OK,
+        axum::http::StatusCode::UNAUTHORIZED,
         axum::response::Json(json!({
-            "status": "removed",
-            "alias": alias,
-            "path": project_path,
-            "message": "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+            "error": "Unauthorized: API key required for network access",
+            "status": "unauthorized"
         })),
     )
+        .into_response()
 }
 
 /// Axum middleware: log MCP requests (method + path, skips /health spam).
@@ -2998,11 +3445,16 @@ pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
 ///
 /// This is the entry point called from CLI when `codesearch serve` is invoked.
 pub async fn run_serve(
+    host: Option<String>,
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
     no_tui: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
+    use crate::constants::{resolve_serve_host, SERVE_HOST_ENV};
+
+    let effective_host = host.unwrap_or_else(resolve_serve_host);
+
     let effective_port = port.unwrap_or_else(|| {
         std::env::var(SERVE_PORT_ENV)
             .ok()
@@ -3010,10 +3462,42 @@ pub async fn run_serve(
             .unwrap_or(DEFAULT_SERVE_PORT)
     });
 
+    // ── Security check: non-localhost binding requires API key ──
+    let is_localhost = is_localhost_host(&effective_host);
+
+    if !is_localhost {
+        let api_key = std::env::var(SERVE_API_KEY_ENV)
+            .ok()
+            .filter(|k| !k.is_empty());
+        if api_key.is_none() {
+            anyhow::bail!(
+                "Refusing to bind to '{}' without authentication. \
+                 Set the {} environment variable to an API key before binding to a non-localhost address. \
+                 This protects MCP and all other endpoints from unauthorized network access.",
+                effective_host,
+                SERVE_API_KEY_ENV
+            );
+        }
+    }
+
+    // Capture auth config at startup for the middleware.
+    let network_auth = NetworkAuthConfig {
+        is_network_bind: !is_localhost,
+        api_key: std::env::var(SERVE_API_KEY_ENV)
+            .ok()
+            .filter(|k| !k.is_empty()),
+    };
+
     // Load repos config (register any --register paths first)
     let mut config = ReposConfig::load().unwrap_or_default();
     for path in &register_paths {
         let canonical = safe_canonicalize(path).unwrap_or_else(|_| path.clone());
+
+        // Validate path against allowed roots (if configured)
+        if let Err(e) = validate_path_within_allowed_roots(&canonical) {
+            anyhow::bail!("Rejected --register path '{}': {}", path.display(), e);
+        }
+
         let alias = config.register(canonical);
         eprintln!("Registered repo '{}' -> {}", alias, path.display());
         info!("Registered repo '{}' -> {}", alias, path.display());
@@ -3032,8 +3516,24 @@ pub async fn run_serve(
 
     let serve_state = Arc::new(ServeState::new(config, None));
 
+    // Construct the bind address from resolved host + port.
+    // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.
+    // For IPv6 literals, users should pass e.g. `[::1]` (with brackets).
+    let addr: SocketAddr = format!("{}:{}", effective_host, effective_port)
+        .parse()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid bind address '{}:{}': {}. \
+                 For IPv6, use brackets: `[::1]:port`. \
+                 Override with --host or {}.",
+                effective_host,
+                effective_port,
+                e,
+                SERVE_HOST_ENV
+            )
+        })?;
+
     // Log startup
-    let addr = SocketAddr::from(([127, 0, 0, 1], effective_port));
     info!(
         "🚀 Starting codesearch serve v{} on {}",
         env!("CARGO_PKG_VERSION"),
@@ -3076,13 +3576,21 @@ pub async fn run_serve(
 
     let mcp_service = StreamableHttpService::new(service_factory, session_manager, config);
 
-    // Build axum router with request logging.
+    // Build axum router with request logging and optional admin auth.
     // Stale-session recovery is handled client-side by the stdio proxy's retry
     // loop in `McpProxyService` (see src/mcp/mod.rs). Remote MCP clients that
     // are not spec-compliant must reconnect themselves — we do not attempt a
     // server-side transparent reconnect because that path opened a session leak
     // and could not actually reach OpenCode (TCP keep-alive failure happens
     // before the request hits this middleware).
+    //
+    // Layer order (outermost → innermost):
+    //   Extension(inject NetworkAuthConfig) → require_auth_for_network → log_mcp_requests → require_admin_auth → handler.
+    // - `Extension`: injects NetworkAuthConfig captured at startup into every request.
+    // - `require_auth_for_network`: protects ALL routes when non-localhost (network mode).
+    // - `log_mcp_requests`: logs method + path for every request.
+    // - `require_admin_auth`: protects management endpoints only (when API key set).
+    // Auth failures are logged because log_mcp_requests wraps the admin-auth layer.
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
         .route(STATUS_PATH, axum::routing::get(status_handler))
@@ -3093,8 +3601,18 @@ pub async fn run_serve(
             "/repos/:alias/reindex",
             axum::routing::post(reindex_handler),
         )
+        .route("/repos/:alias/info", axum::routing::get(info_handler))
+        // /doctor is a POST but is intentionally read-only (diagnostics only, no
+        // --fix path), so like /info and /status it is NOT in require_admin_auth's
+        // management set — reachable without the admin key on localhost, and still
+        // protected by require_auth_for_network on network binds. If doctor ever
+        // gains a mutating mode, add it to `is_management` in require_admin_auth.
+        .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
+        .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))
+        .layer(axum::middleware::from_fn(require_auth_for_network))
+        .layer(axum::Extension(network_auth))
         .with_state(serve_state.clone());
 
     // Bind TCP listener BEFORE spawning background warmup, so we know the port is live.
@@ -3108,6 +3626,15 @@ pub async fn run_serve(
     // When a real terminal is attached, launch the fullscreen ratatui TUI.
     // When piped / no TTY, fall back to periodic eprintln dashboard.
     let serve_url = format!("http://{}", addr);
+
+    // Write serve_url to ~/.codesearch/serve_url so git hooks can find us
+    if let Ok(dir) = config_dir() {
+        let url_file = dir.join("serve_url");
+        if let Err(e) = std::fs::write(&url_file, &serve_url) {
+            warn!("Failed to write serve_url file: {}", e);
+        }
+    }
+
     let tui_cancel = cancel_token.clone();
     let tui_state = serve_state.clone();
     let tui_url = serve_url.clone();
@@ -3202,6 +3729,12 @@ pub async fn run_serve(
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
     }
 
+    // Clean up serve_url file on shutdown
+    if let Ok(dir) = config_dir() {
+        let url_file = dir.join("serve_url");
+        let _ = std::fs::remove_file(&url_file);
+    }
+
     Ok(())
 }
 
@@ -3209,6 +3742,17 @@ pub async fn run_serve(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_api_key_matches() {
+        assert!(api_key_matches("secret-key", "secret-key"));
+        assert!(!api_key_matches("secret-key", "secret-keX"));
+        assert!(!api_key_matches("secret", "secret-key")); // different length
+        assert!(!api_key_matches("", "secret-key"));
+        assert!(api_key_matches("", "")); // both empty digests are equal
+                                          // Case-sensitive and exact.
+        assert!(!api_key_matches("Secret-Key", "secret-key"));
+    }
 
     fn state_with_config(config: ReposConfig) -> ServeState {
         // Use a temp file override so reload_if_changed doesn't see the real repos.json
@@ -3395,6 +3939,7 @@ mod tests {
             axum::extract::Json(AddRepoRequest {
                 path: repo_path.clone(),
                 alias: Some("brandnew".to_string()),
+                model: None,
             }),
         )
         .await;
@@ -3650,6 +4195,89 @@ mod tests {
         );
     }
 
+    /// Verify that the /repos/:alias/info and /repos/:alias/doctor routes are
+    /// registered and reachable. Starts a real axum server on a random port and
+    /// asserts that an unknown alias yields our handler's 404 (not axum's 404).
+    #[tokio::test]
+    async fn info_doctor_routes_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("myrepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+
+        let state = Arc::new(ServeState::new(config, Some(config_file)));
+
+        let app = axum::Router::new()
+            .route(
+                crate::constants::HEALTH_PATH,
+                axum::routing::get(health_handler),
+            )
+            .route("/repos/:alias/info", axum::routing::get(info_handler))
+            .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // GET unknown alias info → 404 from our handler (not axum's built-in 404)
+        let resp = client
+            .get(format!("http://{}/repos/unknown/info", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "expected 404 from info handler"
+        );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("info handler should return JSON body for 404");
+        assert!(
+            body.get("error").is_some(),
+            "expected JSON error body from info handler, got: {}",
+            body
+        );
+
+        // POST unknown alias doctor → 404 from our handler (not axum's built-in 404)
+        let resp = client
+            .post(format!("http://{}/repos/unknown/doctor", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "expected 404 from doctor handler"
+        );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("doctor handler should return JSON body for 404");
+        assert!(
+            body.get("error").is_some(),
+            "expected JSON error body from doctor handler, got: {}",
+            body
+        );
+    }
+
     #[test]
     fn config_reload_tolerates_parse_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3739,6 +4367,147 @@ mod tests {
             );
             let body: serde_json::Value = resp2.json().await.unwrap();
             assert_eq!(body["status"], "conflict");
+        }
+    }
+
+    /// Unit tests for `validate_path_within_allowed_roots`.
+    ///
+    /// These tests temporarily set/remove the `CODESEARCH_ALLOWED_ROOTS` env var.
+    /// A static Mutex serializes env mutation to prevent races under parallel test execution.
+    #[cfg(test)]
+    mod allowed_roots_tests {
+        use super::*;
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        /// Global lock to serialize env var mutations across parallel test threads.
+        static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        }
+
+        /// Helper: create a unique temp dir per test, return its canonical path.
+        fn temp_root(suffix: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("codesearch_test_roots_{}", suffix));
+            let _ = std::fs::create_dir_all(&dir);
+            safe_canonicalize(&dir).unwrap()
+        }
+
+        fn clear_env() {
+            std::env::remove_var(ALLOWED_ROOTS_ENV);
+        }
+
+        fn set_env(val: &str) {
+            std::env::set_var(ALLOWED_ROOTS_ENV, val);
+        }
+
+        #[test]
+        fn env_unset_allows_all() {
+            let _guard = lock();
+            clear_env();
+            let path = PathBuf::from("/some/random/path");
+            assert!(validate_path_within_allowed_roots(&path).is_ok());
+        }
+
+        #[test]
+        fn env_empty_allows_all() {
+            let _guard = lock();
+            set_env("");
+            let path = PathBuf::from("/some/random/path");
+            assert!(validate_path_within_allowed_roots(&path).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn path_within_root_is_allowed() {
+            let _guard = lock();
+            let root = temp_root("within");
+            set_env(&root.display().to_string());
+            let child = root.join("my-project");
+            let _ = std::fs::create_dir_all(&child);
+            let canonical_child = safe_canonicalize(&child).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn exact_root_match_is_allowed() {
+            let _guard = lock();
+            let root = temp_root("exact");
+            set_env(&root.display().to_string());
+            assert!(validate_path_within_allowed_roots(&root).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn path_outside_root_is_rejected() {
+            let _guard = lock();
+            let root = temp_root("outside");
+            set_env(&root.display().to_string());
+            // Construct a path guaranteed outside the temp root
+            let outside = if cfg!(windows) {
+                PathBuf::from("C:\\Windows\\System32")
+            } else {
+                PathBuf::from("/etc")
+            };
+            assert!(
+                !outside.starts_with(&root),
+                "Test setup error: outside path '{}' must not overlap root '{}'",
+                outside.display(),
+                root.display()
+            );
+            let result = validate_path_within_allowed_roots(&outside);
+            assert!(result.is_err(), "Expected rejection for path outside root");
+            assert!(result.unwrap_err().contains("outside allowed roots"));
+            clear_env();
+        }
+
+        #[test]
+        fn all_nonexistent_roots_rejects() {
+            let _guard = lock();
+            set_env("/nonexistent/path/abc;/also/nonexistent/xyz");
+            let some_path = std::env::temp_dir();
+            let canonical = safe_canonicalize(&some_path).unwrap();
+            let result = validate_path_within_allowed_roots(&canonical);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("No valid roots found"));
+            clear_env();
+        }
+
+        #[test]
+        fn semicolons_with_empty_segments_works() {
+            let _guard = lock();
+            let root = temp_root("semicolons");
+            set_env(&format!(";{};;", root.display()));
+            let child = root.join("project");
+            let _ = std::fs::create_dir_all(&child);
+            let canonical_child = safe_canonicalize(&child).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
+            clear_env();
+        }
+
+        #[test]
+        fn multiple_roots_any_match() {
+            let _guard = lock();
+            let root1 = temp_root("multi1");
+            let root2 = temp_root("multi2");
+
+            set_env(&format!("{};{}", root1.display(), root2.display()));
+
+            // Path under root1
+            let child1 = root1.join("project");
+            let _ = std::fs::create_dir_all(&child1);
+            let canonical1 = safe_canonicalize(&child1).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical1).is_ok());
+
+            // Path under root2
+            let child2 = root2.join("project");
+            let _ = std::fs::create_dir_all(&child2);
+            let canonical2 = safe_canonicalize(&child2).unwrap();
+            assert!(validate_path_within_allowed_roots(&canonical2).is_ok());
+
+            clear_env();
         }
     }
 }

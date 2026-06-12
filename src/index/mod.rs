@@ -15,7 +15,7 @@ use crate::db_discovery::{
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
-use crate::vectordb::VectorStore;
+use crate::vectordb::{merge_metadata_atomic, VectorStore};
 
 // Index manager module
 mod manager;
@@ -50,18 +50,19 @@ pub(crate) fn ensure_hnsw_index_if_needed(
 
 /// Update metadata.json with current chunk/file counts so that `status(projects)`
 /// can report accurate numbers without opening LMDB.
+/// Uses atomic read-modify-write (temp+rename) so a crash never leaves an empty file.
 pub(crate) fn update_metadata_stats(db_path: &Path, total_chunks: usize, total_files: usize) {
-    let metadata_path = db_path.join("metadata.json");
-    if let Ok(content) = fs::read_to_string(&metadata_path) {
-        if let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&content) {
-            metadata["total_chunks"] = serde_json::Value::Number(total_chunks.into());
-            metadata["total_files"] = serde_json::Value::Number(total_files.into());
-            if let Ok(pretty) = serde_json::to_string_pretty(&metadata) {
-                if let Err(e) = fs::write(&metadata_path, pretty) {
-                    tracing::warn!("Failed to update metadata stats: {}", e);
-                }
-            }
-        }
+    if let Err(e) = merge_metadata_atomic(db_path, |obj| {
+        obj.insert(
+            "total_chunks".to_string(),
+            serde_json::Value::Number(total_chunks.into()),
+        );
+        obj.insert(
+            "total_files".to_string(),
+            serde_json::Value::Number(total_files.into()),
+        );
+    }) {
+        tracing::warn!("Failed to update metadata stats: {}", e);
     }
 }
 
@@ -976,26 +977,27 @@ async fn index_with_options(
 
         // Save metadata — best-effort: log and continue on failure so the
         // partial chunks we already built are still searchable.
-        let metadata_json = serde_json::to_string_pretty(&serde_json::json!({
-            "model_short_name": model_type.short_name(),
-            "model_name": model_type.name(),
-            "dimensions": model_type.dimensions(),
-            "indexed_at": chrono::Utc::now().to_rfc3339(),
-            "partial": true,
-        }));
-        match metadata_json {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(db_path.join("metadata.json"), json) {
-                    log_print!("{}   metadata.json write warning: {}", "⚠️ ".yellow(), e);
-                }
-            }
-            Err(e) => {
-                log_print!(
-                    "{}   metadata.json serialise warning: {}",
-                    "⚠️ ".yellow(),
-                    e
-                );
-            }
+        // Uses read-modify-write so existing stats (total_chunks/total_files) are preserved.
+        if let Err(e) = merge_metadata_atomic(&db_path, |obj| {
+            obj.insert(
+                "model_short_name".to_string(),
+                serde_json::Value::String(model_type.short_name().to_string()),
+            );
+            obj.insert(
+                "model_name".to_string(),
+                serde_json::Value::String(model_type.name().to_string()),
+            );
+            obj.insert(
+                "dimensions".to_string(),
+                serde_json::Value::Number(model_type.dimensions().into()),
+            );
+            obj.insert(
+                "indexed_at".to_string(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+            obj.insert("partial".to_string(), serde_json::Value::Bool(true));
+        }) {
+            log_print!("{}   metadata.json write warning: {}", "⚠️ ".yellow(), e);
         }
 
         // Update FileMetaStore with the files that were actually processed.
@@ -1141,20 +1143,29 @@ async fn index_with_options(
     store.build_index()?;
     let _storage_duration = storage_start.elapsed();
 
-    // Save model metadata.  `partial: false` is explicit so the schema matches
-    // the cancel path (which writes `partial: true`); readers can always check
-    // the field regardless of how indexing completed.
-    let metadata = serde_json::json!({
-        "model_short_name": model_short_name,
-        "model_name": model_name,
-        "dimensions": model_dimensions,
-        "indexed_at": chrono::Utc::now().to_rfc3339(),
-        "partial": false,
-    });
-    std::fs::write(
-        db_path.join("metadata.json"),
-        serde_json::to_string_pretty(&metadata)?,
-    )?;
+    // Save model metadata (read-modify-write so existing stats are preserved).
+    // `partial: false` is explicit so the schema matches the cancel path
+    // (which writes `partial: true`); readers can always check the field
+    // regardless of how indexing completed.
+    merge_metadata_atomic(&db_path, |obj| {
+        obj.insert(
+            "model_short_name".to_string(),
+            serde_json::Value::String(model_short_name.to_string()),
+        );
+        obj.insert(
+            "model_name".to_string(),
+            serde_json::Value::String(model_name.to_string()),
+        );
+        obj.insert(
+            "dimensions".to_string(),
+            serde_json::Value::Number(model_dimensions.into()),
+        );
+        obj.insert(
+            "indexed_at".to_string(),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        obj.insert("partial".to_string(), serde_json::Value::Bool(false));
+    })?;
 
     // Update FileMetaStore with new chunk IDs (incremental mode)
     if is_incremental {
@@ -1418,6 +1429,7 @@ pub async fn prune_index() -> Result<()> {
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
+    model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
@@ -1433,7 +1445,7 @@ pub async fn add_to_index(
         let path = path.clone();
         // Alias is always derived from the directory name; the CLI no longer
         // lets the user set it. Pass None so serve derives it consistently.
-        async move { try_delegate_add_to_serve(&path, &None, global).await }
+        async move { try_delegate_add_to_serve(&path, &None, global, &model).await }
     })
     .await;
 
@@ -1553,7 +1565,7 @@ pub async fn add_to_index(
             false,
             false,
             true,
-            None,
+            model,
             cancel_token.clone(),
         )
         .await?;
@@ -1566,7 +1578,7 @@ pub async fn add_to_index(
             false,
             false,
             false,
-            None,
+            model,
             cancel_token,
         )
         .await?;
@@ -1926,14 +1938,15 @@ async fn try_delegate_reindex_to_serve(
     path: &Option<PathBuf>,
     force: bool,
 ) -> std::result::Result<(String, PathBuf), DelegateError> {
-    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+    use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SERVE_PORT);
+    let host = resolve_serve_host();
 
-    let base_url = format!("http://127.0.0.1:{}", port);
+    let base_url = format!("http://{}:{}", host, port);
 
     // 1. Health check — is serve running (and responsive)?
     let client = reqwest::Client::builder()
@@ -2140,15 +2153,17 @@ pub(crate) async fn try_delegate_add_to_serve(
     path: &Option<PathBuf>,
     alias: &Option<String>,
     global: bool,
+    model: &Option<ModelType>,
 ) -> std::result::Result<(String, PathBuf), DelegateError> {
-    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+    use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SERVE_PORT);
+    let host = resolve_serve_host();
 
-    let base_url = format!("http://127.0.0.1:{}", port);
+    let base_url = format!("http://{}:{}", host, port);
 
     // 1. Health check — is serve running (and responsive)?
     let client = reqwest::Client::builder()
@@ -2183,6 +2198,9 @@ pub(crate) async fn try_delegate_add_to_serve(
     });
     if let Some(a) = alias {
         body["alias"] = serde_json::Value::String(a.clone());
+    }
+    if let Some(m) = model {
+        body["model"] = serde_json::Value::String(m.short_name().to_string());
     }
 
     // 4. POST /repos
@@ -2222,14 +2240,15 @@ pub(crate) async fn try_delegate_add_to_serve(
 pub(crate) async fn try_delegate_rm_to_serve(
     path: &Option<PathBuf>,
 ) -> std::result::Result<(String, PathBuf), String> {
-    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+    use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SERVE_PORT);
+    let host = resolve_serve_host();
 
-    let base_url = format!("http://127.0.0.1:{}", port);
+    let base_url = format!("http://{}:{}", host, port);
 
     // 1. Health check
     let client = reqwest::Client::builder()

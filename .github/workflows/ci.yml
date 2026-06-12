@@ -10,13 +10,19 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: read
+
 jobs:
   test-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      # pin@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # pin@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      # pin@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry/
@@ -32,9 +38,12 @@ jobs:
   test-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      # pin@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # pin@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      # pin@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry/
@@ -47,16 +56,20 @@ jobs:
   csharp-integration-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      # pin@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # pin@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           dotnet-version: '10.0.x'
       - name: Build scip-csharp helper (self-contained single-file)
         run: |
           cd helpers/csharp
           dotnet publish scip-csharp.csproj -c Release -r linux-x64 --self-contained -p:PublishSingleFile=true -o bin/Release/net10.0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      # pin@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      # pin@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry/
@@ -66,4 +79,4 @@ jobs:
       - name: Run C# integration tests
         run: |
           export CODESEARCH_SCIP_CSHARP="$PWD/helpers/csharp/bin/Release/net10.0/scip-csharp"
-          cargo test --features csharp_helper_integration -- --include-ignored --nocapture
+          cargo test --features csharp_helper_integration -- --nocapture

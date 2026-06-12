@@ -2236,13 +2236,15 @@ mod tests {
 
 pub mod types;
 
-/// Resolve the serve base URL from env or default port.
+/// Resolve the serve base URL from env or default host/port.
 fn serve_url_from_env() -> String {
+    use crate::constants::resolve_serve_host;
+    let host = resolve_serve_host();
     let port = std::env::var(crate::constants::SERVE_PORT_ENV)
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(crate::constants::DEFAULT_SERVE_PORT);
-    format!("http://127.0.0.1:{}", port)
+    format!("http://{}:{}", host, port)
 }
 
 use crate::db_discovery::{find_best_database, load_repos_config};
@@ -2505,6 +2507,13 @@ fn read_model_metadata(db_path: &Path) -> (String, usize) {
 
 /// Read chunk/file counts from metadata.json (written after each indexing operation).
 /// Returns `(total_chunks, total_files)` defaulting to `(0, 0)`.
+///
+/// When metadata.json reports `total_chunks == 0` but the LMDB database exists,
+/// falls back to opening the store read-only and counting live chunks.
+/// This catches the case where a metadata writer clobbered the stats fields
+/// (see `merge_metadata_atomic` for the definitive fix). The fallback is lazy —
+/// only triggered when metadata reports zero — so it does not unnecessarily
+/// open databases for repos that already have correct metadata.
 fn read_metadata_stats(db_path: &Path) -> (usize, usize) {
     let metadata_path = db_path.join("metadata.json");
     if let Ok(content) = std::fs::read_to_string(&metadata_path) {
@@ -2517,10 +2526,69 @@ fn read_metadata_stats(db_path: &Path) -> (usize, usize) {
                 .get("total_files")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
+
+            if total_chunks > 0 {
+                return (total_chunks, total_files);
+            }
+
+            // Metadata says 0 chunks — try live LMDB count as fallback.
+            // This is safe in serve context: `read_metadata_stats` is only called
+            // for repos NOT yet opened in SharedStores (opened repos use vs.stats()
+            // directly), so no double-open risk.
+            if let Some((live_chunks, live_files)) = live_chunk_count(db_path) {
+                tracing::info!(
+                    "metadata.json reports 0 chunks for {}, but LMDB has {} chunks / {} files — using live count",
+                    db_path.display(), live_chunks, live_files
+                );
+                return (live_chunks, live_files);
+            }
+
             return (total_chunks, total_files);
         }
     }
     (0, 0)
+}
+
+/// Open the LMDB read-only and count chunks/files.
+/// Returns `None` if the database cannot be opened (missing, corrupt, or
+/// already locked by another handle).
+///
+/// # Safety (LMDB double-open)
+///
+/// This function is only called when `get_opened_stores(alias)` returned `None`,
+/// meaning no `SharedStores` handle exists for this repo. There is a theoretical
+/// race window between that check and this `open_readonly` call where another task
+/// could open the repo via `get_or_open_stores`. In practice this is safe because:
+/// 1. The tokio runtime uses a single thread for non-spawned futures.
+/// 2. Even if the race occurs, `open_readonly` returns `Err` (TrackedEnv blocks it),
+///    and we return `None` — no crash, no corruption.
+fn live_chunk_count(db_path: &Path) -> Option<(usize, usize)> {
+    let (model_name, dims) = read_model_metadata(db_path);
+    if model_name == "unknown" {
+        return None;
+    }
+    match VectorStore::open_readonly(db_path, dims) {
+        Ok(store) => match store.stats() {
+            Ok(stats) if stats.total_chunks > 0 => Some((stats.total_chunks, stats.total_files)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::debug!(
+                    "live_chunk_count: stats() failed for {}: {}",
+                    db_path.display(),
+                    e
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!(
+                "live_chunk_count: open_readonly failed for {}: {}",
+                db_path.display(),
+                e
+            );
+            None
+        }
+    }
 }
 
 /// RRF score threshold below which results are considered low-confidence.
@@ -7603,15 +7671,25 @@ pub async fn run_mcp_server(
         let model_name = format!("{:?}", model_type);
         let dimensions = model_type.dimensions();
 
-        // Create minimal metadata.json (matching format used by build_index)
-        let metadata_path = db_path.join("metadata.json");
-        let metadata = serde_json::json!({
-            "model_short_name": model_short_name,
-            "model_name": model_name,
-            "dimensions": dimensions,
-            "indexed_at": chrono::Utc::now().to_rfc3339()
-        });
-        tokio::fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?).await?;
+        // Create minimal metadata.json (atomic read-modify-write, matching format used by build_index)
+        crate::vectordb::merge_metadata_atomic(&db_path, |obj| {
+            obj.insert(
+                "model_short_name".to_string(),
+                serde_json::Value::String(model_short_name.clone()),
+            );
+            obj.insert(
+                "model_name".to_string(),
+                serde_json::Value::String(model_name),
+            );
+            obj.insert(
+                "dimensions".to_string(),
+                serde_json::Value::Number(dimensions.into()),
+            );
+            obj.insert(
+                "indexed_at".to_string(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+        })?;
 
         // Create minimal file_meta.json (matching FileMetaStore format)
         let file_meta = crate::cache::FileMetaStore::new(model_short_name.clone(), dimensions);

@@ -107,16 +107,22 @@ impl ParsedCode {
         node_positions
     }
 
-    /// Walk the entire tree, calling a function for each node
-    fn walk_tree<F>(&self, node: Node, callback: &mut F)
+    /// Walk the entire tree, calling a function for each node.
+    ///
+    /// Uses an explicit stack to avoid deep recursion on large ASTs.
+    fn walk_tree<F>(&self, root: Node, callback: &mut F)
     where
         F: FnMut(Node),
     {
-        callback(node);
-
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            self.walk_tree(child, callback);
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            callback(node);
+            // Push children in reverse so leftmost is processed first (LIFO)
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.children(&mut cursor).collect();
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
         }
     }
 }
@@ -295,5 +301,43 @@ fn baz() {}
 
         let parsed = result.unwrap();
         assert!(parsed.has_errors()); // But marks the tree as having errors
+    }
+
+    /// Regression test for #112 at the tree-walker level. `find_nodes_by_type`
+    /// drives `walk_tree`, which is now iterative. A ~50k-deep AST (nested
+    /// parenthesized expressions) must be walked without overflowing the stack;
+    /// we enforce this on a 1 MiB thread stack so any return to recursion fails
+    /// the test deterministically.
+    #[test]
+    fn test_walk_tree_deeply_nested_does_not_overflow() {
+        const DEPTH: usize = 50_000;
+        let mut source = String::with_capacity(DEPTH * 2 + 32);
+        source.push_str("fn deep() -> i32 {\n    ");
+        for _ in 0..DEPTH {
+            source.push('(');
+        }
+        source.push('0');
+        for _ in 0..DEPTH {
+            source.push(')');
+        }
+        source.push_str("\n}\n");
+
+        let handle = std::thread::Builder::new()
+            .stack_size(1024 * 1024) // 1 MiB — too small for 50k recursive frames
+            .spawn(move || {
+                let mut parser = CodeParser::new();
+                let parsed = parser.parse(Language::Rust, &source).expect("parse rust");
+                // Exercises walk_tree across the entire deep AST.
+                parsed.find_nodes_by_type("integer_literal").len()
+            })
+            .expect("spawn parser thread");
+
+        let count = handle
+            .join()
+            .expect("walk_tree must not overflow the stack on a deep AST");
+        assert!(
+            count >= 1,
+            "should find the integer literal at the bottom of the nesting"
+        );
     }
 }
