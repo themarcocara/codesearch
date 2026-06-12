@@ -8,8 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.207] - 2026-06-12
+
 ### Added
 
+- **`serve --host` — bind beyond localhost (#114)**: `codesearch serve` now
+  accepts `--host` (env `CODESEARCH_SERVE_HOST`); set `0.0.0.0` to bind all
+  interfaces (e.g. inside a container). IPv4 and IPv6 literals are supported
+  (`[::]`). Because this exposes the management endpoints, pair it with
+  `CODESEARCH_SERVE_API_KEY` to require an API key on `POST /repos`, `/reindex`,
+  and `/reload`.
 - **Global `.codesearchignore`**: `~/.codesearch/.codesearchignore` is now loaded
   as the lowest-priority ignore file, applying to all indexed repositories.
   Precedence: global < `.git/info/exclude` < `.gitignore` < repo-local
