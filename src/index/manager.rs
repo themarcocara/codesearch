@@ -446,6 +446,56 @@ impl IndexManager {
         })
     }
 
+    /// Resolve the embedding model recorded in `metadata.json` for an index.
+    ///
+    /// Returns the parsed [`ModelType`] and its dimension count. Vectors written
+    /// to an index MUST be produced by this exact model — embedding with any
+    /// other model (including the hardcoded default) silently corrupts the index
+    /// and, for non-384d models, yields a dimension mismatch. Every embedding
+    /// path resolves the model through this helper instead of `ModelType::default()`.
+    ///
+    /// Fails fast if metadata is missing, names an unknown model, or records a
+    /// dimension count that disagrees with the resolved model.
+    fn resolve_embed_model(db_path: &Path) -> Result<(ModelType, usize)> {
+        let metadata_path = db_path.join("metadata.json");
+        if !metadata_path.exists() {
+            return Err(anyhow::anyhow!(
+                "No metadata.json found in {}",
+                db_path.display()
+            ));
+        }
+        let content = std::fs::read_to_string(&metadata_path)?;
+        let json: serde_json::Value = serde_json::from_str(&content)?;
+        let model_name = json
+            .get("model_short_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("minilm-l6-q");
+        let dimensions = json
+            .get("dimensions")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(384) as usize;
+        let model = ModelType::parse(model_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown embedding model '{}' in {}. Valid models: {}",
+                model_name,
+                metadata_path.display(),
+                ModelType::valid_short_names()
+            )
+        })?;
+        if model.dimensions() != dimensions {
+            return Err(anyhow::anyhow!(
+                "Metadata inconsistency in {}: model '{}' has {} dimensions but \
+                 metadata records {}. The index is corrupt — re-create it with a \
+                 single consistent model.",
+                metadata_path.display(),
+                model_name,
+                model.dimensions(),
+                dimensions
+            ));
+        }
+        Ok((model, dimensions))
+    }
+
     /// Perform incremental refresh using shared stores.
     ///
     /// This checks for changed/deleted files since last index and updates
@@ -463,51 +513,13 @@ impl IndexManager {
         info!("🔄 Performing incremental refresh with shared stores...");
         let start = std::time::Instant::now();
 
-        // Read model metadata
-        let metadata_path = db_path.join("metadata.json");
-        let (model_name, dimensions) = if metadata_path.exists() {
-            let content = std::fs::read_to_string(&metadata_path)?;
-            let json: serde_json::Value = serde_json::from_str(&content)?;
-            let model = json
-                .get("model_short_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("minilm-l6-q");
-            let dims = json
-                .get("dimensions")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(384) as usize;
-            (model.to_string(), dims)
-        } else {
-            return Err(anyhow::anyhow!("No metadata.json found in database"));
-        };
-
-        // Resolve the embedding model from the recorded short name. The vectors
-        // produced here MUST match the model recorded in metadata.json — embedding
-        // with a different model (or the hardcoded default) silently corrupts the
-        // index, and for non-384d models produces a dimension mismatch. Fail fast
-        // with a clear error rather than defaulting.
-        let embed_model = ModelType::parse(&model_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Unknown embedding model '{}' in {}. Valid models: {}",
-                model_name,
-                metadata_path.display(),
-                ModelType::valid_short_names()
-            )
-        })?;
-        if embed_model.dimensions() != dimensions {
-            return Err(anyhow::anyhow!(
-                "Metadata inconsistency in {}: model '{}' has {} dimensions but \
-                 metadata records {}. The index is corrupt — re-create it with a \
-                 single consistent model.",
-                metadata_path.display(),
-                model_name,
-                embed_model.dimensions(),
-                dimensions
-            ));
-        }
+        // Resolve the embedding model recorded for this index. Embedding MUST use
+        // the same model the index was created with — see resolve_embed_model.
+        let (embed_model, dimensions) = Self::resolve_embed_model(db_path)?;
+        let model_name = embed_model.short_name();
 
         // Load FileMetaStore
-        let mut file_meta_store = FileMetaStore::load_or_create(db_path, &model_name, dimensions)?;
+        let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
 
         // B1 safety guard: if FileMetaStore is empty but VectorStore has chunks,
         // the metadata was lost/reset (model change, corrupt file, etc.).
@@ -642,7 +654,6 @@ impl IndexManager {
             let files_for_embed = changed_files.clone();
             let embedded_chunks =
                 tokio::task::spawn_blocking(move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
-                    let embed_model = embed_model;
                     let mut chunker = SemanticChunker::new(100, 2000, 10);
                     let mut all_chunks = Vec::new();
 
@@ -1768,20 +1779,18 @@ impl IndexManager {
             file_path.display()
         );
 
+        // Resolve the embedding model recorded for this index BEFORE embedding.
+        // The live watcher path must re-embed changed files with the SAME model
+        // the index was created with — using the hardcoded default here would
+        // write 384d vectors into a non-384d index and corrupt it.
+        let (embed_model, dimensions) = Self::resolve_embed_model(&db_path)?;
+        let model_name = embed_model.short_name();
+
         // Generate embeddings
         let cache_dir = crate::constants::get_global_models_cache_dir()?;
         let mut embedding_service =
-            EmbeddingService::with_cache_dir(ModelType::default(), Some(cache_dir.as_path()))?;
+            EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
-
-        // Load metadata to get dimensions
-        let metadata_path = db_path.join("metadata.json");
-        let metadata: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
-        let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-        let model_name = metadata["model_short_name"]
-            .as_str()
-            .unwrap_or("minilm-l6-q");
 
         // ── Delete stale chunks for this file BEFORE inserting new ones ──
         // When a file is re-indexed (e.g. after a content change), the old
