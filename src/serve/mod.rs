@@ -2282,6 +2282,7 @@ async fn status_handler(
                 "last_tool_call": info.last_tool_call,
                 "tool_call_count": info.tool_call_count,
                 "csharp_index": csharp_str,
+                "csharp_error": info.csharp_error,
             })
         })
         .collect();
@@ -2340,6 +2341,144 @@ async fn status_handler(
         "csharp_helper": csharp_helper,
         "uptime_secs": uptime_secs,
     }))
+}
+
+/// Info handler: GET /repos/{alias}/info
+///
+/// Returns live index stats for a single repo, mirroring the TUI info overlay
+/// (`tui::build_info_overlay`). Used by the remote TUI's `i` key.
+async fn info_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let config = state.config_snapshot();
+    let project_path = match config.resolve(&alias) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                AxumJson(json!({
+                    "error": format!("unknown repo alias: {}", alias),
+                    "status": "error",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let db_path = project_path.join(DB_DIR_NAME);
+
+    // Defaults (overridden by metadata.json then live store stats).
+    let mut chunks = 0usize;
+    let mut files = 0usize;
+    let mut max_chunk_id = 0u32;
+    let mut dims = 0usize;
+    let mut model = String::from("unknown");
+    let mut lock = String::from("—");
+    let mut index_age = String::from("—");
+
+    // Read model + dims + counts from metadata.json.
+    if let Ok(content) = std::fs::read_to_string(db_path.join("metadata.json")) {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+            model = meta
+                .get("model_short_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            dims = meta.get("dimensions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            chunks = meta
+                .get("total_chunks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            files = meta
+                .get("total_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            if let Some(indexed_at) = meta.get("indexed_at").and_then(|v| v.as_str()) {
+                index_age = tui::format_age(indexed_at);
+            }
+        }
+    }
+
+    // If stores are open, live stats override metadata.
+    if let Some(stores) = state.get_opened_stores(&alias) {
+        if let Ok(vs) = stores.vector_store.try_read() {
+            if let Ok(live_stats) = vs.stats() {
+                chunks = live_stats.total_chunks;
+                files = live_stats.total_files;
+                max_chunk_id = live_stats.max_chunk_id;
+                if dims == 0 {
+                    dims = live_stats.dimensions;
+                }
+            }
+        }
+        lock = if stores.readonly {
+            "read".to_string()
+        } else {
+            "write".to_string()
+        };
+    }
+
+    let db_size_human = tui::dir_size_human(&db_path);
+
+    AxumJson(json!({
+        "chunks": chunks,
+        "files": files,
+        "max_chunk_id": max_chunk_id,
+        "db_size_human": db_size_human,
+        "model": model,
+        "dims": dims,
+        "lock": lock,
+        "index_age": index_age,
+    }))
+    .into_response()
+}
+
+/// Doctor handler: POST /repos/{alias}/doctor
+///
+/// Runs doctor diagnostics for a single repo and returns the rendered TUI lines.
+/// Reuses the open LMDB handle via `diagnose_with_store` when stores are open,
+/// to avoid double-opening the environment. Used by the remote TUI's `d` key.
+async fn doctor_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let config = state.config_snapshot();
+    let project_path = match config.resolve(&alias) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                AxumJson(json!({
+                    "error": format!("unknown repo alias: {}", alias),
+                    "status": "error",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Reuse the open LMDB handle when available; otherwise open via diagnose().
+    let report = if let Some(stores) = state.get_opened_stores(&alias) {
+        let vs = stores.vector_store.read().await;
+        crate::cli::doctor::diagnose_with_store(&project_path, &vs)
+    } else {
+        crate::cli::doctor::diagnose(&project_path)
+    };
+
+    let results = match report {
+        Ok(report) => report.render_tui(),
+        Err(e) => vec![
+            format!("✗ Doctor failed: {}", e),
+            String::new(),
+            "  [Esc] close".to_string(),
+        ],
+    };
+
+    AxumJson(json!({ "results": results })).into_response()
 }
 
 /// Trigger a symbol index rebuild for a repo (C# etc.).
@@ -3441,6 +3580,8 @@ pub async fn run_serve(
             "/repos/:alias/reindex",
             axum::routing::post(reindex_handler),
         )
+        .route("/repos/:alias/info", axum::routing::get(info_handler))
+        .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))

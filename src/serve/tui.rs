@@ -444,7 +444,7 @@ fn build_info_overlay(
 }
 
 /// Format an ISO 8601 timestamp as a human-readable age string.
-fn format_age(iso_ts: &str) -> String {
+pub(crate) fn format_age(iso_ts: &str) -> String {
     let parsed = chrono::DateTime::parse_from_rfc3339(iso_ts).or_else(|_| {
         // Try without timezone (assume UTC)
         chrono::NaiveDateTime::parse_from_str(iso_ts, "%Y-%m-%dT%H:%M:%S%.f")
@@ -478,7 +478,7 @@ fn format_age(iso_ts: &str) -> String {
 }
 
 /// Compute total size of a directory on disk, formatted as human-readable string.
-fn dir_size_human(path: &std::path::Path) -> String {
+pub(crate) fn dir_size_human(path: &std::path::Path) -> String {
     let total_bytes = walkdir_size(path);
     if total_bytes == 0 {
         return "—".to_string();
