@@ -528,6 +528,10 @@ pub fn render_detail(
     }
 }
 
+// Footer renders many independent display fields (hints, scroll, sessions, CPU,
+// C# indicator, transient flash); grouping them into a struct would add
+// ceremony without improving clarity.
+#[allow(clippy::too_many_arguments)]
 pub fn render_footer(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -536,6 +540,7 @@ pub fn render_footer(
     active: u64,
     cpu: &str,
     csharp_helper: bool,
+    flash: Option<&str>,
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
@@ -557,59 +562,71 @@ pub fn render_footer(
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right_len as u16 + 2)])
             .areas(footer_inner);
 
-    let left_line = Line::from(vec![
-        Span::styled(
-            "i",
+    // A transient flash message (e.g. "reindex started") takes over the left
+    // line while active, so the user gets immediate confirmation of an action
+    // even before the status column updates on the next redraw.
+    let left_line = if let Some(msg) = flash {
+        Line::from(vec![Span::styled(
+            msg.to_string(),
             Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        Span::styled("nfo  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "d",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        Span::styled("octor  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("rei", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "n",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        Span::styled("dex  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "r",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        Span::styled("emove  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("re", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "l",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        Span::styled("oad  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "q",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        Span::styled("uit  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "↑↓",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
-    ]);
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "i",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::styled("nfo  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "d",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::styled("octor  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("rei", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "n",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::styled("dex  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "r",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::styled("emove  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("re", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "l",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::styled("oad  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "q",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::styled("uit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "↑↓",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
+        ])
+    };
 
     let csharp_indicator = if csharp_helper {
         Span::styled("C# │ ", Style::default().fg(Color::Green))

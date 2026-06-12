@@ -194,6 +194,7 @@ async fn run_remote_tui_loop(
                     active,
                     cpu,
                     csharp_helper,
+                    None,
                 );
             } else {
                 tui_common::render_header(f, chunks[0], serve_url, "?", true, &uptime_str);
@@ -209,7 +210,7 @@ async fn run_remote_tui_loop(
                     ),
                 ]));
                 f.render_widget(connecting, chunks[1]);
-                tui_common::render_footer(f, chunks[3], &[], &table_state, 0, "—", false);
+                tui_common::render_footer(f, chunks[3], &[], &table_state, 0, "—", false, None);
             }
 
             // Render overlay on top if active

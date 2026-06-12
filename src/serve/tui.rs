@@ -78,6 +78,11 @@ async fn run_tui_loop(
     // Optional modal overlay (dismissed by Esc)
     let mut overlay: Option<OverlayState> = None;
 
+    // Transient footer flash (action confirmations like "reindex started").
+    // Auto-clears after FLASH_TTL so it never sticks.
+    let mut flash: Option<(String, std::time::Instant)> = None;
+    const FLASH_TTL: Duration = Duration::from_secs(4);
+
     // Channel to receive doctor results from background task. The payload is
     // tagged with a request generation so a late result from a request the
     // user already dismissed (or superseded with a newer one) is ignored.
@@ -110,6 +115,15 @@ async fn run_tui_loop(
             .map(|i| i.is_available())
             .unwrap_or(false);
 
+        // Expire a stale flash, then borrow the live message (if any) for render.
+        if flash
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= FLASH_TTL)
+        {
+            flash = None;
+        }
+        let flash_msg = flash.as_ref().map(|(msg, _)| msg.as_str());
+
         terminal.draw(|f| {
             let size = f.area();
             let chunks = Layout::vertical([
@@ -131,6 +145,7 @@ async fn run_tui_loop(
                 active,
                 &cpu,
                 csharp_helper,
+                flash_msg,
             );
 
             // Render overlay on top of everything if active
@@ -216,7 +231,18 @@ async fn run_tui_loop(
                     KeyAction::ForceReindex(idx) => {
                         if idx < repos.len() {
                             let alias = repos[idx].0.clone();
-                            spawn_force_reindex(alias, &state);
+                            let msg = match spawn_force_reindex(alias.clone(), &state) {
+                                ReindexLaunch::Started => {
+                                    format!("⟳ Reindex started for '{alias}' …")
+                                }
+                                ReindexLaunch::AlreadyRunning => {
+                                    format!("⟳ Reindex already running for '{alias}'")
+                                }
+                                ReindexLaunch::Failed => {
+                                    format!("✗ Cannot reindex '{alias}' — see logs")
+                                }
+                            };
+                            flash = Some((msg, std::time::Instant::now()));
                         }
                     }
                     KeyAction::RequestRemove(idx) => {
@@ -579,16 +605,28 @@ fn spawn_doctor(
 // Force reindex (non-blocking spawn)
 // ---------------------------------------------------------------------------
 
+/// Outcome of a TUI force-reindex launch — used to drive immediate footer
+/// feedback. Only describes whether the background task *started*; the actual
+/// indexing result is reported later via the status column / logs.
+enum ReindexLaunch {
+    /// Background reindex task spawned successfully.
+    Started,
+    /// A reindex was already running for this alias — request ignored.
+    AlreadyRunning,
+    /// Could not start (config error, unresolved alias, read-only, open error).
+    Failed,
+}
+
 /// Spawn a background force reindex task for the given repo alias.
 /// Follows the same flow as the HTTP `reindex_handler`.
-fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
+fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
     // Guard against concurrent reindex
     if !state.active_reindexes.insert(alias.clone()) {
         tracing::warn!(
             "Force reindex already in progress for '{}', skipping TUI request",
             alias
         );
-        return;
+        return ReindexLaunch::AlreadyRunning;
     }
 
     let config = match state.config.read() {
@@ -596,7 +634,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
         Err(e) => {
             tracing::error!("Config lock poisoned: {}", e);
             state.active_reindexes.remove(&alias);
-            return;
+            return ReindexLaunch::Failed;
         }
     };
     let project_path = match config.resolve(&alias) {
@@ -604,7 +642,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
         None => {
             tracing::error!("Cannot resolve alias '{}' for force reindex", alias);
             state.active_reindexes.remove(&alias);
-            return;
+            return ReindexLaunch::Failed;
         }
     };
     drop(config); // release read lock
@@ -636,12 +674,12 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
                         alias
                     );
                     state.active_reindexes.remove(&alias);
-                    return;
+                    return ReindexLaunch::Failed;
                 }
                 Err(e) => {
                     tracing::error!("Cannot open stores for '{}': {}", alias, e);
                     state.active_reindexes.remove(&alias);
-                    return;
+                    return ReindexLaunch::Failed;
                 }
             }
         }
@@ -671,6 +709,8 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
         // Remove guard
         state_bg.active_reindexes.remove(&alias_bg);
     });
+
+    ReindexLaunch::Started
 }
 
 // ---------------------------------------------------------------------------
