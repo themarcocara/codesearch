@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Global `.codesearchignore`**: `~/.codesearch/.codesearchignore` is now loaded
+  as the lowest-priority ignore file, applying to all indexed repositories.
+  Precedence: global < `.git/info/exclude` < `.gitignore` < repo-local
+  `.codesearchignore`.
+- **Jupyter Notebook (`.ipynb`) support**: `.ipynb` files are parsed as JSON,
+  extracting code and markdown cells as separate chunks with `# [code]` /
+  `# [markdown]` prefixes. Adjacent same-type cells under 50 lines are merged.
 - **Dart language support**: Tree-sitter semantic chunking for Dart — classes,
   mixins, enums, extensions, extension types, and top-level functions are
   extracted as definition chunks with full breadcrumb context.
@@ -24,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FileWatcher missing repo-local `.codesearchignore`**: `build_gitignore()` now
+  loads `.codesearchignore` from the repository root alongside the global file.
+  Previously only the global file was loaded, causing repo-local ignores to be
+  silently skipped in the file watcher.
 - **`.git/info/exclude` broken for worktrees**: `FileWatcher::build_gitignore`
   now resolves the actual git directory (following `gitdir:` pointers in
   worktree `.git` files) before accessing `info/exclude`.
