@@ -970,9 +970,16 @@ SERVE_URL_FILE="$HOME/.codesearch/serve_url"
 if [ -f "$SERVE_URL_FILE" ]; then
     SERVE_URL=$(cat "$SERVE_URL_FILE")
     if [ -n "$SERVE_URL" ]; then
+        # JSON-escape the repo path before embedding it in the request body.
+        # A path containing a double quote or backslash would otherwise break
+        # out of the JSON string literal (malformed body / injection). Escape
+        # backslashes first, then double quotes (order matters).
+        REPO_PATH="$(pwd)"
+        REPO_PATH="${REPO_PATH//\\/\\\\}"
+        REPO_PATH="${REPO_PATH//\"/\\\"}"
         curl -s -X POST "$SERVE_URL/repos" \
             -H "Content-Type: application/json" \
-            -d "{\"path\":\"$(pwd)\"}" &>/dev/null &
+            -d "{\"path\":\"$REPO_PATH\"}" &>/dev/null &
     fi
 fi
 "#;

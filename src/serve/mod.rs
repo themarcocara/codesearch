@@ -3075,6 +3075,48 @@ fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Res
     }
 }
 
+/// Constant-time API key comparison.
+///
+/// Hashes both the supplied candidate and the configured key with SHA-256 and
+/// compares the fixed-length 32-byte digests byte-for-byte without early exit.
+/// Because the digests are always the same length and SHA-256 is
+/// preimage-resistant, the comparison time does not depend on how many leading
+/// bytes of the candidate match the secret — closing the timing side-channel
+/// that a raw `==` on the key strings would open on the network-exposed path.
+fn api_key_matches(candidate: &str, configured: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let candidate_digest = Sha256::digest(candidate.as_bytes());
+    let configured_digest = Sha256::digest(configured.as_bytes());
+    let mut diff: u8 = 0;
+    for (a, b) in candidate_digest.iter().zip(configured_digest.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Returns true if the request carries a valid API key in either the
+/// `Authorization: Bearer <key>` or `X-API-Key: <key>` header, compared in
+/// constant time against `configured`. Shared by both auth middlewares so the
+/// constant-time guarantee lives in exactly one place.
+fn request_has_valid_api_key(headers: &axum::http::HeaderMap, configured: &str) -> bool {
+    if let Some(auth_val) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
+            if api_key_matches(bearer_key, configured) {
+                return true;
+            }
+        }
+    }
+    if let Some(key_val) = headers.get("X-API-Key").and_then(|v| v.to_str().ok()) {
+        if api_key_matches(key_val, configured) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Axum middleware that requires API key authentication for management endpoints.
 ///
 /// When `CODESEARCH_SERVE_API_KEY` is set, requests must include the key in either:
@@ -3087,8 +3129,7 @@ fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Res
 /// `POST /repos/:alias/reindex`, `POST /reload`.
 /// All other routes (health, status, MCP) are always unauthenticated.
 ///
-/// Note: key comparison uses standard string equality, not constant-time comparison.
-/// Timing attacks are impractical on a localhost-only service.
+/// Key comparison is constant-time (see `api_key_matches`).
 async fn require_admin_auth(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -3110,24 +3151,8 @@ async fn require_admin_auth(
         _ => return next.run(req).await,
     };
 
-    // Check Authorization: Bearer <key>
-    if let Some(auth_header) = req.headers().get(axum::http::header::AUTHORIZATION) {
-        if let Ok(auth_val) = auth_header.to_str() {
-            if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
-                if bearer_key == configured_key {
-                    return next.run(req).await;
-                }
-            }
-        }
-    }
-
-    // Check X-API-Key: <key>
-    if let Some(api_key_header) = req.headers().get("X-API-Key") {
-        if let Ok(key_val) = api_key_header.to_str() {
-            if key_val == configured_key {
-                return next.run(req).await;
-            }
-        }
+    if request_has_valid_api_key(req.headers(), &configured_key) {
+        return next.run(req).await;
     }
 
     warn!(
@@ -3185,24 +3210,8 @@ async fn require_auth_for_network(
         }
     };
 
-    // Check Authorization: Bearer <key>
-    if let Some(auth_header) = req.headers().get(axum::http::header::AUTHORIZATION) {
-        if let Ok(auth_val) = auth_header.to_str() {
-            if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
-                if bearer_key == configured_key {
-                    return next.run(req).await;
-                }
-            }
-        }
-    }
-
-    // Check X-API-Key: <key>
-    if let Some(api_key_header) = req.headers().get("X-API-Key") {
-        if let Ok(key_val) = api_key_header.to_str() {
-            if key_val == configured_key {
-                return next.run(req).await;
-            }
-        }
+    if request_has_valid_api_key(req.headers(), configured_key) {
+        return next.run(req).await;
     }
 
     let path = req.uri().path();
@@ -3566,6 +3575,17 @@ pub async fn run_serve(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_api_key_matches() {
+        assert!(api_key_matches("secret-key", "secret-key"));
+        assert!(!api_key_matches("secret-key", "secret-keX"));
+        assert!(!api_key_matches("secret", "secret-key")); // different length
+        assert!(!api_key_matches("", "secret-key"));
+        assert!(api_key_matches("", "")); // both empty digests are equal
+                                          // Case-sensitive and exact.
+        assert!(!api_key_matches("Secret-Key", "secret-key"));
+    }
 
     fn state_with_config(config: ReposConfig) -> ServeState {
         // Use a temp file override so reload_if_changed doesn't see the real repos.json
