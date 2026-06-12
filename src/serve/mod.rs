@@ -2880,7 +2880,7 @@ async fn add_repo_handler(
                 return (
                     StatusCode::BAD_REQUEST,
                     axum::response::Json(json!({
-                        "error": format!("Unknown model: '{}'. Use one of: minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm, bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q, jina-code, e5-multilingual, mxbai-large, modernbert-large", model_str),
+                        "error": format!("Unknown model: '{}'. Use one of: {}", model_str, crate::embed::ModelType::valid_short_names()),
                         "status": "error"
                     })),
                 );

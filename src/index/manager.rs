@@ -481,6 +481,31 @@ impl IndexManager {
             return Err(anyhow::anyhow!("No metadata.json found in database"));
         };
 
+        // Resolve the embedding model from the recorded short name. The vectors
+        // produced here MUST match the model recorded in metadata.json — embedding
+        // with a different model (or the hardcoded default) silently corrupts the
+        // index, and for non-384d models produces a dimension mismatch. Fail fast
+        // with a clear error rather than defaulting.
+        let embed_model = ModelType::parse(&model_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown embedding model '{}' in {}. Valid models: {}",
+                model_name,
+                metadata_path.display(),
+                ModelType::valid_short_names()
+            )
+        })?;
+        if embed_model.dimensions() != dimensions {
+            return Err(anyhow::anyhow!(
+                "Metadata inconsistency in {}: model '{}' has {} dimensions but \
+                 metadata records {}. The index is corrupt — re-create it with a \
+                 single consistent model.",
+                metadata_path.display(),
+                model_name,
+                embed_model.dimensions(),
+                dimensions
+            ));
+        }
+
         // Load FileMetaStore
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, &model_name, dimensions)?;
 
@@ -617,6 +642,7 @@ impl IndexManager {
             let files_for_embed = changed_files.clone();
             let embedded_chunks =
                 tokio::task::spawn_blocking(move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
+                    let embed_model = embed_model;
                     let mut chunker = SemanticChunker::new(100, 2000, 10);
                     let mut all_chunks = Vec::new();
 
@@ -633,11 +659,13 @@ impl IndexManager {
                         return Ok(Vec::new());
                     }
 
-                    info!("📦 Embedding {} chunks...", all_chunks.len());
-                    let mut embedding_service = EmbeddingService::with_cache_dir(
-                        ModelType::default(),
-                        Some(cache_dir.as_path()),
-                    )?;
+                    info!(
+                        "📦 Embedding {} chunks with model {}...",
+                        all_chunks.len(),
+                        embed_model.short_name()
+                    );
+                    let mut embedding_service =
+                        EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
                     embedding_service.embed_chunks(all_chunks)
                 })
                 .await

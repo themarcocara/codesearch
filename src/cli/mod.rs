@@ -571,9 +571,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                                 let parsed = ModelType::parse(m);
                                 if parsed.is_none() {
                                     eprintln!("Unknown model: '{}'. Available models:", m);
-                                    eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
-                                    eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
-                                    eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large");
+                                    eprintln!("  {}", ModelType::valid_short_names());
                                     std::process::exit(1);
                                 }
                                 parsed
