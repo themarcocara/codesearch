@@ -603,6 +603,14 @@ impl IndexManager {
             return Ok(());
         }
 
+        // There is work to do. Resolve the embedding model NOW — before any
+        // destructive store mutation below — so that a corrupt index (unknown
+        // model / model-vs-dimension mismatch) fails fast with the index still
+        // intact, rather than deleting stale chunks and then erroring before
+        // re-embedding them. Fail-fast guarantees vectors are always produced
+        // by the model the index was created with (never the hardcoded default).
+        let (embed_model, _dims) = Self::resolve_embed_model(db_path)?;
+
         // Delete chunks for deleted files
         for (file_path, chunk_ids) in &deleted_files {
             if !chunk_ids.is_empty() {
@@ -660,12 +668,6 @@ impl IndexManager {
         // Chunk changed files
         if !changed_files.is_empty() {
             info!("🔄 Processing {} changed files...", changed_files.len());
-
-            // Resolve the embedding model now that we know we must embed. This
-            // fails fast on an unknown model or a model/dimension mismatch, so
-            // vectors are always produced by the model the index was created
-            // with (never the hardcoded default).
-            let (embed_model, _dims) = Self::resolve_embed_model(db_path)?;
 
             // Read + chunk + embed is synchronous, CPU/I/O-heavy work
             // (file reads, tree-sitter parsing, fastembed/ONNX inference that

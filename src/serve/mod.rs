@@ -2461,13 +2461,22 @@ async fn doctor_handler(
         }
     };
 
-    // Reuse the open LMDB handle when available; otherwise open via diagnose().
-    let report = if let Some(stores) = state.get_opened_stores(&alias) {
-        let vs = stores.vector_store.read().await;
-        crate::cli::doctor::diagnose_with_store(&project_path, &vs)
-    } else {
-        crate::cli::doctor::diagnose(&project_path)
-    };
+    // diagnose() walks the repo tree and scans LMDB — synchronous, potentially
+    // slow work. Run it on a blocking thread so it never occupies a tokio worker
+    // (mirrors the reindex path). Reuse the open LMDB handle when available
+    // (via blocking_read inside the blocking task) to avoid double-opening the
+    // env; otherwise diagnose() opens its own read-only handle.
+    let opened = state.get_opened_stores(&alias);
+    let pp = project_path.clone();
+    let report = tokio::task::spawn_blocking(move || match opened {
+        Some(stores) => {
+            let vs = stores.vector_store.blocking_read();
+            crate::cli::doctor::diagnose_with_store(&pp, &vs)
+        }
+        None => crate::cli::doctor::diagnose(&pp),
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("doctor task panicked: {}", e)));
 
     let results = match report {
         Ok(report) => report.render_tui(),
@@ -3581,6 +3590,11 @@ pub async fn run_serve(
             axum::routing::post(reindex_handler),
         )
         .route("/repos/:alias/info", axum::routing::get(info_handler))
+        // /doctor is a POST but is intentionally read-only (diagnostics only, no
+        // --fix path), so like /info and /status it is NOT in require_admin_auth's
+        // management set — reachable without the admin key on localhost, and still
+        // protected by require_auth_for_network on network binds. If doctor ever
+        // gains a mutating mode, add it to `is_management` in require_admin_auth.
         .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(require_admin_auth))
