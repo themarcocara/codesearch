@@ -48,6 +48,13 @@ impl SemanticChunker {
             return self.chunk_markdown(path, content);
         }
 
+        // Jupyter notebooks are chunked by extracting cells from the JSON
+        // structure (no tree-sitter grammar for .ipynb).
+        if language == Language::Jupyter {
+            let chunks = super::jupyter::chunk_jupyter(path, content);
+            return Ok(chunks);
+        }
+
         // 1. Check if we have an extractor for this language
         let extractor = match get_extractor(language) {
             Some(ext) => ext,
