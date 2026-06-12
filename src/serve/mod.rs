@@ -1209,17 +1209,29 @@ impl ServeState {
                 RepoState::Warm { stores } => {
                     return Some(stores.clone());
                 }
-                RepoState::Readonly { .. } => {
-                    // Cannot force-reindex a readonly store; let the caller
-                    // fall through to try_open_stores(allow_create=true)
-                    // which will attempt a write-mode open (and fail with a
-                    // clear error if the write lock is still held).
+                RepoState::Readonly { .. } | RepoState::Conflicted => {
+                    // Cannot force-reindex a readonly or conflicted store.
+                    // Drop the entry from the DashMap so the LMDB TrackedEnv
+                    // is released — the caller will reopen in write mode via
+                    // try_open_stores(allow_create=true).
+                    drop(entry);
+                    self.close_repo(alias);
                     return None;
                 }
-                RepoState::Conflicted => return None,
             }
         }
         None
+    }
+
+    /// Remove a repo from the DashMap, dropping its stores and releasing
+    /// LMDB file handles. Used before force-reindex reopen.
+    fn close_repo(&self, alias: &str) {
+        if self.repos.remove(alias).is_some() {
+            tracing::info!(
+                "Closed repo '{}' (dropped stores, released LMDB handles)",
+                alias
+            );
+        }
     }
 
     /// Spawn the FSW background task for a repo after it has been stopped.
