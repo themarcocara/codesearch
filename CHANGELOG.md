@@ -28,9 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instance via `POST /repos`.
 - **`ServeState::remove_repo()` method**: extracted from `remove_repo_handler`
   for reuse by both the HTTP endpoint and the embedded TUI.
+- **Immediate reindex feedback in the embedded TUI**: pressing `n` now shows a
+  transient footer confirmation (`⟳ Reindex started for '<alias>' …`,
+  `already running`, or a failure notice) instead of silently spawning the
+  background task. The pulsing `⟳ idx…` status label is unchanged.
 
 ### Fixed
 
+- **`500 "an environment is already opened with different options"` on repo
+  reopen**: reopening a database (e.g. the idle reaper dropping a repo while a
+  force-reindex reopens it) could fail with a raw heed error. Two causes fixed:
+  `TrackedEnv::drop` now releases the underlying `heed::Env` *before* freeing its
+  registry slot (closing a drop-order window), and the LMDB `map_size` is now
+  pinned per canonical path for the process lifetime (monotonic, capped at MAX)
+  so every reopen uses a consistent size and never mismatches a still-live env.
 - **FileWatcher missing repo-local `.codesearchignore`**: `build_gitignore()` now
   loads `.codesearchignore` from the repository root alongside the global file.
   Previously only the global file was loaded, causing repo-local ignores to be

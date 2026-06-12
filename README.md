@@ -486,6 +486,7 @@ Tree-sitter AST-aware chunking:
 | C# | `.cs` |
 | Go | `.go` |
 | Java | `.java` |
+| Dart | `.dart` |
 | Shell | `.sh`, `.bash`, `.zsh` |
 | Ruby | `.rb`, `.rake` |
 | PHP | `.php` |
