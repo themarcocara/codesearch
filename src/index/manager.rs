@@ -513,13 +513,30 @@ impl IndexManager {
         info!("🔄 Performing incremental refresh with shared stores...");
         let start = std::time::Instant::now();
 
-        // Resolve the embedding model recorded for this index. Embedding MUST use
-        // the same model the index was created with — see resolve_embed_model.
-        let (embed_model, dimensions) = Self::resolve_embed_model(db_path)?;
-        let model_name = embed_model.short_name();
+        // Read model name + dims (lenient) for the FileMetaStore. The strict,
+        // fail-fast embedding-model resolution happens lazily below, only when
+        // there are actually changed files to embed — a no-op refresh must not
+        // require a resolvable model.
+        let metadata_path = db_path.join("metadata.json");
+        let (model_name, dimensions) = if metadata_path.exists() {
+            let content = std::fs::read_to_string(&metadata_path)?;
+            let json: serde_json::Value = serde_json::from_str(&content)?;
+            let model = json
+                .get("model_short_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("minilm-l6-q")
+                .to_string();
+            let dims = json
+                .get("dimensions")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(384) as usize;
+            (model, dims)
+        } else {
+            return Err(anyhow::anyhow!("No metadata.json found in database"));
+        };
 
         // Load FileMetaStore
-        let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
+        let mut file_meta_store = FileMetaStore::load_or_create(db_path, &model_name, dimensions)?;
 
         // B1 safety guard: if FileMetaStore is empty but VectorStore has chunks,
         // the metadata was lost/reset (model change, corrupt file, etc.).
@@ -643,6 +660,12 @@ impl IndexManager {
         // Chunk changed files
         if !changed_files.is_empty() {
             info!("🔄 Processing {} changed files...", changed_files.len());
+
+            // Resolve the embedding model now that we know we must embed. This
+            // fails fast on an unknown model or a model/dimension mismatch, so
+            // vectors are always produced by the model the index was created
+            // with (never the hardcoded default).
+            let (embed_model, _dims) = Self::resolve_embed_model(db_path)?;
 
             // Read + chunk + embed is synchronous, CPU/I/O-heavy work
             // (file reads, tree-sitter parsing, fastembed/ONNX inference that
