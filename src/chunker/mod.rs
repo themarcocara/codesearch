@@ -8,6 +8,7 @@ mod dedup;
 mod extractor;
 mod fallback;
 mod grammar;
+mod jupyter;
 mod parser;
 mod semantic;
 mod tree_sitter;

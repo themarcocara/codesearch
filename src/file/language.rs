@@ -16,6 +16,7 @@ pub enum Language {
     Php,
     Swift,
     Kotlin,
+    Dart,
     Shell,
     Markdown,
     Json,
@@ -25,6 +26,7 @@ pub enum Language {
     Html,
     Css,
     Xml,
+    Jupyter,
     Unknown,
 }
 
@@ -73,6 +75,7 @@ impl Language {
             "php" => Self::Php,
             "swift" => Self::Swift,
             "kt" | "kts" => Self::Kotlin,
+            "dart" => Self::Dart,
             "sh" | "bash" | "zsh" => Self::Shell,
             "md" | "markdown" | "txt" => Self::Markdown, // Treat txt as markdown-like
             "json" => Self::Json,
@@ -82,6 +85,7 @@ impl Language {
             "html" | "htm" => Self::Html,
             "css" | "scss" | "sass" | "less" => Self::Css,
             "xml" | "csproj" | "props" | "targets" | "resx" | "config" => Self::Xml,
+            "ipynb" => Self::Jupyter,
             _ => Self::Unknown,
         }
     }
@@ -100,6 +104,8 @@ impl Language {
                 | Self::CSharp
                 | Self::Go
                 | Self::Java
+                | Self::Kotlin
+                | Self::Dart
                 | Self::Shell
                 | Self::Ruby
                 | Self::Php
@@ -130,6 +136,7 @@ impl Language {
             Self::Php => "PHP",
             Self::Swift => "Swift",
             Self::Kotlin => "Kotlin",
+            Self::Dart => "Dart",
             Self::Shell => "Shell",
             Self::Markdown => "Markdown",
             Self::Json => "JSON",
@@ -139,6 +146,7 @@ impl Language {
             Self::Html => "HTML",
             Self::Css => "CSS",
             Self::Xml => "XML",
+            Self::Jupyter => "Jupyter",
             Self::Unknown => "Unknown",
         }
     }
@@ -172,6 +180,21 @@ mod tests {
     }
 
     #[test]
+    fn test_shell_detection() {
+        assert_eq!(Language::from_extension("sh"), Language::Shell);
+        assert_eq!(Language::from_extension("bash"), Language::Shell);
+        assert_eq!(Language::from_extension("zsh"), Language::Shell);
+        assert_eq!(
+            Language::from_path(&PathBuf::from("scripts/deploy.sh")),
+            Language::Shell
+        );
+        // Extensionless shell filenames
+        assert_eq!(Language::from_filename("Dockerfile"), Language::Shell);
+        assert_eq!(Language::from_filename("Makefile"), Language::Shell);
+        assert_eq!(Language::from_filename(".env"), Language::Shell);
+    }
+
+    #[test]
     fn test_tree_sitter_support() {
         assert!(Language::Rust.supports_tree_sitter());
         assert!(Language::Python.supports_tree_sitter());
@@ -187,5 +210,22 @@ mod tests {
         assert!(Language::Rust.is_indexable());
         assert!(Language::Markdown.is_indexable());
         assert!(!Language::Unknown.is_indexable());
+    }
+
+    #[test]
+    fn test_jupyter_detection() {
+        assert_eq!(Language::from_extension("ipynb"), Language::Jupyter);
+        assert_eq!(
+            Language::from_path(&PathBuf::from("analysis.ipynb")),
+            Language::Jupyter
+        );
+        assert!(
+            Language::Jupyter.is_indexable(),
+            "Jupyter should be indexable"
+        );
+        assert!(
+            !Language::Jupyter.supports_tree_sitter(),
+            "Jupyter should NOT support tree-sitter (uses custom JSON extraction)"
+        );
     }
 }

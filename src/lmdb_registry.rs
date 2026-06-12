@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -73,7 +74,10 @@ fn unregister(canonical: &Path) {
 /// Implements `Deref<Target = heed::Env>` so all existing `env.method()` calls
 /// work without changes.
 pub struct TrackedEnv {
-    inner: heed::Env,
+    /// Wrapped in `ManuallyDrop` so [`Drop`] can release the underlying
+    /// `heed::Env` BEFORE freeing our own registry slot. See the `Drop` impl
+    /// for why the ordering is load-bearing.
+    inner: ManuallyDrop<heed::Env>,
     canonical: PathBuf,
 }
 
@@ -92,7 +96,7 @@ impl TrackedEnv {
 
         match opts.open(path) {
             Ok(env) => Ok(Self {
-                inner: env,
+                inner: ManuallyDrop::new(env),
                 canonical,
             }),
             Err(e) => {
@@ -105,6 +109,30 @@ impl TrackedEnv {
 
 impl Drop for TrackedEnv {
     fn drop(&mut self) {
+        // Ordering here is load-bearing. heed maintains its OWN process-global
+        // registry of opened environments (`OPENED_ENV`), keyed by canonical
+        // path, that outlives a `heed::Env` until its last strong ref drops.
+        // If we `unregister()` from our registry FIRST and let the field drop
+        // afterwards (the default Rust drop order: body, then fields), there is
+        // a window where our slot is free but heed's env is still alive. A
+        // concurrent `TrackedEnv::open` on the same path — e.g. the idle reaper
+        // dropping a repo while a reindex/query reopens it — then passes our
+        // `register()` guard and falls through to `opts.open()`, which heed
+        // rejects with the cryptic "an environment is already opened with
+        // different options" (once a prior MDB_MAP_FULL resize left the live
+        // env's recorded map_size differing from the reopen's resolved size).
+        //
+        // Dropping the `heed::Env` BEFORE `unregister()` enforces the invariant
+        // "our slot free ⟹ heed's slot free": a concurrent open either sees our
+        // slot still occupied (clear "double-open prevented" + retry) or sees
+        // both free (clean reopen). It can never observe the inconsistent state
+        // that produces heed's raw error.
+        //
+        // SAFETY: `inner` is dropped exactly once, here, and never accessed
+        // again (the surrounding `TrackedEnv` is being destroyed).
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner);
+        }
         unregister(&self.canonical);
     }
 }
@@ -132,8 +160,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_opts() -> heed::EnvOpenOptions {
+        make_opts_sized(1024 * 1024)
+    }
+
+    fn make_opts_sized(map_size: usize) -> heed::EnvOpenOptions {
         let mut opts = heed::EnvOpenOptions::new();
-        opts.map_size(1024 * 1024).max_dbs(1);
+        opts.map_size(map_size).max_dbs(1);
         opts
     }
 
@@ -177,5 +209,66 @@ mod tests {
 
         let _env1 = unsafe { TrackedEnv::open(&opts, dir1.path(), "test-1").unwrap() };
         let _env2 = unsafe { TrackedEnv::open(&opts, dir2.path(), "test-2").unwrap() };
+    }
+
+    /// Regression guard for the concurrent open→drop→reopen path that produced
+    /// the production 500 ("an environment is already opened with different
+    /// options").
+    ///
+    /// Contract: every open of a given path within the process MUST use the
+    /// same `map_size` (the store layer enforces this via its process-global
+    /// per-path map-size pin — see `vectordb::store::resolve_map_size`). heed
+    /// rejects a reopen whose recorded options differ from a still-live env, and
+    /// because heed defers env close, a reopen can briefly observe the prior
+    /// env; the `TrackedEnv` `Drop` reorder (drop the heed env before freeing
+    /// our slot) narrows that window but the consistent-size contract is what
+    /// makes it fully safe — matching options mean heed reuses/reopens cleanly
+    /// instead of erroring.
+    ///
+    /// This test churns open→drop→reopen on a single shared path from many
+    /// threads (behind a barrier to maximize overlap), all using the SAME size,
+    /// and asserts the forbidden heed string NEVER appears. Our own "double-open
+    /// prevented" error IS allowed (it means `register()` serialized the race).
+    /// The assertion can only fail on a real regression — never flaky.
+    #[test]
+    fn test_concurrent_reopen_same_size_never_conflicts() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 4000;
+        const MAP_SIZE: usize = 1024 * 1024;
+
+        let dir = TempDir::new().unwrap();
+        let path: Arc<std::path::PathBuf> = Arc::new(dir.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ITERS {
+                        let opts = make_opts_sized(MAP_SIZE);
+                        match unsafe { TrackedEnv::open(&opts, &path, "race") } {
+                            Ok(env) => drop(env),
+                            Err(e) => {
+                                let msg = e.to_string();
+                                assert!(
+                                    !msg.contains("already opened with different options"),
+                                    "heed slot leaked past our registry slot: {msg}"
+                                );
+                                // "double-open prevented" is the expected,
+                                // benign outcome of a serialized race.
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in threads {
+            h.join().unwrap();
+        }
     }
 }

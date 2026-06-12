@@ -151,7 +151,6 @@ impl ModelType {
     }
 
     /// List all available models
-    #[allow(dead_code)] // Reserved for model listing command
     pub fn all() -> &'static [ModelType] {
         &[
             Self::AllMiniLML6V2,
@@ -171,6 +170,19 @@ impl ModelType {
             Self::MxbaiEmbedLargeV1,
             Self::ModernBertEmbedLarge,
         ]
+    }
+
+    /// Comma-separated list of all valid model short names.
+    ///
+    /// Single source of truth for the "valid models" message shown by the CLI
+    /// (`index add --model`) and the serve `POST /repos` error path, so the two
+    /// can never drift from the set `parse()` actually accepts.
+    pub fn valid_short_names() -> String {
+        Self::all()
+            .iter()
+            .map(|m| m.short_name())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Parse model from string (for CLI)
@@ -375,6 +387,38 @@ mod tests {
     fn test_all_models() {
         let all = ModelType::all();
         assert_eq!(all.len(), 16);
+    }
+
+    #[test]
+    fn test_short_name_round_trips_through_parse() {
+        // Every model advertised by all() must parse back from its short_name.
+        // This guards the C1/M6 fix: the embedding path resolves the model from
+        // the short name stored in metadata.json, and the CLI/serve error lists
+        // are derived from valid_short_names() — a model whose short_name does
+        // not parse would silently break indexing or produce a wrong error list.
+        for m in ModelType::all() {
+            assert_eq!(
+                ModelType::parse(m.short_name()),
+                Some(*m),
+                "short_name '{}' did not round-trip through parse()",
+                m.short_name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_short_names_lists_every_model() {
+        let listed = ModelType::valid_short_names();
+        for m in ModelType::all() {
+            assert!(
+                listed.split(", ").any(|s| s == m.short_name()),
+                "valid_short_names() is missing '{}'",
+                m.short_name()
+            );
+        }
+        // Regression for the original bug: bge-large was accepted by parse()
+        // but omitted from the hand-maintained error lists.
+        assert!(listed.contains("bge-large"));
     }
 
     #[test]

@@ -11,7 +11,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::cache::normalize_path;
-use crate::constants::{ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS, ALWAYS_SKIP_FILENAME_SUFFIXES};
+use crate::constants::{
+    global_codesearchignore_path, ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS,
+    ALWAYS_SKIP_FILENAME_SUFFIXES,
+};
 use crate::file::Language;
 
 /// Normalize a path from notify events to a consistent format.
@@ -82,15 +85,57 @@ impl FileWatcher {
         }
     }
 
-    /// Build a `Gitignore` matcher from the repo root's `.gitignore` and
-    /// `.git/info/exclude`. Returns `None` if neither file exists.
+    /// Resolve the actual `.git` directory for a repo root.
+    ///
+    /// For regular repos, `.git` is a directory and we return `root/.git`.
+    /// For git worktrees, `.git` is a file containing `gitdir: <path>`,
+    /// so we parse and resolve that path.
+    fn resolve_git_dir(root: &Path) -> PathBuf {
+        let dot_git = root.join(".git");
+        if dot_git.is_dir() {
+            return dot_git;
+        }
+        // Worktree: .git is a file with "gitdir: <path>" on the first line
+        if dot_git.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&dot_git) {
+                if let Some(line) = content.lines().next() {
+                    if let Some(path_str) = line.strip_prefix("gitdir: ") {
+                        let resolved = root.join(path_str.trim());
+                        // Normalize the path
+                        if resolved.exists() {
+                            return resolved;
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: return the default path even if it doesn't exist
+        dot_git
+    }
+
+    /// Build a `Gitignore` matcher from the repo root's `.gitignore`,
+    /// `.git/info/exclude`, repo-local `.codesearchignore`, and the global
+    /// `~/.codesearch/.codesearchignore`. Returns `None` if no file exists.
     fn build_gitignore(root: &Path) -> Option<Gitignore> {
         let mut builder = GitignoreBuilder::new(root);
 
         let mut added_any = false;
 
-        // Add .git/info/exclude if present
-        let exclude_path = root.join(".git").join("info").join("exclude");
+        // Add global ~/.codesearch/.codesearchignore (lowest precedence)
+        if let Some(global_path) = global_codesearchignore_path() {
+            if global_path.exists() {
+                if let Some(e) = builder.add(&global_path) {
+                    tracing::debug!("Failed to add global codesearchignore: {}", e);
+                } else {
+                    tracing::debug!("Loaded global codesearchignore: {}", global_path.display());
+                    added_any = true;
+                }
+            }
+        }
+
+        // Add .git/info/exclude if present (resolves worktree .git files)
+        let git_dir = Self::resolve_git_dir(root);
+        let exclude_path = git_dir.join("info").join("exclude");
         if exclude_path.exists() {
             if let Some(e) = builder.add(&exclude_path) {
                 tracing::debug!("Failed to add .git/info/exclude: {}", e);
@@ -109,13 +154,24 @@ impl FileWatcher {
             }
         }
 
+        // Add repo-local .codesearchignore if present (highest precedence)
+        let codesearchignore_path = root.join(".codesearchignore");
+        if codesearchignore_path.exists() {
+            if let Some(e) = builder.add(&codesearchignore_path) {
+                tracing::debug!("Failed to add .codesearchignore: {}", e);
+            } else {
+                tracing::debug!("Loaded .codesearchignore for {}", root.display());
+                added_any = true;
+            }
+        }
+
         if !added_any {
             return None;
         }
 
         match builder.build() {
             Ok(gi) => {
-                tracing::debug!("Loaded .gitignore rules for {}", root.display());
+                tracing::debug!("Loaded ignore rules for {}", root.display());
                 Some(gi)
             }
             Err(e) => {
@@ -662,6 +718,72 @@ mod tests {
         let events = watcher.poll_events();
 
         assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn test_codesearchignore_loaded_and_respected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Create repo-local .codesearchignore excluding tests/
+        fs::write(root.join(".codesearchignore"), "tests/\n").unwrap();
+
+        let watcher = FileWatcher::new(root.to_path_buf());
+        assert!(
+            watcher.gitignore.is_some(),
+            "Should have loaded .codesearchignore"
+        );
+
+        assert!(
+            !watcher.is_watchable(&root.join("tests/test_foo.rs")),
+            "tests/ should be ignored by .codesearchignore"
+        );
+        assert!(
+            watcher.is_watchable(&root.join("src/main.rs")),
+            "src/main.rs should be watchable"
+        );
+    }
+
+    #[test]
+    fn test_codesearchignore_overrides_gitignore() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Scenario: .gitignore excludes logs/ but .codesearchignore excludes src/generated/.
+        // Both files are loaded — each contributes its own patterns to the matcher.
+        fs::write(root.join(".gitignore"), "logs/\n").unwrap();
+        fs::write(root.join(".codesearchignore"), "src/generated/\n").unwrap();
+
+        let watcher = FileWatcher::new(root.to_path_buf());
+        assert!(watcher.gitignore.is_some());
+
+        // .gitignore pattern takes effect
+        assert!(
+            !watcher.is_watchable(&root.join("logs/debug.log")),
+            "logs/ should be ignored by .gitignore"
+        );
+        // .codesearchignore pattern takes effect
+        assert!(
+            !watcher.is_watchable(&root.join("src/generated/types.rs")),
+            "src/generated/ should be ignored by .codesearchignore"
+        );
+        // Non-ignored file still watchable
+        assert!(
+            watcher.is_watchable(&root.join("src/main.rs")),
+            "src/main.rs should be watchable"
+        );
+    }
+
+    #[test]
+    fn test_no_ignore_files_returns_none() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let watcher = FileWatcher::new(root.to_path_buf());
+        assert!(
+            watcher.gitignore.is_none(),
+            "Should have no gitignore matcher when no ignore files exist"
+        );
     }
 
     #[tokio::test]

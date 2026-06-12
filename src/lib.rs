@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod cache;
 pub mod chunker;
+pub mod cli;
 pub mod constants;
 pub mod db_discovery;
 pub mod embed;
