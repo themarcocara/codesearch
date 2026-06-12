@@ -1095,11 +1095,16 @@ impl LanguageExtractor for DartExtractor {
     fn classify(&self, node: Node) -> ChunkKind {
         match node.kind() {
             "function_declaration" => {
+                // A function_declaration nested in a type-member body is a method.
+                // Dart's grammar uses `class_body` for the body of classes, mixins
+                // AND (via the shared body rule) the member list, so mixin/class
+                // methods both land here. `mixin_application` (the `with A, B`
+                // superclass clause) is NOT a member body and never parents a
+                // function_declaration, so it is intentionally not listed.
                 if let Some(parent) = node.parent() {
                     if parent.kind() == "class_body"
                         || parent.kind() == "enum_body"
                         || parent.kind() == "extension_body"
-                        || parent.kind() == "mixin_application"
                     {
                         return ChunkKind::Method;
                     }

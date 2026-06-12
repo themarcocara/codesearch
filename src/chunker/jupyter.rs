@@ -4,6 +4,19 @@
 //! individually searchable chunks.  Adjacent cells of the same type are
 //! merged when their combined line count stays under 50 lines, keeping
 //! the index compact without losing granularity.
+//!
+//! CAVEAT — line numbers are synthetic. `start_line`/`end_line` on the
+//! emitted chunks are a running cursor over *cell content lines*, NOT the
+//! real line/byte offset of the cell inside the `.ipynb` JSON (where each
+//! cell's source is an array element surrounded by metadata/outputs). They
+//! are display/ordering metadata only. Any feature that needs to map a chunk
+//! back to a precise position in the raw `.ipynb` (jump-to-line, snippet
+//! re-extraction, symbol references) must NOT trust these numbers — it would
+//! have to compute the real JSON offsets during parsing.
+//!
+//! NOTE — all code cells are labelled generically (kernel language is not read
+//! from `metadata.kernelspec`); search relevance for non-Python notebooks may
+//! be slightly degraded. Follow-up if multi-kernel notebooks become common.
 
 use super::{Chunk, ChunkKind};
 use crate::cache::normalize_path;
@@ -110,11 +123,11 @@ fn extract_cell(cell: &Value) -> Option<RawCell> {
         return None;
     };
 
-    let line_count = if content.is_empty() {
-        0
-    } else {
-        content.lines().count().max(1)
-    };
+    // Normalize to at least 1 line even for an empty cell, so the two passes
+    // in merge_adjacent_cells (line numbering and merge accumulation) always
+    // agree on a cell's width. (Previously empty cells stored 0, which the
+    // numbering pass counted as 1 but the merge accumulator counted as 0.)
+    let line_count = content.lines().count().max(1);
 
     Some(RawCell {
         cell_type,
@@ -136,12 +149,9 @@ fn merge_adjacent_cells(cells: &[RawCell]) -> Vec<CellGroup> {
     let mut cursor = 0usize;
     for cell in cells {
         let start = cursor;
-        let lines = if cell.line_count == 0 {
-            1
-        } else {
-            cell.line_count
-        };
-        cursor += lines;
+        // line_count is normalized to >= 1 in extract_cell, so the numbering
+        // pass and the merge accumulator below use the identical width.
+        cursor += cell.line_count;
         numbered.push((start, cursor, cell));
     }
 
