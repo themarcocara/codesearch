@@ -1209,17 +1209,29 @@ impl ServeState {
                 RepoState::Warm { stores } => {
                     return Some(stores.clone());
                 }
-                RepoState::Readonly { .. } => {
-                    // Cannot force-reindex a readonly store; let the caller
-                    // fall through to try_open_stores(allow_create=true)
-                    // which will attempt a write-mode open (and fail with a
-                    // clear error if the write lock is still held).
+                RepoState::Readonly { .. } | RepoState::Conflicted => {
+                    // Cannot force-reindex a readonly or conflicted store.
+                    // Drop the entry from the DashMap so the LMDB TrackedEnv
+                    // is released — the caller will reopen in write mode via
+                    // try_open_stores(allow_create=true).
+                    drop(entry);
+                    self.close_repo(alias);
                     return None;
                 }
-                RepoState::Conflicted => return None,
             }
         }
         None
+    }
+
+    /// Remove a repo from the DashMap, dropping its stores and releasing
+    /// LMDB file handles. Used before force-reindex reopen.
+    fn close_repo(&self, alias: &str) {
+        if self.repos.remove(alias).is_some() {
+            tracing::info!(
+                "Closed repo '{}' (dropped stores, released LMDB handles)",
+                alias
+            );
+        }
     }
 
     /// Spawn the FSW background task for a repo after it has been stopped.
@@ -2282,6 +2294,7 @@ async fn status_handler(
                 "last_tool_call": info.last_tool_call,
                 "tool_call_count": info.tool_call_count,
                 "csharp_index": csharp_str,
+                "csharp_error": info.csharp_error,
             })
         })
         .collect();
@@ -2340,6 +2353,153 @@ async fn status_handler(
         "csharp_helper": csharp_helper,
         "uptime_secs": uptime_secs,
     }))
+}
+
+/// Info handler: GET /repos/{alias}/info
+///
+/// Returns live index stats for a single repo, mirroring the TUI info overlay
+/// (`tui::build_info_overlay`). Used by the remote TUI's `i` key.
+async fn info_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let config = state.config_snapshot();
+    let project_path = match config.resolve(&alias) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                AxumJson(json!({
+                    "error": format!("unknown repo alias: {}", alias),
+                    "status": "error",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let db_path = project_path.join(DB_DIR_NAME);
+
+    // Defaults (overridden by metadata.json then live store stats).
+    let mut chunks = 0usize;
+    let mut files = 0usize;
+    let mut max_chunk_id = 0u32;
+    let mut dims = 0usize;
+    let mut model = String::from("unknown");
+    let mut lock = String::from("—");
+    let mut index_age = String::from("—");
+
+    // Read model + dims + counts from metadata.json.
+    if let Ok(content) = std::fs::read_to_string(db_path.join("metadata.json")) {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+            model = meta
+                .get("model_short_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            dims = meta.get("dimensions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            chunks = meta
+                .get("total_chunks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            files = meta
+                .get("total_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            if let Some(indexed_at) = meta.get("indexed_at").and_then(|v| v.as_str()) {
+                index_age = tui::format_age(indexed_at);
+            }
+        }
+    }
+
+    // If stores are open, live stats override metadata.
+    if let Some(stores) = state.get_opened_stores(&alias) {
+        if let Ok(vs) = stores.vector_store.try_read() {
+            if let Ok(live_stats) = vs.stats() {
+                chunks = live_stats.total_chunks;
+                files = live_stats.total_files;
+                max_chunk_id = live_stats.max_chunk_id;
+                if dims == 0 {
+                    dims = live_stats.dimensions;
+                }
+            }
+        }
+        lock = if stores.readonly {
+            "read".to_string()
+        } else {
+            "write".to_string()
+        };
+    }
+
+    let db_size_human = tui::dir_size_human(&db_path);
+
+    AxumJson(json!({
+        "chunks": chunks,
+        "files": files,
+        "max_chunk_id": max_chunk_id,
+        "db_size_human": db_size_human,
+        "model": model,
+        "dims": dims,
+        "lock": lock,
+        "index_age": index_age,
+    }))
+    .into_response()
+}
+
+/// Doctor handler: POST /repos/{alias}/doctor
+///
+/// Runs doctor diagnostics for a single repo and returns the rendered TUI lines.
+/// Reuses the open LMDB handle via `diagnose_with_store` when stores are open,
+/// to avoid double-opening the environment. Used by the remote TUI's `d` key.
+async fn doctor_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let config = state.config_snapshot();
+    let project_path = match config.resolve(&alias) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                AxumJson(json!({
+                    "error": format!("unknown repo alias: {}", alias),
+                    "status": "error",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // diagnose() walks the repo tree and scans LMDB — synchronous, potentially
+    // slow work. Run it on a blocking thread so it never occupies a tokio worker
+    // (mirrors the reindex path). Reuse the open LMDB handle when available
+    // (via blocking_read inside the blocking task) to avoid double-opening the
+    // env; otherwise diagnose() opens its own read-only handle.
+    let opened = state.get_opened_stores(&alias);
+    let pp = project_path.clone();
+    let report = tokio::task::spawn_blocking(move || match opened {
+        Some(stores) => {
+            let vs = stores.vector_store.blocking_read();
+            crate::cli::doctor::diagnose_with_store(&pp, &vs)
+        }
+        None => crate::cli::doctor::diagnose(&pp),
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("doctor task panicked: {}", e)));
+
+    let results = match report {
+        Ok(report) => report.render_tui(),
+        Err(e) => vec![
+            format!("✗ Doctor failed: {}", e),
+            String::new(),
+            "  [Esc] close".to_string(),
+        ],
+    };
+
+    AxumJson(json!({ "results": results })).into_response()
 }
 
 /// Trigger a symbol index rebuild for a repo (C# etc.).
@@ -2880,7 +3040,7 @@ async fn add_repo_handler(
                 return (
                     StatusCode::BAD_REQUEST,
                     axum::response::Json(json!({
-                        "error": format!("Unknown model: '{}'. Use one of: minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm, bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q, jina-code, e5-multilingual, mxbai-large, modernbert-large", model_str),
+                        "error": format!("Unknown model: '{}'. Use one of: {}", model_str, crate::embed::ModelType::valid_short_names()),
                         "status": "error"
                     })),
                 );
@@ -3075,6 +3235,48 @@ fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Res
     }
 }
 
+/// Constant-time API key comparison.
+///
+/// Hashes both the supplied candidate and the configured key with SHA-256 and
+/// compares the fixed-length 32-byte digests byte-for-byte without early exit.
+/// Because the digests are always the same length and SHA-256 is
+/// preimage-resistant, the comparison time does not depend on how many leading
+/// bytes of the candidate match the secret — closing the timing side-channel
+/// that a raw `==` on the key strings would open on the network-exposed path.
+fn api_key_matches(candidate: &str, configured: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let candidate_digest = Sha256::digest(candidate.as_bytes());
+    let configured_digest = Sha256::digest(configured.as_bytes());
+    let mut diff: u8 = 0;
+    for (a, b) in candidate_digest.iter().zip(configured_digest.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Returns true if the request carries a valid API key in either the
+/// `Authorization: Bearer <key>` or `X-API-Key: <key>` header, compared in
+/// constant time against `configured`. Shared by both auth middlewares so the
+/// constant-time guarantee lives in exactly one place.
+fn request_has_valid_api_key(headers: &axum::http::HeaderMap, configured: &str) -> bool {
+    if let Some(auth_val) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
+            if api_key_matches(bearer_key, configured) {
+                return true;
+            }
+        }
+    }
+    if let Some(key_val) = headers.get("X-API-Key").and_then(|v| v.to_str().ok()) {
+        if api_key_matches(key_val, configured) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Axum middleware that requires API key authentication for management endpoints.
 ///
 /// When `CODESEARCH_SERVE_API_KEY` is set, requests must include the key in either:
@@ -3087,8 +3289,7 @@ fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Res
 /// `POST /repos/:alias/reindex`, `POST /reload`.
 /// All other routes (health, status, MCP) are always unauthenticated.
 ///
-/// Note: key comparison uses standard string equality, not constant-time comparison.
-/// Timing attacks are impractical on a localhost-only service.
+/// Key comparison is constant-time (see `api_key_matches`).
 async fn require_admin_auth(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -3110,24 +3311,8 @@ async fn require_admin_auth(
         _ => return next.run(req).await,
     };
 
-    // Check Authorization: Bearer <key>
-    if let Some(auth_header) = req.headers().get(axum::http::header::AUTHORIZATION) {
-        if let Ok(auth_val) = auth_header.to_str() {
-            if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
-                if bearer_key == configured_key {
-                    return next.run(req).await;
-                }
-            }
-        }
-    }
-
-    // Check X-API-Key: <key>
-    if let Some(api_key_header) = req.headers().get("X-API-Key") {
-        if let Ok(key_val) = api_key_header.to_str() {
-            if key_val == configured_key {
-                return next.run(req).await;
-            }
-        }
+    if request_has_valid_api_key(req.headers(), &configured_key) {
+        return next.run(req).await;
     }
 
     warn!(
@@ -3185,24 +3370,8 @@ async fn require_auth_for_network(
         }
     };
 
-    // Check Authorization: Bearer <key>
-    if let Some(auth_header) = req.headers().get(axum::http::header::AUTHORIZATION) {
-        if let Ok(auth_val) = auth_header.to_str() {
-            if let Some(bearer_key) = auth_val.strip_prefix("Bearer ") {
-                if bearer_key == configured_key {
-                    return next.run(req).await;
-                }
-            }
-        }
-    }
-
-    // Check X-API-Key: <key>
-    if let Some(api_key_header) = req.headers().get("X-API-Key") {
-        if let Ok(key_val) = api_key_header.to_str() {
-            if key_val == configured_key {
-                return next.run(req).await;
-            }
-        }
+    if request_has_valid_api_key(req.headers(), configured_key) {
+        return next.run(req).await;
     }
 
     let path = req.uri().path();
@@ -3432,6 +3601,13 @@ pub async fn run_serve(
             "/repos/:alias/reindex",
             axum::routing::post(reindex_handler),
         )
+        .route("/repos/:alias/info", axum::routing::get(info_handler))
+        // /doctor is a POST but is intentionally read-only (diagnostics only, no
+        // --fix path), so like /info and /status it is NOT in require_admin_auth's
+        // management set — reachable without the admin key on localhost, and still
+        // protected by require_auth_for_network on network binds. If doctor ever
+        // gains a mutating mode, add it to `is_management` in require_admin_auth.
+        .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))
@@ -3566,6 +3742,17 @@ pub async fn run_serve(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_api_key_matches() {
+        assert!(api_key_matches("secret-key", "secret-key"));
+        assert!(!api_key_matches("secret-key", "secret-keX"));
+        assert!(!api_key_matches("secret", "secret-key")); // different length
+        assert!(!api_key_matches("", "secret-key"));
+        assert!(api_key_matches("", "")); // both empty digests are equal
+                                          // Case-sensitive and exact.
+        assert!(!api_key_matches("Secret-Key", "secret-key"));
+    }
 
     fn state_with_config(config: ReposConfig) -> ServeState {
         // Use a temp file override so reload_if_changed doesn't see the real repos.json
@@ -4004,6 +4191,89 @@ mod tests {
         assert!(
             body.get("status").is_some(),
             "expected JSON with 'status' field, got: {}",
+            body
+        );
+    }
+
+    /// Verify that the /repos/:alias/info and /repos/:alias/doctor routes are
+    /// registered and reachable. Starts a real axum server on a random port and
+    /// asserts that an unknown alias yields our handler's 404 (not axum's 404).
+    #[tokio::test]
+    async fn info_doctor_routes_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("myrepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+
+        let state = Arc::new(ServeState::new(config, Some(config_file)));
+
+        let app = axum::Router::new()
+            .route(
+                crate::constants::HEALTH_PATH,
+                axum::routing::get(health_handler),
+            )
+            .route("/repos/:alias/info", axum::routing::get(info_handler))
+            .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // GET unknown alias info → 404 from our handler (not axum's built-in 404)
+        let resp = client
+            .get(format!("http://{}/repos/unknown/info", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "expected 404 from info handler"
+        );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("info handler should return JSON body for 404");
+        assert!(
+            body.get("error").is_some(),
+            "expected JSON error body from info handler, got: {}",
+            body
+        );
+
+        // POST unknown alias doctor → 404 from our handler (not axum's built-in 404)
+        let resp = client
+            .post(format!("http://{}/repos/unknown/doctor", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "expected 404 from doctor handler"
+        );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("doctor handler should return JSON body for 404");
+        assert!(
+            body.get("error").is_some(),
+            "expected JSON error body from doctor handler, got: {}",
             body
         );
     }

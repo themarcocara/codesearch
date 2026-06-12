@@ -1016,6 +1016,58 @@ class Calculator:
     }
 
     #[test]
+    fn test_dart_semantic_chunking() {
+        let mut chunker = SemanticChunker::new(100, 2000, 10);
+        let content = r#"
+int topLevel() => 1;
+
+class Greeter {
+  String greet() => "hi";
+}
+
+mixin Walker {
+  void walk() {}
+}
+"#;
+        let chunks = chunker
+            .chunk_semantic(Language::Dart, Path::new("a.dart"), content)
+            .unwrap();
+        assert!(!chunks.is_empty());
+
+        // A chunk with the given text and exact kind must exist. (We use `any`
+        // rather than `find` because the enclosing class/mixin chunk also
+        // contains its members' text — we want the member-level chunk.)
+        let has_kind = |needle: &str, kind: ChunkKind| {
+            chunks
+                .iter()
+                .any(|c| c.content.contains(needle) && c.kind == kind)
+        };
+        // Top-level function → Function; class & mixin members → Method.
+        assert!(has_kind("int topLevel", ChunkKind::Function));
+        assert!(has_kind("String greet", ChunkKind::Method));
+        // Regression for the mixin_application misclassification: mixin members
+        // must be Method (their parent is class_body, not mixin_application).
+        assert!(has_kind("void walk", ChunkKind::Method));
+    }
+
+    #[test]
+    fn test_dart_unparseable_still_chunks() {
+        // A .dart file that is not valid Dart must still yield fallback chunks
+        // rather than producing nothing (grammar-failure resilience).
+        let mut chunker = SemanticChunker::new(100, 2000, 10);
+        let content = "@@@ not valid dart @@@\n{{{ ][ )(\nlorem ipsum dolor sit amet\n";
+        let chunks = chunker
+            .chunk_semantic(Language::Dart, Path::new("broken.dart"), content)
+            .unwrap();
+        assert!(
+            !chunks.is_empty(),
+            "unparseable Dart should still produce fallback chunks"
+        );
+        let joined: String = chunks.iter().map(|c| c.content.clone()).collect();
+        assert!(joined.contains("lorem ipsum"));
+    }
+
+    #[test]
     fn test_gap_tracking() {
         let content = "line 0\nline 1\nline 2\nline 3\nline 4";
         let mut tracker = GapTracker::new(content);

@@ -14,7 +14,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::Terminal;
 
 use crossterm::event::{self, Event, KeyEventKind};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{self, EnterAlternateScreen};
 
 use tokio_util::sync::CancellationToken;
 
@@ -54,7 +54,7 @@ pub async fn run_tui(
     let result = run_tui_loop(&mut terminal, state, cancel_token, &serve_url).await;
 
     // Always restore terminal, even on error
-    restore_terminal(&mut terminal)?;
+    tui_common::restore_terminal(&mut terminal)?;
 
     result
 }
@@ -77,6 +77,11 @@ async fn run_tui_loop(
 
     // Optional modal overlay (dismissed by Esc)
     let mut overlay: Option<OverlayState> = None;
+
+    // Transient footer flash (action confirmations like "reindex started").
+    // Auto-clears after FLASH_TTL so it never sticks.
+    let mut flash: Option<(String, std::time::Instant)> = None;
+    const FLASH_TTL: Duration = Duration::from_secs(4);
 
     // Channel to receive doctor results from background task. The payload is
     // tagged with a request generation so a late result from a request the
@@ -110,6 +115,15 @@ async fn run_tui_loop(
             .map(|i| i.is_available())
             .unwrap_or(false);
 
+        // Expire a stale flash, then borrow the live message (if any) for render.
+        if flash
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= FLASH_TTL)
+        {
+            flash = None;
+        }
+        let flash_msg = flash.as_ref().map(|(msg, _)| msg.as_str());
+
         terminal.draw(|f| {
             let size = f.area();
             let chunks = Layout::vertical([
@@ -131,6 +145,7 @@ async fn run_tui_loop(
                 active,
                 &cpu,
                 csharp_helper,
+                flash_msg,
             );
 
             // Render overlay on top of everything if active
@@ -187,7 +202,7 @@ async fn run_tui_loop(
                 }
                 match tui_common::handle_key(key, &mut table_state, rows.len()) {
                     KeyAction::Reload => {
-                        // 's' pressed — force reload of repos config
+                        // 'l' pressed — force reload of repos config
                         // Clear mtime so reload_if_changed actually reloads
                         if let Ok(mut mtime_guard) = state.config_mtime.write() {
                             *mtime_guard = None;
@@ -216,7 +231,18 @@ async fn run_tui_loop(
                     KeyAction::ForceReindex(idx) => {
                         if idx < repos.len() {
                             let alias = repos[idx].0.clone();
-                            spawn_force_reindex(alias, &state);
+                            let msg = match spawn_force_reindex(alias.clone(), &state) {
+                                ReindexLaunch::Started => {
+                                    format!("⟳ Reindex started for '{alias}' …")
+                                }
+                                ReindexLaunch::AlreadyRunning => {
+                                    format!("⟳ Reindex already running for '{alias}'")
+                                }
+                                ReindexLaunch::Failed => {
+                                    format!("✗ Cannot reindex '{alias}' — see logs")
+                                }
+                            };
+                            flash = Some((msg, std::time::Instant::now()));
                         }
                     }
                     KeyAction::RequestRemove(idx) => {
@@ -274,7 +300,7 @@ fn map_repo_rows(
                 super::CSharpIndexStatus::Ready => "ready",
                 super::CSharpIndexStatus::Indexing => "indexing",
                 super::CSharpIndexStatus::Error => "error",
-                super::CSharpIndexStatus::None => "",
+                super::CSharpIndexStatus::None => "none",
             }
             .to_string();
 
@@ -303,17 +329,6 @@ fn map_repo_rows(
             }
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Restore helpers
-// ---------------------------------------------------------------------------
-
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    terminal::disable_raw_mode()?;
-    crossterm::execute!(io::stdout(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +459,7 @@ fn build_info_overlay(
 }
 
 /// Format an ISO 8601 timestamp as a human-readable age string.
-fn format_age(iso_ts: &str) -> String {
+pub(crate) fn format_age(iso_ts: &str) -> String {
     let parsed = chrono::DateTime::parse_from_rfc3339(iso_ts).or_else(|_| {
         // Try without timezone (assume UTC)
         chrono::NaiveDateTime::parse_from_str(iso_ts, "%Y-%m-%dT%H:%M:%S%.f")
@@ -478,7 +493,7 @@ fn format_age(iso_ts: &str) -> String {
 }
 
 /// Compute total size of a directory on disk, formatted as human-readable string.
-fn dir_size_human(path: &std::path::Path) -> String {
+pub(crate) fn dir_size_human(path: &std::path::Path) -> String {
     let total_bytes = walkdir_size(path);
     if total_bytes == 0 {
         return "—".to_string();
@@ -590,16 +605,28 @@ fn spawn_doctor(
 // Force reindex (non-blocking spawn)
 // ---------------------------------------------------------------------------
 
+/// Outcome of a TUI force-reindex launch — used to drive immediate footer
+/// feedback. Only describes whether the background task *started*; the actual
+/// indexing result is reported later via the status column / logs.
+enum ReindexLaunch {
+    /// Background reindex task spawned successfully.
+    Started,
+    /// A reindex was already running for this alias — request ignored.
+    AlreadyRunning,
+    /// Could not start (config error, unresolved alias, read-only, open error).
+    Failed,
+}
+
 /// Spawn a background force reindex task for the given repo alias.
 /// Follows the same flow as the HTTP `reindex_handler`.
-fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
+fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
     // Guard against concurrent reindex
     if !state.active_reindexes.insert(alias.clone()) {
         tracing::warn!(
             "Force reindex already in progress for '{}', skipping TUI request",
             alias
         );
-        return;
+        return ReindexLaunch::AlreadyRunning;
     }
 
     let config = match state.config.read() {
@@ -607,7 +634,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
         Err(e) => {
             tracing::error!("Config lock poisoned: {}", e);
             state.active_reindexes.remove(&alias);
-            return;
+            return ReindexLaunch::Failed;
         }
     };
     let project_path = match config.resolve(&alias) {
@@ -615,7 +642,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
         None => {
             tracing::error!("Cannot resolve alias '{}' for force reindex", alias);
             state.active_reindexes.remove(&alias);
-            return;
+            return ReindexLaunch::Failed;
         }
     };
     drop(config); // release read lock
@@ -647,12 +674,12 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
                         alias
                     );
                     state.active_reindexes.remove(&alias);
-                    return;
+                    return ReindexLaunch::Failed;
                 }
                 Err(e) => {
                     tracing::error!("Cannot open stores for '{}': {}", alias, e);
                     state.active_reindexes.remove(&alias);
-                    return;
+                    return ReindexLaunch::Failed;
                 }
             }
         }
@@ -682,6 +709,8 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) {
         // Remove guard
         state_bg.active_reindexes.remove(&alias_bg);
     });
+
+    ReindexLaunch::Started
 }
 
 // ---------------------------------------------------------------------------

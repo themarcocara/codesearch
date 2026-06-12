@@ -571,9 +571,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                                 let parsed = ModelType::parse(m);
                                 if parsed.is_none() {
                                     eprintln!("Unknown model: '{}'. Available models:", m);
-                                    eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
-                                    eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
-                                    eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large");
+                                    eprintln!("  {}", ModelType::valid_short_names());
                                     std::process::exit(1);
                                 }
                                 parsed
@@ -972,9 +970,20 @@ SERVE_URL_FILE="$HOME/.codesearch/serve_url"
 if [ -f "$SERVE_URL_FILE" ]; then
     SERVE_URL=$(cat "$SERVE_URL_FILE")
     if [ -n "$SERVE_URL" ]; then
+        # JSON-escape the repo path before embedding it in the request body.
+        # A path containing a double quote or backslash would otherwise break
+        # out of the JSON string literal (malformed body / injection). Use
+        # quoted variables as the search/replace operands so the patterns match
+        # LITERALLY — bare backslash patterns (${v//\\/..}) are unreliable across
+        # bash/msys builds. Escape backslashes first, then double quotes.
+        REPO_PATH="$(pwd)"
+        BS='\'
+        DQ='"'
+        REPO_PATH=${REPO_PATH//"$BS"/"$BS$BS"}
+        REPO_PATH=${REPO_PATH//"$DQ"/"$BS$DQ"}
         curl -s -X POST "$SERVE_URL/repos" \
             -H "Content-Type: application/json" \
-            -d "{\"path\":\"$(pwd)\"}" &>/dev/null &
+            -d "{\"path\":\"$REPO_PATH\"}" &>/dev/null &
     fi
 fi
 "#;
