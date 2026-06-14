@@ -63,6 +63,28 @@ fn unregister(canonical: &Path) {
     }
 }
 
+/// Check whether an LMDB environment at `path` is currently registered as open
+/// in this process — without attempting to open it.
+///
+/// Returns `false` if the registry is uninitialized, the path cannot be
+/// canonicalized, or no live [`TrackedEnv`] holds the canonical path. Returns
+/// `true` if a `TrackedEnv` for the canonical path is currently alive.
+///
+/// Use this to avoid a doomed second [`TrackedEnv::open`] when the path is
+/// known to be held by another component in the same process — e.g. the serve
+/// process holds the embedding cache via `EmbeddingService` while `doctor` runs
+/// in-process via the TUI HTTP handler. Calling `open` anyway would trip the
+/// double-open guard; `is_open` lets the caller fall back to file-based stats.
+pub fn is_open(path: &Path) -> bool {
+    match LMDB_REGISTRY.get() {
+        Some(registry) => match safe_canonicalize(path) {
+            Ok(canonical) => registry.contains_key(&canonical),
+            Err(_) => false,
+        },
+        None => false,
+    }
+}
+
 // ── TrackedEnv wrapper ──────────────────────────────────────────
 
 /// Wrapper around [`heed::Env`] that prevents double-open panics.

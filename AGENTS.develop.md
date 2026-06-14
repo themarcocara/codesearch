@@ -35,6 +35,21 @@ This file contains only architecture, conventions, and changelog.
 
 ---
 
+## ⚠️ Branching & PR workflow (READ FIRST)
+
+This repo uses a **`develop`-based** gitflow. The GitHub default branch is `master` (`origin/HEAD → origin/master`), but `master` is **NOT** the integration branch.
+
+- **Integration branch = `develop`.** All feature/fix/release branches merge into `develop`.
+- **ALL PRs target `develop`** — pass `--base develop` to `gh pr create`, and to `/git pr create` / `/git merge`. NEVER target `master`.
+- **`master`** only receives release merges from `develop` (cut at release time).
+- **Merge style = merge commits** (`--merge`), not squash. Repo history is full of `Merge pull request #N`.
+- **Review requirement** is enforced by a repo ruleset (not branch protection). As repo owner, override with `gh pr merge <n> --merge --admin --delete-branch`.
+- Before creating a PR, **verify the base**: `gh pr view <n> --json baseRefName`. If it says `master`, retarget: `gh pr edit <n> --base develop`.
+
+Common mistake: a subagent runs `/git pr create` with no explicit `--base`, the tooling picks `master` (GitHub default), and the PR lands against the wrong branch. Always specify `--base develop`.
+
+---
+
 ## What codesearch is
 
 A fast, local, offline MCP server for semantic code search. Single Rust binary.
