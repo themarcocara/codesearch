@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.0.208] - 2026-06-14
+
+### Fixed
+
+- **`doctor` in the embedded TUI failed with "LMDB double-open prevented"**:
+  running `doctor` while `serve` held the embedding cache open tried to open a
+  second LMDB environment on the same directory. `check_embedding_cache` now
+  reads live stats from a process-global registry (no env open) when the cache
+  is already open, falls back to on-disk `data.mdb` metadata, and only opens a
+  new environment in the standalone CLI path. Adds `lmdb_registry::is_open`,
+  `PersistentEmbeddingCache::live_stats` / `cache_dir_for` / `file_stats`, and a
+  process-global `LIVE_CACHE_STATS` registry updated on open/put/clear/evict and
+  cleaned up on `Drop`.
+
+### Changed
+
+- Documented the `develop`-based gitflow in `AGENTS.md` and
+  `AGENTS.develop.md`: all PRs target `develop` (`--base develop`), `master`
+  receives release merges only, merge style is merge commits, plus the repo-owner
+  review override. Prevents PRs from defaulting to `master` (the GitHub default
+  branch).
+
 ## [1.0.207] - 2026-06-12
 
 ### Added
