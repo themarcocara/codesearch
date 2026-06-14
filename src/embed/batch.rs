@@ -274,6 +274,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires model — flaky on CI without model cache
     fn test_prepare_text() {
         // Set a temporary cache directory to avoid creating .fastembed_cache in project root
         let temp_dir = std::env::temp_dir().join("codesearch_test_cache");
