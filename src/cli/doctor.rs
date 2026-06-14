@@ -520,7 +520,79 @@ fn format_bytes(bytes: usize) -> String {
 
 /// Check 9: Embedding cache
 fn check_embedding_cache(_db_path: &Path, model_name: &str) -> CheckResult {
-    // PersistentEmbeddingCache::open takes model_name as &str
+    // Resolve the cache directory WITHOUT opening LMDB. This lets us detect the
+    // "not initialised" case and — critically — the "already held open by the
+    // serve process" case without tripping TrackedEnv's double-open guard.
+    // When doctor runs in-process inside `serve` (via the TUI HTTP handler),
+    // the EmbeddingService already holds this LMDB env open; calling
+    // PersistentEmbeddingCache::open unconditionally would fail with
+    // "LMDB double-open prevented".
+    let cache_dir = match PersistentEmbeddingCache::cache_dir_for(model_name) {
+        Ok(p) => p,
+        Err(e) => {
+            return CheckResult::warn(
+                "Embedding cache",
+                format!("Could not resolve cache dir: {}", e),
+            )
+        }
+    };
+
+    if !cache_dir.exists() {
+        return CheckResult::warn(
+            "Embedding cache",
+            "Cache not initialised (created on first embedding)",
+        )
+        .with_hint("Run a search or reindex to populate the cache");
+    }
+
+    // FAST PATH: if an EmbeddingService in this process currently holds the
+    // cache open, it mirrors accurate stats (entry count + size) into a
+    // process-global registry on every write. Read those without touching LMDB.
+    // This is the path taken when doctor runs inside `serve`.
+    if let Some(stats) = PersistentEmbeddingCache::live_stats(model_name) {
+        if stats.entries > 0 {
+            return CheckResult::pass(
+                "Embedding cache",
+                format!(
+                    "{} entries ({}, live)",
+                    stats.entries,
+                    format_bytes(stats.file_size_bytes as usize)
+                ),
+            );
+        } else {
+            return CheckResult::pass(
+                "Embedding cache",
+                format!(
+                    "Cache empty but functional ({} entries, live)",
+                    stats.entries
+                ),
+            );
+        }
+    }
+
+    // DEFENSIVE FALLBACK: the env is registered open (TrackedEnv) but live_stats
+    // is missing — e.g. the cache was opened through a code path that predates
+    // the registry refresh, or refresh failed. We CANNOT reopen, so report file
+    // metadata only.
+    if crate::lmdb_registry::is_open(&cache_dir) {
+        return match PersistentEmbeddingCache::file_stats(&cache_dir) {
+            Some(stats) => CheckResult::pass(
+                "Embedding cache",
+                format!(
+                    "In use by indexer ({})",
+                    format_bytes(stats.file_size_bytes as usize)
+                ),
+            )
+            .with_details("Cache is held open but live stats are unavailable; entry count unknown"),
+            None => CheckResult::warn(
+                "Embedding cache",
+                "Cache directory exists but data.mdb is missing",
+            ),
+        };
+    }
+
+    // STANDALONE PATH: cache dir exists and is NOT held open by anyone in this
+    // process (standalone `codesearch doctor` CLI). Safe to open for full stats.
     match PersistentEmbeddingCache::open(model_name) {
         Ok(cache) => match cache.stats() {
             Ok(stats) => {
