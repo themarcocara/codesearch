@@ -621,7 +621,7 @@ enum ReindexLaunch {
 /// Follows the same flow as the HTTP `reindex_handler`.
 fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
     // Guard against concurrent reindex
-    if !state.active_reindexes.insert(alias.clone()) {
+    if !state.begin_indexing(&alias) {
         tracing::warn!(
             "Force reindex already in progress for '{}', skipping TUI request",
             alias
@@ -633,7 +633,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Config lock poisoned: {}", e);
-            state.active_reindexes.remove(&alias);
+            state.end_indexing(&alias);
             return ReindexLaunch::Failed;
         }
     };
@@ -641,7 +641,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
         Some(p) => p,
         None => {
             tracing::error!("Cannot resolve alias '{}' for force reindex", alias);
-            state.active_reindexes.remove(&alias);
+            state.end_indexing(&alias);
             return ReindexLaunch::Failed;
         }
     };
@@ -673,12 +673,12 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
                         "Repo {} opened read-only; cannot force-reindex from TUI",
                         alias
                     );
-                    state.active_reindexes.remove(&alias);
+                    state.end_indexing(&alias);
                     return ReindexLaunch::Failed;
                 }
                 Err(e) => {
                     tracing::error!("Cannot open stores for '{}': {}", alias, e);
-                    state.active_reindexes.remove(&alias);
+                    state.end_indexing(&alias);
                     return ReindexLaunch::Failed;
                 }
             }
@@ -707,7 +707,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
         state_bg.restart_fsw(&alias_bg, stores).await;
 
         // Remove guard
-        state_bg.active_reindexes.remove(&alias_bg);
+        state_bg.end_indexing(&alias_bg);
     });
 
     ReindexLaunch::Started
