@@ -235,6 +235,31 @@ pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 /// Environment variable to override the repo idle timeout.
 pub const REPO_IDLE_TIMEOUT_ENV: &str = "CODESEARCH_REPO_IDLE_TIMEOUT_SECS";
 
+/// Maximum wall-clock duration a single reindex may take before its
+/// `active_reindexes` entry is considered **stale** (leaked).
+///
+/// Background indexing tasks (`reindex_handler`, `add_repo_handler`,
+/// `spawn_force_reindex`, `trigger_symbol_rebuild`, and the file-watcher
+/// branch-change callback) insert into `active_reindexes` at the start and
+/// remove at the end.  Some of these tasks run inside fire-and-forget
+/// `tokio::spawn` calls whose `JoinHandle` is discarded — a panic or
+/// cancellation between insert and remove silently leaks the entry, leaving
+/// the TUI stuck on "Indexing" forever.
+///
+/// Rather than chase every leak path, entries older than this threshold are
+/// treated as absent by all read sites (`repo_statuses_lightweight`,
+/// `evict_idle_repos`, and the reindex 409 guard) and lazily evicted. This
+/// makes the system self-healing regardless of the leak cause.
+///
+/// 30 minutes is deliberately generous: a force reindex of a very large repo
+/// or a full scip-csharp solution rebuild can legitimately take many minutes.
+/// Any session stuck beyond that is almost certainly leaked.
+/// Override with `CODESEARCH_MAX_INDEXING_SECS`.
+pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
+
+/// Environment variable to override the maximum indexing duration.
+pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
+
 /// Default embedding dimensions used when metadata is missing or unreadable.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
 

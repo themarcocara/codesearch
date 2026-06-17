@@ -18,12 +18,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::response::{IntoResponse, Json as AxumJson};
 use colored::Colorize;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use rmcp::transport::{
     streamable_http_server::session::local::LocalSessionManager, StreamableHttpServerConfig,
     StreamableHttpService,
@@ -37,8 +37,9 @@ use crate::cache::safe_canonicalize;
 use crate::constants::{
     ALLOWED_ROOTS_ENV, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
     CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
-    HEALTH_PATH, LANG_CSHARP, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
-    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH,
+    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS,
+    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -187,8 +188,17 @@ pub(crate) struct ServeState {
     config_mtime: std::sync::RwLock<Option<std::time::SystemTime>>,
     /// Optional override for the repos config path (used in tests to avoid env vars).
     config_path_override: Option<PathBuf>,
-    /// Aliases currently being reindexed — prevents concurrent force reindex on the same repo.
-    active_reindexes: DashSet<String>,
+    /// Aliases currently being reindexed — prevents concurrent force reindex
+    /// on the same repo. The value is the `Instant` the entry was inserted so
+    /// that stale (leaked) entries can be detected and self-healed; see
+    /// [`Self::begin_indexing`] / [`Self::is_indexing`] and
+    /// [`MAX_INDEXING_SECS`].
+    ///
+    /// Wrapped in `Arc` so that [`Self::make_indexing_status_callback`] can
+    /// capture a cheap clone that **shares** the underlying map (a bare
+    /// `DashMap::clone()` is a deep copy and would silently disconnect the
+    /// file-watcher callback from this field).
+    active_reindexes: Arc<DashMap<String, Instant>>,
     /// Per-repo change count since serve started (incremented by index/reindex operations).
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
@@ -272,7 +282,7 @@ impl ServeState {
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
-            active_reindexes: DashSet::new(),
+            active_reindexes: Arc::new(DashMap::new()),
             repo_changes: DashMap::new(),
             last_tool_call: DashMap::new(),
             active_sessions: AtomicU64::new(0),
@@ -329,7 +339,7 @@ impl ServeState {
 
     /// Build an `IndexingStatusCallback` for the given repo `alias`.
     ///
-    /// The callback captures an `Arc` clone of `active_reindexes` so it can be sent
+    /// The callback captures a clone of `active_reindexes` so it can be sent
     /// into the file-watcher background task. When the watcher triggers a refresh
     /// (branch change, significant batch), it calls this closure to insert/remove
     /// the alias — making "Indexing" visible in the TUI.
@@ -338,11 +348,92 @@ impl ServeState {
         let alias_key = alias.to_string();
         Arc::new(move |active: bool| {
             if active {
-                reindexes.insert(alias_key.clone());
+                reindexes.insert(alias_key.clone(), Instant::now());
             } else {
                 reindexes.remove(&alias_key);
             }
         })
+    }
+
+    /// Mark `alias` as actively indexing, returning `true` if the caller may
+    /// proceed. Returns `false` only when a **non-stale** entry already exists
+    /// (i.e. another reindex is genuinely in progress) — in that case the
+    /// caller should return HTTP 409. Stale entries are silently overwritten
+    /// with a fresh timestamp.
+    ///
+    /// This is the guard used by `reindex_handler`, `add_repo_handler`, and
+    /// `spawn_force_reindex` to reject concurrent reindexes.
+    fn begin_indexing(&self, alias: &str) -> bool {
+        let now = Instant::now();
+        let max = self.indexing_timeout();
+        match self.active_reindexes.entry(alias.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                if now.duration_since(*e.get()) < max {
+                    // Genuinely in progress — reject.
+                    false
+                } else {
+                    // Stale entry from a leaked/crashed task — overwrite.
+                    *e.get_mut() = now;
+                    true
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                e.insert(now);
+                true
+            }
+        }
+    }
+
+    /// Remove the indexing marker for `alias`. Called when a background
+    /// indexing task finishes (success, error, or panic).
+    fn end_indexing(&self, alias: &str) {
+        self.active_reindexes.remove(alias);
+    }
+
+    /// Returns `true` if `alias` is currently (non-stale) indexing.
+    ///
+    /// Stale entries — those older than [`MAX_INDEXING_SECS`] — are lazily
+    /// evicted here. This is the self-healing mechanism: even if a
+    /// fire-and-forget background task panics or is cancelled between
+    /// `begin_indexing` and `end_indexing`, the entry eventually expires and
+    /// the TUI returns to the correct state without a server restart.
+    ///
+    /// The eviction uses the atomic `remove_if` primitive so that a concurrent
+    /// `begin_indexing` that inserts a fresh timestamp between the staleness
+    /// check and the removal cannot be wrongly evicted.
+    fn is_indexing(&self, alias: &str) -> bool {
+        let max = self.indexing_timeout();
+        // Atomically evict a stale entry. `remove_if` holds the shard's write
+        // lock for the predicate check + removal, so a racing `begin_indexing`
+        // that refreshed the timestamp in the meantime will cause the predicate
+        // to return false and the entry to be kept.
+        if self
+            .active_reindexes
+            .remove_if(alias, |_, ts| ts.elapsed() >= max)
+            .is_some()
+        {
+            tracing::warn!(
+                "🧹 Evicted stale indexing marker for '{}' (older than {}s) — \
+                 likely a leaked/crashed background task",
+                alias,
+                max.as_secs()
+            );
+            return false;
+        }
+        // Entry is either absent or still within the active window.
+        self.active_reindexes.contains_key(alias)
+    }
+
+    /// Returns the configured maximum indexing duration, honouring the
+    /// `CODESEARCH_MAX_INDEXING_SECS` env override (falls back to
+    /// [`MAX_INDEXING_SECS`]).
+    fn indexing_timeout(&self) -> Duration {
+        std::env::var(MAX_INDEXING_SECS_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&secs: &u64| secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(MAX_INDEXING_SECS))
     }
 
     fn now_unix_secs() -> i64 {
@@ -1933,7 +2024,7 @@ impl ServeState {
             let db_path = path.join(DB_DIR_NAME);
             let db_exists = db_path.exists();
 
-            let label = if self.active_reindexes.contains(alias) {
+            let label = if self.is_indexing(alias) {
                 RepoStateLabel::Indexing
             } else {
                 match self.repos.get(alias) {
@@ -2187,7 +2278,7 @@ impl ServeState {
             .filter(|entry| {
                 let alias = entry.key();
                 // Don't evict repos that are being reindexed
-                if self.active_reindexes.contains(alias) {
+                if self.is_indexing(alias) {
                     return false;
                 }
                 now.duration_since(*entry.value()) >= timeout
@@ -2539,11 +2630,12 @@ async fn trigger_symbol_rebuild(
     //
     // Known benign race: if the FSW-SCIP rebuild path (indexing_cb) fires for
     // the same alias simultaneously, both paths insert into active_reindexes.
-    // Because DashSet::insert is idempotent, there is no data corruption.
+    // Because the map key is the alias, there is no data corruption.
     // However, whichever path finishes first will call remove(), which may
     // briefly flip the TUI back to Warm/Open while the other path is still
     // running. This is a cosmetic flash only — no state is corrupted.
-    state.active_reindexes.insert(alias.to_string());
+    // (Stale entries from a crashed task self-heal via `is_indexing`.)
+    state.begin_indexing(alias);
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
     let alias_owned = alias.to_string();
@@ -2567,7 +2659,7 @@ async fn trigger_symbol_rebuild(
                 summary.references_stored,
                 summary.duration_ms
             );
-            state.active_reindexes.remove(&alias_owned);
+            state.end_indexing(&alias_owned);
             state
                 .csharp_index_status
                 .insert(alias_owned.clone(), CSharpIndexStatus::Ready);
@@ -2580,7 +2672,7 @@ async fn trigger_symbol_rebuild(
         }
         Ok(Err(e)) => {
             tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, e);
-            state.active_reindexes.remove(&alias_owned);
+            state.end_indexing(&alias_owned);
             state
                 .csharp_index_error
                 .insert(alias_owned.clone(), e.to_string());
@@ -2594,7 +2686,7 @@ async fn trigger_symbol_rebuild(
                 alias_owned,
                 e
             );
-            state.active_reindexes.remove(&alias_owned);
+            state.end_indexing(&alias_owned);
             state
                 .csharp_index_error
                 .insert(alias_owned.clone(), format!("Task panicked: {}", e));
@@ -2695,7 +2787,7 @@ async fn reindex_handler(
     let alias_bg = alias.clone();
 
     // Concurrent reindex guard — reject if this alias is already being reindexed
-    if !state.active_reindexes.insert(alias_bg.clone()) {
+    if !state.begin_indexing(&alias_bg) {
         return (
             StatusCode::CONFLICT,
             axum::response::Json(json!({
@@ -2740,7 +2832,7 @@ async fn reindex_handler(
                     }
                     Ok(OpenedStores::Readonly(_)) => {
                         // Cannot force-reindex against a readonly store.
-                        state.active_reindexes.remove(&guard_alias);
+                        state.end_indexing(&guard_alias);
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             axum::response::Json(json!({
@@ -2753,7 +2845,7 @@ async fn reindex_handler(
                         );
                     }
                     Err(e) => {
-                        state.active_reindexes.remove(&guard_alias);
+                        state.end_indexing(&guard_alias);
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             axum::response::Json(json!({
@@ -2794,14 +2886,14 @@ async fn reindex_handler(
                 trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
             }
 
-            g_state.active_reindexes.remove(&g_alias);
+            g_state.end_indexing(&g_alias);
         });
     } else {
         // Incremental refresh: ensure the repo is opened, then refresh
         let stores = match state.get_or_open_stores(&alias, true).await {
             Ok(s) => s,
             Err(e) => {
-                state.active_reindexes.remove(&guard_alias);
+                state.end_indexing(&guard_alias);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::response::Json(json!({
@@ -2839,7 +2931,7 @@ async fn reindex_handler(
                 trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
             }
 
-            g_state.active_reindexes.remove(&g_alias);
+            g_state.end_indexing(&g_alias);
         });
     }
 
@@ -3004,7 +3096,7 @@ async fn add_repo_handler(
     state.touch_access(&alias);
 
     // Guard against concurrent reindex for the same alias.
-    if !state.active_reindexes.insert(alias.clone()) {
+    if !state.begin_indexing(&alias) {
         // Another reindex for this alias is already in progress.
         // We must undo *all* side-effects created so far:
         //   1. Cancel the token and remove from repos (releases the LMDB handle).
@@ -3080,7 +3172,7 @@ async fn add_repo_handler(
                 tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
                 // Clean up: remove from repos and config
                 state_bg.repos.remove(&alias_bg);
-                state_bg.active_reindexes.remove(&alias_bg);
+                state_bg.end_indexing(&alias_bg);
                 if let Ok(mut config) = state_bg.config.write() {
                     config.unregister_alias(&alias_bg);
                     if let Err(e) = state_bg.persist_config(&config) {
@@ -3117,7 +3209,7 @@ async fn add_repo_handler(
         // Start FSW and transition to proper Write state with IndexManager
         state_bg.restart_fsw(&alias_bg, stores).await;
 
-        state_bg.active_reindexes.remove(&alias_bg);
+        state_bg.end_indexing(&alias_bg);
         tracing::info!("Repo '{}' fully indexed and ready", alias_bg);
     });
 
