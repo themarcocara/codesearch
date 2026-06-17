@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.0.209] - 2026-06-17
+
+### Fixed
+
+- **Repo stuck showing "Indexing" in the TUI forever**: `ServeState.active_reindexes`
+  was an in-memory `DashSet<String>` with no expiry. Background indexing tasks run
+  inside fire-and-forget `tokio::spawn` calls whose `JoinHandle` is discarded, so a
+  panic or cancellation between insert and remove silently leaked the entry —
+  causing the TUI to show "Indexing" permanently and the `POST /repos/<alias>/reindex`
+  endpoint to return `409 Conflict` forever, even though the actual index was
+  complete. Converted to `Arc<DashMap<String, Instant>>` with self-healing
+  semantics: entries older than `MAX_INDEXING_SECS` (30 min, overridable via
+  `CODESEARCH_MAX_INDEXING_SECS`) are lazily evicted on read. Added
+  `begin_indexing` / `end_indexing` / `is_indexing` helpers; the eviction path
+  uses atomic `remove_if` to prevent a TOCTOU race that could wrongly drop a
+  freshly-refreshed entry.
+
 ## [1.0.208] - 2026-06-14
 
 ### Fixed
