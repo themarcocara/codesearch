@@ -254,7 +254,11 @@ pub const REPO_IDLE_TIMEOUT_ENV: &str = "CODESEARCH_REPO_IDLE_TIMEOUT_SECS";
 /// 30 minutes is deliberately generous: a force reindex of a very large repo
 /// or a full scip-csharp solution rebuild can legitimately take many minutes.
 /// Any session stuck beyond that is almost certainly leaked.
+/// Override with `CODESEARCH_MAX_INDEXING_SECS`.
 pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
+
+/// Environment variable to override the maximum indexing duration.
+pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
 
 /// Default embedding dimensions used when metadata is missing or unreadable.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;

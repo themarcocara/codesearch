@@ -37,9 +37,9 @@ use crate::cache::safe_canonicalize;
 use crate::constants::{
     ALLOWED_ROOTS_ENV, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
     CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
-    HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS,
-    REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_API_KEY_ENV,
-    SERVE_PORT_ENV, STATUS_PATH,
+    HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH,
+    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS,
+    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -193,7 +193,12 @@ pub(crate) struct ServeState {
     /// that stale (leaked) entries can be detected and self-healed; see
     /// [`Self::begin_indexing`] / [`Self::is_indexing`] and
     /// [`MAX_INDEXING_SECS`].
-    active_reindexes: DashMap<String, Instant>,
+    ///
+    /// Wrapped in `Arc` so that [`Self::make_indexing_status_callback`] can
+    /// capture a cheap clone that **shares** the underlying map (a bare
+    /// `DashMap::clone()` is a deep copy and would silently disconnect the
+    /// file-watcher callback from this field).
+    active_reindexes: Arc<DashMap<String, Instant>>,
     /// Per-repo change count since serve started (incremented by index/reindex operations).
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
@@ -277,7 +282,7 @@ impl ServeState {
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
-            active_reindexes: DashMap::new(),
+            active_reindexes: Arc::new(DashMap::new()),
             repo_changes: DashMap::new(),
             last_tool_call: DashMap::new(),
             active_sessions: AtomicU64::new(0),
@@ -360,7 +365,7 @@ impl ServeState {
     /// `spawn_force_reindex` to reject concurrent reindexes.
     fn begin_indexing(&self, alias: &str) -> bool {
         let now = Instant::now();
-        let max = Duration::from_secs(MAX_INDEXING_SECS);
+        let max = self.indexing_timeout();
         match self.active_reindexes.entry(alias.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(mut e) => {
                 if now.duration_since(*e.get()) < max {
@@ -392,28 +397,43 @@ impl ServeState {
     /// fire-and-forget background task panics or is cancelled between
     /// `begin_indexing` and `end_indexing`, the entry eventually expires and
     /// the TUI returns to the correct state without a server restart.
+    ///
+    /// The eviction uses the atomic `remove_if` primitive so that a concurrent
+    /// `begin_indexing` that inserts a fresh timestamp between the staleness
+    /// check and the removal cannot be wrongly evicted.
     fn is_indexing(&self, alias: &str) -> bool {
-        let max = Duration::from_secs(MAX_INDEXING_SECS);
-        match self.active_reindexes.get(alias) {
-            Some(entry) => {
-                if entry.elapsed() < max {
-                    true
-                } else {
-                    let age = entry.elapsed().as_secs();
-                    drop(entry);
-                    self.active_reindexes.remove(alias);
-                    tracing::warn!(
-                        "🧹 Evicted stale indexing marker for '{}' (was {}s old, max {}s) — \
-                         likely a leaked/crashed background task",
-                        alias,
-                        age,
-                        max.as_secs()
-                    );
-                    false
-                }
-            }
-            None => false,
+        let max = self.indexing_timeout();
+        // Atomically evict a stale entry. `remove_if` holds the shard's write
+        // lock for the predicate check + removal, so a racing `begin_indexing`
+        // that refreshed the timestamp in the meantime will cause the predicate
+        // to return false and the entry to be kept.
+        if self
+            .active_reindexes
+            .remove_if(alias, |_, ts| ts.elapsed() >= max)
+            .is_some()
+        {
+            tracing::warn!(
+                "🧹 Evicted stale indexing marker for '{}' (older than {}s) — \
+                 likely a leaked/crashed background task",
+                alias,
+                max.as_secs()
+            );
+            return false;
         }
+        // Entry is either absent or still within the active window.
+        self.active_reindexes.contains_key(alias)
+    }
+
+    /// Returns the configured maximum indexing duration, honouring the
+    /// `CODESEARCH_MAX_INDEXING_SECS` env override (falls back to
+    /// [`MAX_INDEXING_SECS`]).
+    fn indexing_timeout(&self) -> Duration {
+        std::env::var(MAX_INDEXING_SECS_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&secs: &u64| secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(MAX_INDEXING_SECS))
     }
 
     fn now_unix_secs() -> i64 {
