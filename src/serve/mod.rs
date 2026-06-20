@@ -1945,6 +1945,9 @@ impl ServeState {
 
     /// Resolve a group name to its constituent aliases.
     /// Returns an error if the group doesn't exist.
+    ///
+    /// The reserved name `ALL_GROUP_NAME` ("all") is a virtual group: it is never
+    /// stored in `repos.json` but resolves dynamically to every registered alias.
     pub(crate) fn resolve_group_aliases(
         &self,
         group: &str,
@@ -1954,6 +1957,13 @@ impl ServeState {
             Ok(c) => c,
             Err(e) => return Err(format!("Config lock poisoned: {}", e)),
         };
+        // Virtual "all" group: resolve to every registered alias (sorted for
+        // deterministic ordering). Not stored in repos.json.
+        if group == crate::constants::ALL_GROUP_NAME {
+            let mut all: Vec<String> = config.repos.keys().cloned().collect();
+            all.sort();
+            return Ok(all);
+        }
         config
             .groups
             .get(group)
