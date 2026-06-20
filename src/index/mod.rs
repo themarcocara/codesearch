@@ -2125,6 +2125,9 @@ async fn try_delegate_reindex_to_serve(
         if !add_resp.status().is_success() {
             let add_status = add_resp.status();
             let add_text = add_resp.text().await.unwrap_or_default();
+            if let Some(hint) = auth_failure_hint(add_status) {
+                return Err(DelegateError::Failed(hint));
+            }
             return Err(DelegateError::Failed(format!(
                 "auto-register returned {} for alias '{}': {}",
                 add_status, alias, add_text
@@ -2193,12 +2196,18 @@ async fn try_delegate_reindex_to_serve(
                 }
                 let force_status = force_resp.status();
                 let force_text = force_resp.text().await.unwrap_or_default();
+                if let Some(hint) = auth_failure_hint(force_status) {
+                    return Err(DelegateError::Failed(hint));
+                }
                 return Err(DelegateError::Failed(format!(
                     "force reindex returned {} for alias '{}': {}",
                     force_status, alias, force_text
                 )));
             }
 
+            if let Some(hint) = auth_failure_hint(add_status) {
+                return Err(DelegateError::Failed(hint));
+            }
             return Err(DelegateError::Failed(format!(
                 "auto-register returned {} for alias '{}': {}",
                 add_status, alias, add_text
@@ -2578,6 +2587,44 @@ mod serve_probe_tests {
         assert!(
             seen.is_none(),
             "client built without a key must NOT send an Authorization header, got: {seen:?}"
+        );
+    }
+
+    /// The inner builder treats any `Some(key)` literally — it does NOT trim or
+    /// filter empties. That filtering is the responsibility of the outer
+    /// `build_serve_client` (which reads the env var, `.trim()`s, and filters
+    /// empties before calling this function). This test pins that contract so a
+    /// future refactor doesn't silently move the filtering into the wrong layer.
+    #[tokio::test]
+    async fn inner_builder_attaches_header_for_any_some_value() {
+        let (base, captured) = spawn_auth_echo_server().await;
+        let c = build_serve_client_with_key(Duration::from_secs(2), Some("any-value"))
+            .expect("Some value must build");
+        c.get(format!("{base}/health"))
+            .send()
+            .await
+            .expect("request must reach the server")
+            .error_for_status()
+            .expect("server must return 200");
+        let seen = captured.lock().unwrap().clone();
+        assert_eq!(
+            seen.as_deref(),
+            Some("Bearer any-value"),
+            "inner builder attaches Bearer <key> verbatim; trimming is the caller's job"
+        );
+    }
+
+    /// A key containing characters invalid in a header value (control chars,
+    /// CR/LF) must fail fast with a message naming the env var, rather than
+    /// panicking or silently dropping the header.
+    #[test]
+    fn build_serve_client_with_invalid_key_fails_with_env_var_name() {
+        // CR/LF is rejected by HeaderValue::from_str (header injection guard).
+        let err = build_serve_client_with_key(Duration::from_secs(2), Some("bad\r\nkey"))
+            .expect_err("invalid header chars must produce an error");
+        assert!(
+            err.contains(crate::constants::SERVE_API_KEY_ENV),
+            "error should name the env var so the user knows which var to fix: {err}"
         );
     }
 }
