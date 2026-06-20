@@ -4612,4 +4612,33 @@ mod tests {
             clear_env();
         }
     }
+
+    /// The reserved virtual "all" group must resolve to every registered alias
+    /// via the serve-layer entry point used by MCP tools (issue #131).
+    #[test]
+    fn resolve_group_aliases_all_returns_every_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_a = tmp.path().join("repo-a");
+        let repo_b = tmp.path().join("repo-b");
+        std::fs::create_dir(&repo_a).unwrap();
+        std::fs::create_dir(&repo_b).unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_a, Some("alpha".to_string()))
+            .unwrap();
+        config
+            .register_with_alias(repo_b, Some("beta".to_string()))
+            .unwrap();
+
+        let state = state_with_config(config);
+
+        let aliases = state
+            .resolve_group_aliases(crate::constants::ALL_GROUP_NAME)
+            .expect("'all' should resolve");
+        assert_eq!(aliases, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // "all" is never stored — an unknown real group still errors.
+        assert!(state.resolve_group_aliases("does-not-exist").is_err());
+    }
 }

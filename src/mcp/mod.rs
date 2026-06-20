@@ -6815,7 +6815,9 @@ impl CodesearchService {
             if let Some(ref serve_state) = self.serve_state {
                 let config = serve_state.config_snapshot();
                 let repo_count = config.repos.len();
-                let group_count = config.groups.len();
+                // Count the virtual "all" group when repos are registered, so the
+                // summary doesn't read "0 group(s)" while `all` is actually available.
+                let group_count = config.groups.len() + if config.repos.is_empty() { 0 } else { 1 };
                 let statuses = serve_state.repo_statuses_lightweight();
                 let open_count = statuses
                     .iter()
