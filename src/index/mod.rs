@@ -1897,6 +1897,73 @@ const SERVE_WARMUP_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_
 /// Sleep between serve `/health` timeout retries.
 const SERVE_HEALTH_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(600);
 
+/// Build a `reqwest::Client` configured for talking to a running `codesearch serve`
+/// instance.
+///
+/// If `CODESEARCH_SERVE_API_KEY` is set in the environment (and non-empty), the
+/// key is attached as `Authorization: Bearer <key>` to *every* request the client
+/// makes. This is required:
+/// - when serve is bound to a non-localhost address (the `require_auth_for_network`
+///   middleware guards ALL endpoints, including `/health`), and
+/// - for management endpoints (`POST /repos`, `DELETE /repos/:alias`,
+///   `POST /repos/:alias/reindex`, `POST /reload`) when serve is bound to
+///   localhost with the key set.
+///
+/// Without this, delegation to a network-bound serve returns 401 and falls back
+/// to local indexing, risking LMDB file-lock conflicts. See issue #132.
+fn build_serve_client(
+    timeout: std::time::Duration,
+) -> std::result::Result<reqwest::Client, String> {
+    let key = std::env::var(crate::constants::SERVE_API_KEY_ENV)
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    build_serve_client_with_key(timeout, key.as_deref())
+}
+
+/// Inner, testable form of [`build_serve_client`]: build a client that attaches
+/// `Authorization: Bearer <key>` (when `key` is `Some`) as a default header, so
+/// every request — health probe, POST, DELETE — carries it automatically.
+fn build_serve_client_with_key(
+    timeout: std::time::Duration,
+    key: Option<&str>,
+) -> std::result::Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+
+    if let Some(k) = key {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let auth_value =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", k)).map_err(|e| {
+                format!(
+                    "invalid {} value: {}",
+                    crate::constants::SERVE_API_KEY_ENV,
+                    e
+                )
+            })?;
+        headers.insert(reqwest::header::AUTHORIZATION, auth_value);
+        builder = builder.default_headers(headers);
+    }
+
+    builder
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {}", e))
+}
+
+/// When the server returns 401, produce a friendly, actionable error pointing at
+/// the missing client-side API key instead of a bare "401 Unauthorized". Returns
+/// `None` for any other status so callers can format their own error.
+fn auth_failure_hint(status: reqwest::StatusCode) -> Option<String> {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        Some(format!(
+            "serve returned 401 Unauthorized. The server requires an API key — \
+             set the {} environment variable on the client to the same value as the server.",
+            crate::constants::SERVE_API_KEY_ENV
+        ))
+    } else {
+        None
+    }
+}
+
 /// Probe serve `/health`, distinguishing "not running" from "busy".
 ///
 /// A *connection refused* (or any non-timeout connect error) returns
@@ -1949,10 +2016,10 @@ async fn try_delegate_reindex_to_serve(
     let base_url = format!("http://{}:{}", host, port);
 
     // 1. Health check — is serve running (and responsive)?
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+    // build_serve_client() attaches the CODESEARCH_SERVE_API_KEY header (if set)
+    // so the health probe and all subsequent POSTs authenticate to a network-bound
+    // serve. See issue #132.
+    let client = build_serve_client(std::time::Duration::from_secs(3))?;
 
     match probe_serve_health(
         &client,
@@ -2025,6 +2092,13 @@ async fn try_delegate_reindex_to_serve(
 
     let status = reindex_resp.status();
     let body = reindex_resp.text().await.unwrap_or_default();
+
+    // 401 means the client is missing the API key the server requires. Surface a
+    // friendly hint rather than falling through to the 404/500 recovery paths
+    // (those would also 401 on the auto-register POST). See issue #132.
+    if let Some(hint) = auth_failure_hint(status) {
+        return Err(DelegateError::Failed(hint));
+    }
 
     // If 404, the alias is unknown to serve — auto-register via POST /repos, then retry reindex.
     if status == reqwest::StatusCode::NOT_FOUND {
@@ -2166,10 +2240,10 @@ pub(crate) async fn try_delegate_add_to_serve(
     let base_url = format!("http://{}:{}", host, port);
 
     // 1. Health check — is serve running (and responsive)?
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+    // build_serve_client() attaches the CODESEARCH_SERVE_API_KEY header (if set)
+    // so the health probe and the POST /repos authenticate to a network-bound
+    // serve. See issue #132.
+    let client = build_serve_client(std::time::Duration::from_secs(3))?;
 
     match probe_serve_health(
         &client,
@@ -2226,6 +2300,10 @@ pub(crate) async fn try_delegate_add_to_serve(
     } else {
         let status = add_resp.status();
         let text = add_resp.text().await.unwrap_or_default();
+        // Surface a friendly hint on 401. See issue #132.
+        if let Some(hint) = auth_failure_hint(status) {
+            return Err(DelegateError::Failed(hint));
+        }
         Err(DelegateError::Failed(format!(
             "serve returned {}: {}",
             status, text
@@ -2251,10 +2329,10 @@ pub(crate) async fn try_delegate_rm_to_serve(
     let base_url = format!("http://{}:{}", host, port);
 
     // 1. Health check
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+    // build_serve_client() attaches the CODESEARCH_SERVE_API_KEY header (if set)
+    // so the health probe and the DELETE authenticate to a network-bound serve.
+    // See issue #132.
+    let client = build_serve_client(std::time::Duration::from_secs(3))?;
 
     let health_resp = client
         .get(format!("{}/health", base_url))
@@ -2268,6 +2346,10 @@ pub(crate) async fn try_delegate_rm_to_serve(
         })?;
 
     if !health_resp.status().is_success() {
+        // Surface a friendly hint on 401 so users know to set the API key.
+        if let Some(hint) = auth_failure_hint(health_resp.status()) {
+            return Err(hint);
+        }
         return Err(format!(
             "serve health check returned {}",
             health_resp.status()
@@ -2309,6 +2391,10 @@ pub(crate) async fn try_delegate_rm_to_serve(
     } else {
         let status = delete_resp.status();
         let text = delete_resp.text().await.unwrap_or_default();
+        // Surface a friendly hint on 401. See issue #132.
+        if let Some(hint) = auth_failure_hint(status) {
+            return Err(hint);
+        }
         Err(format!(
             "serve returned {} for alias '{}': {}",
             status, alias, text
@@ -2318,7 +2404,8 @@ pub(crate) async fn try_delegate_rm_to_serve(
 
 #[cfg(test)]
 mod serve_probe_tests {
-    use super::{probe_serve_health, ServeProbe};
+    use super::{auth_failure_hint, build_serve_client_with_key, probe_serve_health, ServeProbe};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     /// Spawn a minimal HTTP server exposing `/health`. If `delay` is set, the
@@ -2383,6 +2470,114 @@ mod serve_probe_tests {
                 ServeProbe::Unresponsive
             ),
             "listening-but-slow serve must be Unresponsive, not Down"
+        );
+    }
+
+    // ---- auth_failure_hint (issue #132) -------------------------------------
+
+    /// 401 must produce a friendly hint that names the env var, so users know
+    /// *what* to set instead of seeing a bare "401 Unauthorized".
+    #[test]
+    fn auth_failure_hint_for_401_names_env_var() {
+        let hint =
+            auth_failure_hint(reqwest::StatusCode::UNAUTHORIZED).expect("401 must yield a hint");
+        assert!(
+            hint.contains("401"),
+            "hint should mention the status: {hint}"
+        );
+        assert!(
+            hint.contains(crate::constants::SERVE_API_KEY_ENV),
+            "hint should name the env var so users know what to set: {hint}"
+        );
+    }
+
+    /// Any non-401 status returns `None` so callers format their own error.
+    #[test]
+    fn auth_failure_hint_none_for_other_statuses() {
+        for status in [
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::OK,
+        ] {
+            assert!(
+                auth_failure_hint(status).is_none(),
+                "{status} must NOT trigger the auth-failure hint"
+            );
+        }
+    }
+
+    // ---- build_serve_client_with_key (issue #132) ---------------------------
+
+    /// Spawn a server that records the `Authorization` header it receives on
+    /// `/health` into the shared slot. Returns `(base_url, captured)`.
+    async fn spawn_auth_echo_server() -> (String, Arc<Mutex<Option<String>>>) {
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                if let Some(v) = headers.get(reqwest::header::AUTHORIZATION) {
+                    if let Ok(s) = v.to_str() {
+                        *captured_clone.lock().unwrap() = Some(s.to_string());
+                    }
+                }
+                "ok"
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (format!("http://{}", addr), captured)
+    }
+
+    /// When a key is supplied, the client must send `Authorization: Bearer <key>`
+    /// on every request — this is the core of the issue #132 fix.
+    #[tokio::test]
+    async fn build_serve_client_with_key_attaches_bearer_header() {
+        let (base, captured) = spawn_auth_echo_server().await;
+        let c = build_serve_client_with_key(Duration::from_secs(2), Some("hunter2"))
+            .expect("client with valid key must build");
+
+        // Send a GET — the client's default header must be applied automatically.
+        c.get(format!("{base}/health"))
+            .send()
+            .await
+            .expect("request must reach the server")
+            .error_for_status()
+            .expect("server must return 200");
+
+        let seen = captured.lock().unwrap().clone();
+        assert_eq!(
+            seen.as_deref(),
+            Some("Bearer hunter2"),
+            "client built with a key must send Authorization: Bearer <key>"
+        );
+    }
+
+    /// When no key is supplied (`None`), the client must NOT send any
+    /// Authorization header — it should behave like a plain client.
+    #[tokio::test]
+    async fn build_serve_client_without_key_sends_no_auth_header() {
+        let (base, captured) = spawn_auth_echo_server().await;
+        let c = build_serve_client_with_key(Duration::from_secs(2), None)
+            .expect("client without key must build");
+
+        c.get(format!("{base}/health"))
+            .send()
+            .await
+            .expect("request must reach the server")
+            .error_for_status()
+            .expect("server must return 200");
+
+        let seen = captured.lock().unwrap().clone();
+        assert!(
+            seen.is_none(),
+            "client built without a key must NOT send an Authorization header, got: {seen:?}"
         );
     }
 }

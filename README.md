@@ -427,7 +427,7 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | Variable | Description |
 |----------|-------------|
 | `CODESEARCH_SERVE_PORT` | Serve mode port (default: 39725) |
-| `CODESEARCH_SERVE_API_KEY` | API key for management endpoints (unset = no auth) |
+| `CODESEARCH_SERVE_API_KEY` | API key for management endpoints + all endpoints when serve binds to a non-localhost address (unset = no auth) |
 | `CODESEARCH_ALLOWED_ROOTS` | Semicolon-separated allowed roots for repo registration (unset = all allowed) |
 | `CODESEARCH_MCP_MODE` | MCP mode: auto, client, local |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
@@ -439,12 +439,16 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 
 ### Security
 
-When `codesearch serve` is exposed beyond a single trusted user (e.g. shared dev machines), two environment variables harden access:
+When `codesearch serve` is exposed beyond a single trusted user (e.g. shared dev machines, a network bind), two environment variables harden access:
 
-- **`CODESEARCH_SERVE_API_KEY`** — when set, management endpoints require this key via `Authorization: Bearer <key>` or `X-API-Key: <key>`. Health, status, and MCP search endpoints remain open.
+- **`CODESEARCH_SERVE_API_KEY`** — gates access depending on how serve is bound:
+  - **Non-localhost bind** (`--host 0.0.0.0`, a LAN IP, etc.) — **ALL endpoints** require the key (health, status, MCP search, and management). Setting this variable is *required* when binding to a non-localhost address; serve refuses to start without it.
+  - **Localhost bind** (default) — only **management endpoints** (`POST /repos`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex`, `POST /reload`) require the key. Health, status, and MCP search remain open.
+  - Send the key on every request via `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+  - **Client side:** `codesearch index add/rm/reindex` delegate to a running serve, so the CLI must send the same key. Set `CODESEARCH_SERVE_API_KEY` in the client's environment (same value as the server) and the CLI attaches it automatically. Without it, delegation returns `401` and falls back to local indexing — which risks LMDB file-lock conflicts if serve is still running.
 - **`CODESEARCH_ALLOWED_ROOTS`** — semicolon-separated list of filesystem roots. Repo registration is rejected for paths outside these roots. Prevents indexing arbitrary directories.
 
-Both are backward compatible: unset means no restriction.
+Both are backward compatible: unset means no restriction (on a localhost bind).
 
 ### `.codesearchignore`
 
