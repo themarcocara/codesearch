@@ -865,19 +865,32 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
 
 /// Handle groups subcommands
 async fn run_groups_command(command: GroupsCommands) -> Result<()> {
+    use crate::constants::ALL_GROUP_NAME;
     match command {
         GroupsCommands::List => {
             let config = crate::db_discovery::load_repos_config()?;
-            if config.groups.is_empty() {
+            // The virtual "all" group is always present when repos are registered.
+            let has_all = !config.repos.is_empty();
+            if config.groups.is_empty() && !has_all {
                 println!("No groups defined.");
                 return Ok(());
             }
             println!("Groups:");
+            if has_all {
+                let count = config.repos.len();
+                println!("  {} (virtual): {} repos", ALL_GROUP_NAME, count);
+            }
             for (name, aliases) in &config.groups {
                 println!("  {}: {}", name, aliases.join(", "));
             }
         }
         GroupsCommands::Add { name, aliases } => {
+            if name == ALL_GROUP_NAME {
+                return Err(anyhow::anyhow!(
+                    "Group name '{}' is reserved — it always resolves to all registered repos automatically.",
+                    name
+                ));
+            }
             if aliases.is_empty() {
                 return Err(anyhow::anyhow!(
                     "--aliases is required and must specify at least one alias."
@@ -898,6 +911,12 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
             println!("Group '{}' created/updated.", name);
         }
         GroupsCommands::Remove { name } => {
+            if name == ALL_GROUP_NAME {
+                return Err(anyhow::anyhow!(
+                    "Group '{}' is reserved and cannot be removed.",
+                    name
+                ));
+            }
             let mut config = crate::db_discovery::load_repos_config()?;
             if config.remove_group(&name) {
                 config.save()?;

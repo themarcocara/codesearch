@@ -3744,7 +3744,7 @@ impl CodesearchService {
     /// `available_groups`, and `hint_for_agent` so that LLM agents can programmatically
     /// react to the scope requirement.
     fn format_scope_error(&self) -> String {
-        let (projects, groups) = if let Some(ref serve_state) = self.serve_state {
+        let (projects, mut groups) = if let Some(ref serve_state) = self.serve_state {
             let cfg = serve_state.config_snapshot();
             let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
             projects.sort();
@@ -3754,6 +3754,14 @@ impl CodesearchService {
         } else {
             (vec![], vec![])
         };
+        // The "all" virtual group is always available when there are projects to
+        // search — advertise it so agents discover the cross-repo shortcut.
+        // (scope_required only fires when >1 repo is registered, so this is safe.)
+        let all = crate::constants::ALL_GROUP_NAME.to_string();
+        if !projects.is_empty() && !groups.contains(&all) {
+            groups.push(all);
+            groups.sort();
+        }
 
         let payload = serde_json::json!({
             "error_code": "scope_required",
@@ -6807,7 +6815,9 @@ impl CodesearchService {
             if let Some(ref serve_state) = self.serve_state {
                 let config = serve_state.config_snapshot();
                 let repo_count = config.repos.len();
-                let group_count = config.groups.len();
+                // Count the virtual "all" group when repos are registered, so the
+                // summary doesn't read "0 group(s)" while `all` is actually available.
+                let group_count = config.groups.len() + if config.repos.is_empty() { 0 } else { 1 };
                 let statuses = serve_state.repo_statuses_lightweight();
                 let open_count = statuses
                     .iter()
@@ -7080,7 +7090,7 @@ impl CodesearchService {
 
             let response = ListProjectsResponse {
                 repos: repos_info,
-                groups: config.groups,
+                groups: config.groups_with_virtual_all(),
                 serve_active,
                 serve_url,
                 current_directory: current_dir.display().to_string(),
@@ -7137,7 +7147,7 @@ impl CodesearchService {
 
         let response = ListProjectsResponse {
             repos: repos_info,
-            groups: config.groups,
+            groups: config.groups_with_virtual_all(),
             serve_active,
             serve_url,
             current_directory: current_dir.display().to_string(),

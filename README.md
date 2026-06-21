@@ -371,6 +371,19 @@ codesearch groups list
 
 Then in MCP tools: `group="my-group"` fans out the query to all repos in the group.
 
+#### The `all` group
+
+The name `all` is a **reserved virtual group** that always resolves to *every* registered repository — no setup required:
+
+```
+group="all"   # fans out to all repos, equivalent to listing every alias
+```
+
+- It is **not stored** in `repos.json` and always reflects the current set of registered repos (register or remove a repo and `all` updates automatically).
+- It appears in `codesearch groups list` (marked `virtual`) and in the `scope_required` error's `available_groups`, so agents discover it without extra setup.
+- It is **not the default** — when no `project`/`group` is specified in multi-repo mode, codesearch still returns `scope_required` (safe-by-default). Use `group="all"` explicitly when you want to search everywhere.
+- `codesearch groups add all` and `codesearch groups remove all` are **rejected** — the name is reserved.
+
 ### Git Worktree Auto-Index
 
 When using `git worktree add` to create parallel working directories, codesearch can auto-register new worktrees via a `post-checkout` git hook.
