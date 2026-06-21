@@ -6,6 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.0.212] - 2026-06-21
+
+### Added
+
+- **Reserved virtual `"all"` group (#131)**: `group="all"` now resolves to every
+  registered repository, without being stored in `repos.json`. The name is
+  reserved — `codesearch groups add all` / `groups remove all` are rejected. The
+  group is advertised in the `scope_required` error, the `status` tool's `groups`
+  map, and `codesearch groups list` (marked `(virtual)`). It is NOT the default
+  (safe-by-default scope_required behaviour is preserved); it auto-updates as
+  repos are registered/removed.
+
+### Changed
+
+- **MCP agent discoverability improvements (#130)**: the server instructions
+  published via the MCP `initialize` handshake now lead with a "WHEN TO USE
+  codesearch (prefer over grep/glob)" block — good queries vs. not-ideal-for
+  cases — and a "SERVICE-MODE NOTES" block (paths come from the server's
+  filesystem → use `get_chunk`; unindexed directories like `.venv`/`node_modules`
+  → ask, don't blindly grep). `find_impact` is reframed from "C# only" to "C#
+  today; use `find kind="usages"` as a text-based fallback for other languages".
+  The instruction template is extracted to a named const (`INSTRUCTIONS_TEMPLATE`)
+  enabling genuine tests; the previous `include_str!`-based tests were
+  self-referential no-ops (the marker they searched for existed only in the test
+  source, not the real instructions) and are now fixed. README gains an "Agent
+  Guidance" subsection with a copy-paste quickstart for `AGENTS.md`/`.cursorrules`.
+
+### Fixed
+
+- **CLI delegate functions now send `CODESEARCH_SERVE_API_KEY` (#132)**:
+  `index add`, `index rm`, and `index reindex` built their HTTP requests to a
+  running `codesearch serve` without the API key header, so delegation to a
+  network-bound serve (e.g. `--host 0.0.0.0`, where `require_auth_for_network`
+  guards ALL endpoints) returned 401 and fell back to local indexing — risking
+  LMDB file-lock conflicts. A new `build_serve_client()` helper attaches
+  `Authorization: Bearer <key>` as a default header on every request (health
+  probe + all POST/DELETE) when the env var is set. A new `auth_failure_hint()`
+  produces a friendly 401 message naming the env var. The README Security
+  section is corrected: it previously claimed health/status/MCP endpoints
+  remained open, but `require_auth_for_network` blocks everything when bound to
+  non-localhost.
+
 ## [1.0.209] - 2026-06-17
 
 ### Fixed
