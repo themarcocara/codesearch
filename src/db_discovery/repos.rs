@@ -303,6 +303,14 @@ impl ReposConfig {
 
     #[allow(dead_code)] // Used in tests only — dead in bin targets
     pub fn resolve_group(&self, group: &str) -> Vec<(String, PathBuf)> {
+        // Virtual "all" group: resolves to every registered repo, never stored.
+        if group == crate::constants::ALL_GROUP_NAME {
+            return self
+                .repos
+                .iter()
+                .map(|(a, p)| (a.clone(), p.clone()))
+                .collect();
+        }
         let Some(aliases) = self.groups.get(group) else {
             return Vec::new();
         };
@@ -314,6 +322,12 @@ impl ReposConfig {
     }
 
     pub fn add_group(&mut self, name: String, aliases: Vec<String>) -> Result<()> {
+        if name == crate::constants::ALL_GROUP_NAME {
+            return Err(anyhow::anyhow!(
+                "Group name '{}' is reserved — it always resolves to all registered repos automatically.",
+                name
+            ));
+        }
         if aliases.is_empty() {
             return Err(anyhow::anyhow!(
                 "Group '{}' must contain at least one alias",
@@ -340,6 +354,20 @@ impl ReposConfig {
 
         self.groups.insert(name, deduped);
         Ok(())
+    }
+
+    /// Return a groups map that includes the virtual `ALL_GROUP_NAME` group
+    /// (mapping to every registered alias), for display/discoverability surfaces
+    /// such as the `status` tool. The returned map is a clone — `self.groups` is
+    /// untouched and "all" is never persisted to `repos.json`.
+    pub fn groups_with_virtual_all(&self) -> std::collections::HashMap<String, Vec<String>> {
+        let mut out = self.groups.clone();
+        if !self.repos.is_empty() {
+            let mut all: Vec<String> = self.repos.keys().cloned().collect();
+            all.sort();
+            out.insert(crate::constants::ALL_GROUP_NAME.to_string(), all);
+        }
+        out
     }
 
     pub fn remove_group(&mut self, name: &str) -> bool {
@@ -1121,6 +1149,75 @@ mod tests {
             stored_str.starts_with("C:\\") || stored_str.starts_with("C:/"),
             "stored path should be a plain Windows path, got: {}",
             stored_str
+        );
+    }
+
+    // ── Virtual "all" group (issue #131) ───────────────────────────────
+
+    #[test]
+    fn add_group_rejects_reserved_all_name() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+
+        let err = cfg
+            .add_group("all".to_string(), vec!["repo-a".to_string()])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("reserved"),
+            "expected 'reserved' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_group_all_returns_every_registered_repo() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        cfg.repos
+            .insert("repo-b".to_string(), PathBuf::from("/tmp/repo-b"));
+
+        let resolved = cfg.resolve_group(crate::constants::ALL_GROUP_NAME);
+        let mut names: Vec<String> = resolved.into_iter().map(|(a, _)| a).collect();
+        names.sort();
+        assert_eq!(names, vec!["repo-a".to_string(), "repo-b".to_string()]);
+    }
+
+    #[test]
+    fn resolve_group_all_is_empty_when_no_repos_registered() {
+        let cfg = ReposConfig::default();
+        let resolved = cfg.resolve_group(crate::constants::ALL_GROUP_NAME);
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn groups_with_virtual_all_advertises_all_without_storing_it() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        cfg.repos
+            .insert("repo-b".to_string(), PathBuf::from("/tmp/repo-b"));
+        cfg.add_group("platform".to_string(), vec!["repo-a".to_string()])
+            .unwrap();
+
+        // The advertised map includes both the real group and "all".
+        let advertised = cfg.groups_with_virtual_all();
+        assert_eq!(advertised.len(), 2);
+        let mut all_members = advertised
+            .get(crate::constants::ALL_GROUP_NAME)
+            .unwrap()
+            .clone();
+        all_members.sort();
+        assert_eq!(
+            all_members,
+            vec!["repo-a".to_string(), "repo-b".to_string()]
+        );
+
+        // But the stored config is untouched — "all" must never be persisted.
+        assert!(
+            !cfg.groups.contains_key(crate::constants::ALL_GROUP_NAME),
+            "\"all\" must not leak into the stored groups map"
         );
     }
 }

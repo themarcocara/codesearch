@@ -223,50 +223,24 @@ mod tests {
 
     #[test]
     fn test_instructions_max_50_lines() {
-        // Verify that get_info().instructions string is ≤ 50 lines.
-        // This is a compile-time check via include_str to catch regressions.
-        let src = include_str!("mod.rs");
-        // Extract the instructions string content between the raw string delimiters
-        // The instructions are in get_info() method — we can count lines in the
-        // formatted template. Since we can't easily instantiate the service here,
-        // we check the raw string literal line count.
-        //
-        // Look for the compact routing table format — it should be well under 50 lines.
-        // We verify by checking the instructions block has no more than 50 newlines.
-        let instructions_start = src.find("codesearch — semantic + lexical");
-        assert!(
-            instructions_start.is_some(),
-            "Could not find instructions start marker in mod.rs"
-        );
-        let start = instructions_start.unwrap();
-        let remaining = &src[start..];
-        let instructions_end = remaining.find("\"#,");
-        assert!(
-            instructions_end.is_some(),
-            "Could not find instructions end marker in mod.rs"
-        );
-        let instructions_text = &remaining[..instructions_end.unwrap()];
-
-        let line_count = instructions_text.lines().count();
+        // Verify that the MCP instructions template is ≤ 50 lines. MCP clients
+        // display this on connect; keeping it compact avoids truncation and token
+        // waste. The template is a named const (`INSTRUCTIONS_TEMPLATE`) so we can
+        // validate it directly without instantiating the service or fragile
+        // `include_str!` source-text searching.
+        let line_count = super::INSTRUCTIONS_TEMPLATE.lines().count();
         assert!(
             line_count <= 50,
             "Instructions block is {} lines, must be ≤ 50 lines.\n\
              Content:\n{}",
             line_count,
-            instructions_text
+            super::INSTRUCTIONS_TEMPLATE
         );
     }
 
     #[test]
     fn test_no_deprecated_tool_aliases_in_instructions() {
-        let src = include_str!("mod.rs");
-        let instructions_start = src.find("codesearch — semantic + lexical");
-        assert!(instructions_start.is_some());
-        let start = instructions_start.unwrap();
-        let remaining = &src[start..];
-        let instructions_end = remaining.find("\"#,");
-        assert!(instructions_end.is_some());
-        let instructions_text = &remaining[..instructions_end.unwrap()];
+        let instructions_text = super::INSTRUCTIONS_TEMPLATE;
 
         let deprecated = [
             "semantic_search",
@@ -3744,7 +3718,7 @@ impl CodesearchService {
     /// `available_groups`, and `hint_for_agent` so that LLM agents can programmatically
     /// react to the scope requirement.
     fn format_scope_error(&self) -> String {
-        let (projects, groups) = if let Some(ref serve_state) = self.serve_state {
+        let (projects, mut groups) = if let Some(ref serve_state) = self.serve_state {
             let cfg = serve_state.config_snapshot();
             let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
             projects.sort();
@@ -3754,6 +3728,14 @@ impl CodesearchService {
         } else {
             (vec![], vec![])
         };
+        // The "all" virtual group is always available when there are projects to
+        // search — advertise it so agents discover the cross-repo shortcut.
+        // (scope_required only fires when >1 repo is registered, so this is safe.)
+        let all = crate::constants::ALL_GROUP_NAME.to_string();
+        if !projects.is_empty() && !groups.contains(&all) {
+            groups.push(all);
+            groups.sort();
+        }
 
         let payload = serde_json::json!({
             "error_code": "scope_required",
@@ -5607,9 +5589,11 @@ impl CodesearchService {
     ///
     /// Uses language-specific semantic analysis (SCIP) to find all references to a symbol,
     /// enabling agents to plan refactors with IDE-class accuracy instead of text-matching
-    /// grep heuristics. Currently supports C# only; architecture is language-agnostic.
+    /// grep heuristics. C# is supported today (via the bundled `scip-csharp` helper); the
+    /// architecture is language-agnostic and more languages will follow. For languages not
+    /// yet supported, use `find` with `kind="usages"` as a text-based fallback.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol using language-specific semantic analysis (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors with IDE-class accuracy.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nCurrently supports C# only. Requires the `scip-csharp` helper to be installed (bundled in `-with-csharp` release variants).\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands the language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nLanguages: C# today (requires the `scip-csharp` helper, bundled in `-with-csharp` releases). For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -6807,7 +6791,9 @@ impl CodesearchService {
             if let Some(ref serve_state) = self.serve_state {
                 let config = serve_state.config_snapshot();
                 let repo_count = config.repos.len();
-                let group_count = config.groups.len();
+                // Count the virtual "all" group when repos are registered, so the
+                // summary doesn't read "0 group(s)" while `all` is actually available.
+                let group_count = config.groups.len() + if config.repos.is_empty() { 0 } else { 1 };
                 let statuses = serve_state.repo_statuses_lightweight();
                 let open_count = statuses
                     .iter()
@@ -7080,7 +7066,7 @@ impl CodesearchService {
 
             let response = ListProjectsResponse {
                 repos: repos_info,
-                groups: config.groups,
+                groups: config.groups_with_virtual_all(),
                 serve_active,
                 serve_url,
                 current_directory: current_dir.display().to_string(),
@@ -7137,7 +7123,7 @@ impl CodesearchService {
 
         let response = ListProjectsResponse {
             repos: repos_info,
-            groups: config.groups,
+            groups: config.groups_with_virtual_all(),
             serve_active,
             serve_url,
             current_directory: current_dir.display().to_string(),
@@ -7247,28 +7233,33 @@ fn contains_symbol_as_word(sig: &str, symbol: &str) -> bool {
     false
 }
 
-#[tool_handler]
-impl ServerHandler for CodesearchService {
-    fn get_info(&self) -> ServerInfo {
-        let db_exists = self.db_path.exists();
-        let mode = if self.serve_state.is_some() {
-            "serve hub (direct)".to_string()
-        } else {
-            "self-contained (stdio)".to_string()
-        };
+/// MCP server instructions template (pre-substitution). Kept as a named const so
+/// the line-count and deprecated-alias tests can validate it directly without
+/// fragile `include_str!` source-text searching or instantiating the service.
+/// Substitution uses `str::replace` (not `format!`) because `format!` requires a
+/// literal; the placeholders are unique tokens that don't appear in the prose.
+/// See `test_instructions_max_50_lines` / `test_no_deprecated_tool_aliases`.
+const INSTRUCTIONS_TEMPLATE: &str = r#"codesearch — semantic code search + symbol impact analysis.
 
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("codesearch", env!("CARGO_PKG_VERSION")))
-            .with_instructions(format!(
-                r#"codesearch — semantic code search + symbol impact analysis.
+WHEN TO USE codesearch (prefer over grep/glob):
+  Good for: semantic or cross-file lookup, unknown file paths, symbol navigation,
+    "where is X implemented", "find usages of Y", "how does Z flow through the code"
+  Not for: a single known file (just read it), trivial one-line edits,
+    exact literal patterns where plain grep is faster
+
+SERVICE-MODE NOTES (codesearch serve, esp. on another host):
+  - Paths come from the SERVER's filesystem. Use get_chunk to read content;
+    don't try to open returned paths locally.
+  - Not every directory is indexed (e.g. .venv, node_modules, build/). If a
+    search returns nothing, the dir may be unindexed — ask, don't grep blindly.
 
 PICK THE RIGHT TOOL FOR THE TASK:
-  "who calls X?" / "what breaks if I rename X?" / "find all refs"
-    → find_impact (file/line-precise, transitive callers, C# via SCIP)
+  "who calls X?" / "what breaks if I rename X?"
+    → find_impact (C# via SCIP; other languages: use find kind="usages")
   "find code about X" / "how does X work" / "show me X"
-    → search(mode="semantic") — understands concepts + synonyms + identifiers
+    → search(mode="semantic") — concepts + synonyms + identifiers
   exact syntax like Vec<T> / foo = null / a::b
-    → search(mode="literal", regex=true) — ONLY for patterns semantic can't match
+    → search(mode="literal", regex=true) — patterns semantic can't match
   "where is X defined?" / "what does file X import?"
     → find(kind="definition" | "imports")
   "show all symbols in file X" / "code like chunk Y"
@@ -7278,23 +7269,37 @@ PICK THE RIGHT TOOL FOR THE TASK:
 
 RULES:
   - search(semantic) is the DEFAULT for code lookup. Don't skip it.
-  - find_impact BEFORE search when the task is about renaming/removing a specific symbol.
-  - find_impact > find(kind="usages") — it returns transitive callers, not just direct refs.
-  - NEVER use literal as first search unless you need exact syntax patterns.
+  - find_impact for C# refactors; find(kind="usages") for other languages.
+  - NEVER use literal as first search unless you need exact syntax.
   - project or group is REQUIRED in multi-repo mode.
 
 Mode: {mode}
 Project: {project}
 Database: {db} ({exists})
 Model: {model} ({dims}d)
-"#,
-                mode = mode,
-                project = self.project_path.display(),
-                db = self.db_path.display(),
-                exists = if db_exists { "ready" } else { "not found" },
-                model = self.model_type.short_name(),
-                dims = self.dimensions
-            ))
+"#;
+
+#[tool_handler]
+impl ServerHandler for CodesearchService {
+    fn get_info(&self) -> ServerInfo {
+        let db_exists = self.db_path.exists();
+        let mode = if self.serve_state.is_some() {
+            "serve hub (direct)"
+        } else {
+            "self-contained (stdio)"
+        };
+
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("codesearch", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                INSTRUCTIONS_TEMPLATE
+                    .replace("{mode}", mode)
+                    .replace("{project}", &self.project_path.display().to_string())
+                    .replace("{db}", &self.db_path.display().to_string())
+                    .replace("{exists}", if db_exists { "ready" } else { "not found" })
+                    .replace("{model}", self.model_type.short_name())
+                    .replace("{dims}", &self.dimensions.to_string()),
+            )
     }
 }
 

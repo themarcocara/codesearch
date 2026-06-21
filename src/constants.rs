@@ -118,6 +118,14 @@ pub fn global_codesearchignore_path() -> Option<PathBuf> {
 /// Name of the repos configuration file
 pub const REPOS_CONFIG_FILE: &str = "repos.json";
 
+/// Reserved name of the virtual group that resolves to ALL registered repos.
+///
+/// This group is NOT stored in `repos.json` — it is resolved dynamically by
+/// `ServeState::resolve_group_aliases` and `ReposConfig::resolve_group`, so it
+/// always reflects the current set of registered aliases. Because it is reserved,
+/// `codesearch groups add all` is rejected. See issue #131.
+pub const ALL_GROUP_NAME: &str = "all";
+
 /// Default LMDB map size in megabytes (1024MB).
 ///
 /// This is the maximum virtual address space reserved for the memory-mapped database.
