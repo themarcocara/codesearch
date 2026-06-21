@@ -219,6 +219,34 @@ codesearch serve
 
 > **Note:** In multi-repo mode, agents must specify `project` or `group` in tool calls. `status` always works without scope. `get_chunk` auto-routes when the chunk_id is unique across repos; if ambiguous, it returns candidates and requires `project`.
 
+### Agent Guidance (making agents use codesearch, not grep)
+
+codesearch publishes **instructions** to every MCP client on connect (via the `initialize` handshake). These tell the agent *when* to reach for codesearch vs grep/glob, *which* tool to pick, and the service-mode caveats (paths are from the server's filesystem; not every directory is indexed). Most clients (OpenCode, Cursor) surface these automatically.
+
+If your agent **skips codesearch** and falls back to grep/glob too often, add this quickstart to its project rules (`AGENTS.md` for Claude Code / OpenCode, `.cursorrules` for Cursor, custom instructions for others):
+
+```markdown
+## Codesearch quickstart
+
+Prefer codesearch over manual grep/glob for:
+- semantic, cross-file, or symbol-oriented lookup
+- cases where you don't know the exact file path
+- "where is X implemented", "find usages of Y", "how does Z flow through the code"
+
+Use plain grep/glob instead for:
+- a single known file
+- trivial one-line edits
+- exact literal searches
+
+When codesearch runs as a remote service (`codesearch serve` on another host),
+the paths it returns are from the SERVER's filesystem. Use the `get_chunk` tool
+to read content — don't try to open returned paths locally. Not every directory
+is indexed (e.g. `.venv`, `node_modules`, `build/`); if a search returns nothing,
+the dir may simply be unindexed.
+```
+
+> **OpenCode users:** the user-level `~/.config/opencode/AGENTS.md` is the right place for this — it applies across all projects. Claude Code reads a project-level `AGENTS.md` instead, so add the quickstart per-project (or symlink a shared one).
+
 ## MCP Tools Reference
 
 ### `search` — Code Search
