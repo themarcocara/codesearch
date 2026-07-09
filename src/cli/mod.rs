@@ -14,7 +14,8 @@ use crate::search::SearchOptions;
 pub enum IndexCommands {
     /// Add a repository to the index (creates local or global index)
     Add {
-        /// Path to add (defaults to current directory)
+        /// Path to add (defaults to current directory).
+        /// With --remote: a path on the remote peer's filesystem.
         path: Option<PathBuf>,
 
         /// Create global index instead of local
@@ -24,21 +25,40 @@ pub enum IndexCommands {
         /// Embedding model (overrides global --model for this repo)
         #[arg(long)]
         model: Option<String>,
+
+        /// Register the repo on a remote peer (name from `codesearch remote list`).
+        /// When set, <path> is a path on the remote's filesystem.
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Remove the index (local or global, auto-detected)
     #[command(visible_alias = "rm")]
     Remove {
-        /// Path to remove (defaults to current directory)
+        /// Path to remove (defaults to current directory).
+        /// With --remote: the remote **alias** to unregister (not a local path).
         path: Option<PathBuf>,
 
         /// Delete the DB only, preserve the config entry
         #[arg(long)]
         keep_config: bool,
+
+        /// Remove a repo from a remote peer. The positional arg is a remote alias.
+        #[arg(long)]
+        remote: Option<String>,
     },
 
-    /// Show index status (local or global)
-    List,
+    /// Show index status (local, global, or on a remote peer)
+    #[command(visible_alias = "ls")]
+    List {
+        /// List indexes on a remote peer.
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Output JSON (requires --remote; agent-friendly).
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Rebuild symbol index (C# via scip-csharp) for a repository
     Symbol {
@@ -48,6 +68,24 @@ pub enum IndexCommands {
         /// Force full symbol rebuild (ignores cached state)
         #[arg(short = 'f', long)]
         force: bool,
+    },
+
+    /// Reindex a repository (incremental, or full rebuild with --force)
+    Reindex {
+        /// Repository alias (required — use "index list" to see aliases)
+        alias: String,
+
+        /// Force full re-index (ignore incremental state)
+        #[arg(short = 'f', long)]
+        force: bool,
+
+        /// Reindex on a remote peer.
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Output JSON (requires --remote; agent-friendly).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Remove stale entries from repos.json (relocates moved repos first)
@@ -78,6 +116,7 @@ pub enum CacheCommands {
 #[derive(Subcommand, Debug)]
 pub enum GroupsCommands {
     /// List all groups
+    #[command(visible_alias = "ls")]
     List,
 
     /// Create or update a group
@@ -98,14 +137,107 @@ pub enum GroupsCommands {
     },
 }
 
-/// Hook subcommands
+/// Remote federation-peer subcommands
+#[derive(Subcommand, Debug)]
+pub enum RemoteCommands {
+    /// List configured remote peers
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Add (or overwrite) a remote `codesearch serve` peer for federation
+    Add {
+        /// Peer name (referenced from groups as "@<name>")
+        name: String,
+
+        /// Base URL of the remote serve instance (e.g. https://codesearch.example.com)
+        #[arg(long, visible_alias = "base-url")]
+        url: String,
+
+        /// Bearer / X-API-Key secret accepted by the remote (required when the
+        /// remote binds a non-localhost address)
+        #[arg(long)]
+        api_key: Option<String>,
+
+        /// Group to query on the remote (in the remote's own repos.json);
+        /// defaults to the remote's virtual "all" group when omitted
+        #[arg(long)]
+        group: Option<String>,
+
+        /// Per-peer request timeout in seconds (default 15)
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+
+        /// Also add "@<name>" to this LOCAL group (created if needed) so the
+        /// peer is actually queryable via that group
+        #[arg(long)]
+        into_group: Option<String>,
+    },
+
+    /// Remove a remote peer (and prune "@<name>" from any groups)
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// Peer name
+        name: String,
+    },
+
+    /// List the individual projects a peer exposes, marking which are mounted
+    #[command(visible_alias = "avail")]
+    Available {
+        /// Peer name (as configured with `remote add`)
+        peer: String,
+    },
+
+    /// Mount an individual remote project locally (opt-in), by "<peer>/<alias>"
+    Mount {
+        /// Canonical name "<peer>/<alias>" (see `remote available`)
+        name: String,
+    },
+
+    /// Unmount a previously mounted remote project, by "<peer>/<alias>"
+    #[command(visible_alias = "umount")]
+    Unmount {
+        /// Canonical name "<peer>/<alias>"
+        name: String,
+    },
+
+    /// List the remote projects currently mounted locally
+    Mounts,
+}
+
+/// `hooks` subcommands — grouped by integration target.
 #[derive(Subcommand, Debug)]
 pub enum HookCommands {
+    /// Manage the git hooks (post-checkout worktree auto-registration)
+    Git {
+        #[command(subcommand)]
+        command: HookGitCommands,
+    },
+    /// Manage the Claude Code integration hooks (codesearch-first guards)
+    Claude {
+        #[command(subcommand)]
+        command: HookClaudeCommands,
+    },
+}
+
+/// `hooks git` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum HookGitCommands {
     /// Install a post-checkout hook that auto-registers new git worktrees with codesearch serve
     Install {
         /// Path to the git repository (defaults to current directory)
         #[arg(long)]
         path: Option<PathBuf>,
+    },
+}
+
+/// `hooks claude` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum HookClaudeCommands {
+    /// Install the Claude Code PreToolUse guard hooks (codesearch-first) into settings.json
+    Install {
+        /// Install into the project's ./.claude instead of the user-level ~/.claude
+        #[arg(long)]
+        project: bool,
     },
 }
 
@@ -305,6 +437,18 @@ pub enum Commands {
         #[arg(long)]
         no_tui: bool,
 
+        /// Cloud keep-warm: self-ping this ingress URL (e.g. the app's public
+        /// FQDN) to stay warm on a scale-to-zero host while recently active.
+        /// Overrides CODESEARCH_KEEP_WARM_URL.
+        #[arg(long)]
+        keep_warm_url: Option<String>,
+
+        /// Idle window (seconds) before keep-warm stops and the host may
+        /// suspend the replica (default 7200 = 2h). Overrides
+        /// CODESEARCH_IDLE_SUSPEND_SECS.
+        #[arg(long)]
+        idle_suspend_secs: Option<u64>,
+
         /// For `tui` action: serve URL to connect to
         #[arg(long, default_value = DEFAULT_SERVE_URL)]
         url: String,
@@ -385,13 +529,20 @@ pub enum Commands {
         command: GroupsCommands,
     },
 
+    /// Manage remote federation peers (other `codesearch serve` instances)
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommands,
+    },
+
     /// Manage persistent embedding cache
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
     },
 
-    /// Install git hooks for automatic codesearch integration
+    /// Manage codesearch integration hooks (git worktree auto-index, Claude Code guards)
+    #[command(name = "hooks", alias = "hook")]
     Hook {
         #[command(subcommand)]
         command: HookCommands,
@@ -469,6 +620,255 @@ async fn trigger_symbol_reindex_via_api(alias: &str, force: bool) -> Result<()> 
             }
         }
     }
+}
+
+/// Trigger a text reindex by calling the running serve instance's HTTP API.
+/// Like [`trigger_symbol_reindex_via_api`] but without `symbols=true`.
+async fn trigger_reindex_via_api(alias: &str, force: bool) -> Result<()> {
+    use colored::Colorize;
+
+    let base = serve_base_url();
+    let url = if force {
+        format!("{base}{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}?force=true")
+    } else {
+        format!("{base}{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}")
+    };
+
+    println!(
+        "  {} reindex for '{}' via {url}",
+        "⟳".yellow(),
+        alias.bright_green()
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+
+    let resp = client.post(&url).send().await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            if status.as_u16() == 202 {
+                println!(
+                    "  {} reindex accepted — rebuilding in background",
+                    "✓".green()
+                );
+                Ok(())
+            } else if status.as_u16() == 404 {
+                anyhow::bail!(
+                    "Unknown alias '{}' — use `codesearch index list` to see registered repos",
+                    alias
+                );
+            } else if status.as_u16() == 409 {
+                anyhow::bail!("Reindex already in progress for '{}'", alias);
+            } else {
+                anyhow::bail!("Serve returned HTTP {}: {}", status.as_u16(), body.trim());
+            }
+        }
+        Err(e) => {
+            if e.is_connect() {
+                anyhow::bail!(
+                    "Cannot connect to codesearch serve at {}.\n  Is `codesearch serve` running?",
+                    base
+                );
+            } else {
+                anyhow::bail!("HTTP request failed: {}", e);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote index management (--remote <peer>)
+// ---------------------------------------------------------------------------
+
+/// Resolve a peer name (from `codesearch remote list`) into a [`RemotePeer`].
+fn resolve_remote_peer(name: &str) -> Result<crate::db_discovery::repos::RemotePeer> {
+    let config = crate::db_discovery::load_repos_config()?;
+    match config.remotes.get(name) {
+        Some(peer) => Ok(peer.clone()),
+        None => {
+            let mut known: Vec<&String> = config.remotes.keys().collect();
+            known.sort();
+            anyhow::bail!(
+                "Unknown remote '{}'.{}",
+                name,
+                if known.is_empty() {
+                    " No remotes configured — add one with `codesearch remote add <name> --url <URL>`.".to_string()
+                } else {
+                    format!(
+                        " Configured remotes: {}.",
+                        known
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            )
+        }
+    }
+}
+
+/// Unwrap a [`ManagementOutcome`] into a [`Result`], producing a clear error
+/// that names the peer and distinguishes "peer rejected" from "peer unreachable".
+fn unwrap_management<T>(
+    peer_name: &str,
+    outcome: crate::federation::ManagementOutcome<T>,
+) -> Result<T> {
+    match outcome {
+        crate::federation::ManagementOutcome::Ok(v) => Ok(v),
+        crate::federation::ManagementOutcome::HttpError { status, reason } => {
+            anyhow::bail!("Peer '{}' returned HTTP {}: {}", peer_name, status, reason);
+        }
+        crate::federation::ManagementOutcome::Unreachable(msg) => {
+            anyhow::bail!("Cannot reach peer '{}': {}", peer_name, msg);
+        }
+    }
+}
+
+/// `codesearch index list --remote <peer>` — list repos registered on a peer.
+async fn run_remote_list(peer_name: &str, json: bool) -> Result<()> {
+    use colored::Colorize;
+
+    let peer = resolve_remote_peer(peer_name)?;
+    let client = crate::federation::FederationClient::new().map_err(anyhow::Error::msg)?;
+    let status = unwrap_management(peer_name, client.list_repos(&peer).await)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+
+    println!("Remote '{}' ({}):", peer_name.bright_cyan(), peer.url);
+    if status.repos.is_empty() {
+        println!("  No repositories registered on this peer.");
+    } else {
+        // Aligned table: alias | status | lock | changes | last_tool_call
+        for repo in &status.repos {
+            let last = repo.last_tool_call.as_deref().unwrap_or("—");
+            println!(
+                "  {:<18} {:<10} {:<6} {:>6} changes   last: {}",
+                repo.alias, repo.status, repo.lock_mode, repo.changes, last
+            );
+        }
+    }
+    let mut meta = Vec::new();
+    if let Some(v) = status.version {
+        meta.push(format!("version: {}", v));
+    }
+    if let Some(u) = status.uptime_secs {
+        meta.push(format!("uptime: {}", format_duration(u)));
+    }
+    if let Some(s) = status.active_sessions {
+        meta.push(format!("sessions: {}", s));
+    }
+    if !meta.is_empty() {
+        println!("  {}", meta.join("  |  "));
+    }
+    Ok(())
+}
+
+/// Format a duration in seconds as a human-readable string (e.g. "3h 24m").
+fn format_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// `codesearch index add <path> --remote <peer>` — register a repo on a peer.
+async fn run_remote_add(peer_name: &str, path: Option<PathBuf>) -> Result<()> {
+    use colored::Colorize;
+
+    let remote_path = path
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Path required: `codesearch index add <path> --remote <peer>` (path on the remote's filesystem)"
+            )
+        })?;
+
+    let peer = resolve_remote_peer(peer_name)?;
+    let client = crate::federation::FederationClient::new().map_err(anyhow::Error::msg)?;
+    let added = unwrap_management(peer_name, client.add_repo(&peer, remote_path).await)?;
+
+    println!(
+        "{} Added '{}' on peer '{}' (path: {})",
+        "✓".green(),
+        added.alias.bright_green(),
+        peer_name.bright_cyan(),
+        added.path
+    );
+    if let Some(msg) = added.message {
+        println!("  {}", msg);
+    }
+    Ok(())
+}
+
+/// `codesearch index rm <alias> --remote <peer>` — unregister a repo on a peer.
+async fn run_remote_remove(peer_name: &str, alias: Option<PathBuf>) -> Result<()> {
+    use colored::Colorize;
+
+    let alias_str = alias
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Alias required: `codesearch index rm <alias> --remote <peer>` (remote alias, not a local path)"
+            )
+        })?;
+
+    let peer = resolve_remote_peer(peer_name)?;
+    let client = crate::federation::FederationClient::new().map_err(anyhow::Error::msg)?;
+    let removed = unwrap_management(peer_name, client.remove_repo(&peer, alias_str).await)?;
+
+    println!(
+        "{} Removed '{}' from peer '{}'",
+        "✓".green(),
+        removed.alias.bright_green(),
+        peer_name.bright_cyan()
+    );
+    if let Some(msg) = removed.message {
+        println!("  {}", msg);
+    }
+    Ok(())
+}
+
+/// `codesearch index reindex <alias> --remote <peer>` — trigger reindex on a peer.
+async fn run_remote_reindex(peer_name: &str, alias: &str, force: bool, json: bool) -> Result<()> {
+    use colored::Colorize;
+
+    let peer = resolve_remote_peer(peer_name)?;
+    let client = crate::federation::FederationClient::new().map_err(anyhow::Error::msg)?;
+    let result = unwrap_management(peer_name, client.reindex(&peer, alias, force).await)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    let mode = if force { "force " } else { "" };
+    println!(
+        "{} {}reindex started for '{}' on peer '{}'",
+        "⟳".yellow(),
+        mode,
+        alias.bright_green(),
+        peer_name.bright_cyan()
+    );
+    if let Some(msg) = result.message {
+        println!("  {}", msg);
+    }
+    Ok(())
 }
 
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
@@ -564,28 +964,67 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         path: add_path,
                         global,
                         model,
+                        remote,
                     } => {
-                        let mt = model
-                            .as_deref()
-                            .and_then(|m| {
-                                let parsed = ModelType::parse(m);
-                                if parsed.is_none() {
-                                    eprintln!("Unknown model: '{}'. Available models:", m);
-                                    eprintln!("  {}", ModelType::valid_short_names());
-                                    std::process::exit(1);
-                                }
-                                parsed
-                            })
-                            .or(model_type);
-                        crate::index::add_to_index(add_path, global, mt, cancel_token.clone()).await
+                        if let Some(peer_name) = &remote {
+                            run_remote_add(peer_name, add_path).await
+                        } else {
+                            let mt = model
+                                .as_deref()
+                                .and_then(|m| {
+                                    let parsed = ModelType::parse(m);
+                                    if parsed.is_none() {
+                                        eprintln!("Unknown model: '{}'. Available models:", m);
+                                        eprintln!("  {}", ModelType::valid_short_names());
+                                        std::process::exit(1);
+                                    }
+                                    parsed
+                                })
+                                .or(model_type);
+                            crate::index::add_to_index(add_path, global, mt, cancel_token.clone())
+                                .await
+                        }
                     }
                     IndexCommands::Remove {
                         path: rm_path,
                         keep_config,
-                    } => crate::index::remove_from_index(rm_path, keep_config).await,
-                    IndexCommands::List => crate::index::list_index_status().await,
+                        remote,
+                    } => {
+                        if let Some(peer_name) = &remote {
+                            run_remote_remove(peer_name, rm_path).await
+                        } else {
+                            crate::index::remove_from_index(rm_path, keep_config).await
+                        }
+                    }
+                    IndexCommands::List { remote, json } => {
+                        if let Some(peer_name) = &remote {
+                            run_remote_list(peer_name, json).await
+                        } else if json {
+                            anyhow::bail!(
+                                "--json is only supported with --remote (local list is always a table)"
+                            )
+                        } else {
+                            crate::index::list_index_status().await
+                        }
+                    }
                     IndexCommands::Symbol { alias, force } => {
                         trigger_symbol_reindex_via_api(&alias, force).await
+                    }
+                    IndexCommands::Reindex {
+                        alias,
+                        force,
+                        remote,
+                        json,
+                    } => {
+                        if let Some(peer_name) = &remote {
+                            run_remote_reindex(peer_name, &alias, force, json).await
+                        } else if json {
+                            anyhow::bail!(
+                                "--json is only supported with --remote (local reindex prints a status line)"
+                            )
+                        } else {
+                            trigger_reindex_via_api(&alias, force).await
+                        }
                     }
                     IndexCommands::Prune => crate::index::prune_index().await,
                 }
@@ -655,6 +1094,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             verbose,
             create_index: _,
             no_tui,
+            keep_warm_url,
+            idle_suspend_secs,
             url,
         } => {
             match action {
@@ -668,8 +1109,16 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
                         eprintln!("Warning: failed to initialize serve logger: {}", e);
                     }
-                    crate::serve::run_serve(host, port, register, no_tui, cancel_token.clone())
-                        .await
+                    crate::serve::run_serve(
+                        host,
+                        port,
+                        register,
+                        no_tui,
+                        keep_warm_url,
+                        idle_suspend_secs,
+                        cancel_token.clone(),
+                    )
+                    .await
                 }
             }
         }
@@ -699,8 +1148,16 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
         },
         Commands::Groups { command } => run_groups_command(command).await,
+        Commands::Remote { command } => run_remote_command(command).await,
         Commands::Hook { command } => match command {
-            HookCommands::Install { path } => run_hook_install(path).await,
+            HookCommands::Git { command } => match command {
+                HookGitCommands::Install { path } => run_hook_git_install(path).await,
+            },
+            HookCommands::Claude { command } => match command {
+                HookClaudeCommands::Install { project } => {
+                    claude_hooks::run_claude_install(project)
+                }
+            },
         },
     }
 }
@@ -929,8 +1386,180 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
     Ok(())
 }
 
-/// Install the post-checkout git hook for codesearch worktree auto-indexing.
-async fn run_hook_install(path: Option<PathBuf>) -> Result<()> {
+/// Handle remote federation-peer subcommands
+async fn run_remote_command(command: RemoteCommands) -> Result<()> {
+    use crate::constants::DEFAULT_REMOTE_TIMEOUT_SECS;
+    use crate::db_discovery::repos::RemotePeer;
+
+    match command {
+        RemoteCommands::List => {
+            let config = crate::db_discovery::load_repos_config()?;
+            if config.remotes.is_empty() {
+                println!("No remote peers configured.");
+                return Ok(());
+            }
+            println!("Remote peers:");
+            let mut names: Vec<&String> = config.remotes.keys().collect();
+            names.sort();
+            for name in names {
+                let peer = &config.remotes[name];
+                let group = peer.group.as_deref().unwrap_or("(remote's \"all\")");
+                let timeout = peer.timeout_secs.unwrap_or(DEFAULT_REMOTE_TIMEOUT_SECS);
+                let auth = if peer.api_key.is_empty() {
+                    "no api-key"
+                } else {
+                    "api-key set"
+                };
+                let refs = config.groups_referencing_remote(name);
+                let wired = if refs.is_empty() {
+                    "not in any group — add with --into-group or `codesearch groups`".to_string()
+                } else {
+                    format!("groups: {}", refs.join(", "))
+                };
+                println!(
+                    "  @{name}: {url} [remote-group={group}, timeout={timeout}s, {auth}]\n      {wired}",
+                    url = peer.url
+                );
+            }
+        }
+        RemoteCommands::Add {
+            name,
+            url,
+            api_key,
+            group,
+            timeout_secs,
+            into_group,
+        } => {
+            let mut config = crate::db_discovery::load_repos_config()?;
+            let peer = RemotePeer {
+                url,
+                api_key: api_key.unwrap_or_default(),
+                group,
+                timeout_secs,
+            };
+            config.add_remote(name.clone(), peer)?;
+            if let Some(g) = &into_group {
+                config.add_remote_to_group(g.clone(), name.trim())?;
+            }
+            config.save()?;
+            println!("Remote peer '{}' added/updated.", name.trim());
+            if let Some(g) = into_group {
+                println!("  wired into group '{}' as \"@{}\".", g, name.trim());
+            } else {
+                println!(
+                    "  note: add it to a group to query it, e.g. `codesearch remote add {} --url ... --into-group docs`",
+                    name.trim()
+                );
+            }
+        }
+        RemoteCommands::Remove { name } => {
+            let name = name.trim();
+            let mut config = crate::db_discovery::load_repos_config()?;
+            if config.remove_remote(name) {
+                config.save()?;
+                println!("Remote peer '{}' removed.", name);
+            } else {
+                eprintln!("Remote peer '{}' not found.", name);
+            }
+        }
+        RemoteCommands::Available { peer } => {
+            use crate::db_discovery::repos::remote_project_name;
+            use crate::federation::{FederationClient, ManagementOutcome};
+
+            let peer_name = peer.trim();
+            let config = crate::db_discovery::load_repos_config()?;
+            let Some(peer_cfg) = config.remotes.get(peer_name) else {
+                anyhow::bail!(
+                    "Unknown remote peer '{}'. Add it first with `codesearch remote add`.",
+                    peer_name
+                );
+            };
+            let client = FederationClient::new()
+                .map_err(|e| anyhow::anyhow!("failed to init HTTP client: {e}"))?;
+            match client.list_repos(peer_cfg).await {
+                ManagementOutcome::Ok(status) => {
+                    if status.repos.is_empty() {
+                        println!("Peer '{}' exposes no projects.", peer_name);
+                        return Ok(());
+                    }
+                    let mounted: std::collections::HashSet<&String> =
+                        config.remote_mounts.iter().collect();
+                    let mut repos = status.repos;
+                    repos.sort_by(|a, b| a.alias.cmp(&b.alias));
+                    println!("Projects on '{}':", peer_name);
+                    for r in &repos {
+                        let canonical = remote_project_name(peer_name, &r.alias);
+                        let mark = if mounted.contains(&canonical) {
+                            "✓ mounted"
+                        } else {
+                            "  -      "
+                        };
+                        println!("  {mark}  {canonical}  [{}]", r.status);
+                    }
+                    println!("\nMount one with: codesearch remote mount <peer>/<alias>");
+                }
+                ManagementOutcome::HttpError { status, reason } => {
+                    anyhow::bail!("Peer '{}' returned HTTP {}: {}", peer_name, status, reason);
+                }
+                ManagementOutcome::Unreachable(reason) => {
+                    anyhow::bail!("Peer '{}' unreachable: {}", peer_name, reason);
+                }
+            }
+        }
+        RemoteCommands::Mount { name } => {
+            let name = name.trim();
+            let mut config = crate::db_discovery::load_repos_config()?;
+            config.mount_remote_project(name)?;
+            config.save()?;
+            println!(
+                "Mounted remote project '{}'. Query it with `project={}`.",
+                name, name
+            );
+            println!("  (If `codesearch serve` is running, press 'l' in its TUI to reload.)");
+        }
+        RemoteCommands::Unmount { name } => {
+            let name = name.trim();
+            let mut config = crate::db_discovery::load_repos_config()?;
+            if config.unmount_remote_project(name) {
+                config.save()?;
+                println!("Unmounted remote project '{}'.", name);
+            } else {
+                eprintln!("Remote project '{}' was not mounted.", name);
+            }
+        }
+        RemoteCommands::Mounts => {
+            use crate::db_discovery::repos::{remote_project_name, Target};
+
+            let config = crate::db_discovery::load_repos_config()?;
+            if config.remote_mounts.is_empty() {
+                println!("No remote projects mounted. See `codesearch remote available <peer>`.");
+                return Ok(());
+            }
+            println!("Mounted remote projects:");
+            for (name, target) in config.mounted_remote_projects() {
+                if let Target::RemoteProject {
+                    peer_name,
+                    peer,
+                    remote_alias,
+                } = target
+                {
+                    let canonical = remote_project_name(&peer_name, &remote_alias);
+                    if name == canonical {
+                        println!("  {name}  ({})", peer.url);
+                    } else {
+                        // A local rename override is in effect.
+                        println!("  {name}  → {canonical}  ({})", peer.url);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Install the post-checkout git hook for codesearch worktree auto-indexing
+/// (`codesearch hooks git install`).
+async fn run_hook_git_install(path: Option<PathBuf>) -> Result<()> {
     use colored::Colorize;
 
     let repo_path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -982,7 +1611,7 @@ async fn run_hook_install(path: Option<PathBuf>) -> Result<()> {
     let hook_script = r#"#!/bin/bash
 # codesearch post-checkout hook
 # Auto-registers new worktrees with codesearch serve.
-# Installed by: codesearch hook install
+# Installed by: codesearch hooks git install
 # $1 = prev_ref, $2 = new_ref, $3 = flag (1=branch checkout)
 
 SERVE_URL_FILE="$HOME/.codesearch/serve_url"
@@ -1027,6 +1656,7 @@ fi
     Ok(())
 }
 
+pub mod claude_hooks;
 pub mod doctor;
 pub mod setup;
 
@@ -1112,6 +1742,126 @@ mod tests {
                 ..
             } => (),
             _ => panic!("expected Index::Remove subcommand with keep_config"),
+        }
+    }
+
+    // --- --remote flag tests ---
+
+    #[test]
+    fn test_cli_index_add_with_remote() {
+        let cli = Cli::try_parse_from([
+            "codesearch",
+            "index",
+            "add",
+            "/app/docs",
+            "--remote",
+            "peer-a",
+        ])
+        .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Index {
+                command:
+                    Some(IndexCommands::Add {
+                        path,
+                        remote: Some(peer),
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(path.as_deref(), Some(std::path::Path::new("/app/docs")));
+                assert_eq!(peer, "peer-a");
+            }
+            _ => panic!("expected Index::Add with --remote"),
+        }
+    }
+
+    #[test]
+    fn test_cli_index_rm_with_remote() {
+        let cli =
+            Cli::try_parse_from(["codesearch", "index", "rm", "inriver", "--remote", "peer-a"])
+                .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Index {
+                command:
+                    Some(IndexCommands::Remove {
+                        remote: Some(peer), ..
+                    }),
+                ..
+            } => assert_eq!(peer, "peer-a"),
+            _ => panic!("expected Index::Remove with --remote"),
+        }
+    }
+
+    #[test]
+    fn test_cli_index_list_with_remote() {
+        let cli = Cli::try_parse_from([
+            "codesearch",
+            "index",
+            "list",
+            "--remote",
+            "peer-a",
+            "--json",
+        ])
+        .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Index {
+                command:
+                    Some(IndexCommands::List {
+                        remote: Some(peer),
+                        json: true,
+                    }),
+                ..
+            } => assert_eq!(peer, "peer-a"),
+            _ => panic!("expected Index::List with --remote and --json"),
+        }
+    }
+
+    #[test]
+    fn test_cli_index_reindex_local() {
+        let cli = Cli::try_parse_from(["codesearch", "index", "reindex", "docs"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Index {
+                command:
+                    Some(IndexCommands::Reindex {
+                        alias,
+                        force: false,
+                        remote: None,
+                        json: false,
+                    }),
+                ..
+            } => assert_eq!(alias, "docs"),
+            _ => panic!("expected Index::Reindex (local)"),
+        }
+    }
+
+    #[test]
+    fn test_cli_index_reindex_with_remote_and_force() {
+        let cli = Cli::try_parse_from([
+            "codesearch",
+            "index",
+            "reindex",
+            "inriver",
+            "--force",
+            "--remote",
+            "peer-a",
+        ])
+        .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Index {
+                command:
+                    Some(IndexCommands::Reindex {
+                        alias,
+                        force: true,
+                        remote: Some(peer),
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(alias, "inriver");
+                assert_eq!(peer, "peer-a");
+            }
+            _ => panic!("expected Index::Reindex with --remote and --force"),
         }
     }
 }

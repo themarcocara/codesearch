@@ -266,7 +266,7 @@ pub struct SimilarChunksRequest {
 // ═══════════════════════════════════════════════════════════════════
 
 /// Search result item — returned by semantic search
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResultItem {
     pub chunk_id: u32,
     pub path: String,
@@ -282,6 +282,19 @@ pub struct SearchResultItem {
     pub context_prev: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_next: Option<String>,
+    /// Federation source tag: `None` for local results,
+    /// `Some("<peer>/<remote_alias>")` for results merged in from a remote peer
+    /// (e.g. `Some("cloud/inriver")`). Lets the agent tell where a hit
+    /// originated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Federated chunk reference for retrieval, of the form
+    /// `"<peer>/<remote_alias>:<chunk_id>"` (e.g. `"cloud/inriver:12345"`).
+    /// Present only for remote results; pass it back to
+    /// `get_chunk(chunk_ref=...)` to fetch the chunk content from the peer.
+    /// Local results are fetched with the plain numeric `chunk_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_ref: Option<String>,
 }
 
 /// Reference/call site item — returned by find_references, find_definition, find_usages
@@ -376,6 +389,12 @@ pub struct SemanticSearchResponse {
     pub low_confidence: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_tool: Option<String>,
+    /// Federation health warnings — populated when one or more remote peers in
+    /// the queried group were unreachable. The query still returns (degraded)
+    /// local + remaining-remote results; these warnings explain the gap so an
+    /// agent doesn't mistake a partial result set for exhaustive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
 }
 
 /// File outline entry
@@ -391,7 +410,18 @@ pub struct FileOutlineItem {
 /// Request to fetch a chunk by ID
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetChunkRequest {
+    /// Local chunk id. Ignored when `chunk_ref` is set (federated fetch).
+    #[serde(default)]
     pub chunk_id: u32,
+    /// Federated chunk reference `"<peer>/<remote_alias>:<chunk_id>"`
+    /// (e.g. `"cloud/inriver:12345"`), as returned verbatim in a remote search
+    /// result's `chunk_ref`. The `<remote_alias>` segment scopes the fetch to a
+    /// single remote project so the multi-repo peer can disambiguate the
+    /// chunk_id. When set, the chunk is fetched from the named remote peer and
+    /// `chunk_id`/`project`/`group` are ignored. (A legacy `"<peer>:<chunk_id>"`
+    /// ref without an alias is still accepted for backward compatibility.)
+    #[serde(default)]
+    pub chunk_ref: Option<String>,
     pub context_lines: Option<usize>,
     pub project: Option<String>,
     #[serde(default)]
@@ -439,10 +469,29 @@ pub struct DependentItem {
 pub struct ListProjectsResponse {
     pub repos: Vec<RepoInfo>,
     pub groups: HashMap<String, Vec<String>>,
+    /// Mounted remote projects (opt-in federation), each routable by `name` as a
+    /// first-class `project=`. Empty when nothing is mounted. Kept separate from
+    /// `repos` so an agent can tell local indexes from federated ones.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub remote_projects: Vec<RemoteProjectInfo>,
     pub serve_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve_url: Option<String>,
     pub current_directory: String,
+}
+
+/// A mounted remote project surfaced as a first-class, routable project.
+#[derive(Debug, Serialize)]
+pub struct RemoteProjectInfo {
+    /// Local name to pass as `project=` — the canonical `<peer>/<alias>` or the
+    /// user's rename.
+    pub name: String,
+    /// The federation peer this project lives on.
+    pub peer: String,
+    /// The bare project alias on the peer (what is forwarded as `project=`).
+    pub remote_alias: String,
+    /// The peer's base URL.
+    pub peer_url: String,
 }
 
 /// Information about a single registered project/repo.
@@ -455,6 +504,12 @@ pub struct RepoInfo {
     pub total_files: usize,
     pub model: String,
     pub lock_status: String,
+    /// Named group(s) this repo belongs to (sorted; excludes the virtual "all"
+    /// group). Lets an agent see that a single repo is part of a larger group
+    /// and prefer a cross-repo `group=` query — e.g. a separate config /
+    /// import-data repo that shares a group with the main project. Empty when
+    /// the repo is in no named group.
+    pub groups: Vec<String>,
 }
 
 /// Health response served by `codesearch serve` at GET /health.

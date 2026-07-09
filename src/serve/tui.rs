@@ -18,11 +18,19 @@ use crossterm::terminal::{self, EnterAlternateScreen};
 
 use tokio_util::sync::CancellationToken;
 
-use super::tui_common::{self, KeyAction, OverlayKeyAction, OverlayState, RepoRow};
+use super::tui_common::{
+    self, KeyAction, OverlayKeyAction, OverlayState, RemoteIndexStats, RemoteStatsState, RepoRow,
+};
 use super::ServeState;
 use crate::cli::doctor;
 use crate::constants::{DB_DIR_NAME, LANG_CSHARP};
 use crate::index::IndexManager;
+
+/// Footer flash shown when a local-index action key (doctor / reindex / remove)
+/// is pressed while a mounted remote project is selected. Those actions operate
+/// on a local index, which a peer-hosted mount doesn't have — this confirms the
+/// no-op the struck-through footer hint already signals.
+const REMOTE_ACTION_NA: &str = "✗ doctor / reindex / remove don't apply to a remote mount";
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -90,11 +98,25 @@ async fn run_tui_loop(
     // Monotonic id of the most recent doctor request; bumped on every spawn.
     let mut doctor_gen: u64 = 0;
 
+    // Mounted remote projects (peer-hosted indexes, shown italic). Discovered on
+    // a slow background cadence so per-peer HTTP never blocks the render tick;
+    // the latest snapshot is cached here and appended after the local rows.
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel::<Vec<RepoRow>>(1);
+    let mut remote_rows: Vec<RepoRow> = Vec::new();
+    spawn_remote_discovery(state.clone(), remote_tx, cancel_token.clone());
+
     // Main loop
     loop {
-        // Draw the UI
+        // Absorb the newest remote-projects snapshot, if the background task
+        // produced one since the last tick (keep the previous list otherwise).
+        while let Ok(latest) = remote_rx.try_recv() {
+            remote_rows = latest;
+        }
+
+        // Draw the UI — local repos first, mounted remote projects appended.
         let repos = state.repo_statuses_lightweight();
-        let rows = map_repo_rows(&repos, &state);
+        let mut rows = map_repo_rows(&repos, &state);
+        rows.extend(remote_rows.iter().cloned());
 
         // Clamp selection
         if !rows.is_empty() {
@@ -158,7 +180,16 @@ async fn run_tui_loop(
         // the user is still waiting on the current request (spinner showing and
         // generation matches); otherwise the result is stale — drain and drop it.
         if let Ok((gen, result)) = doctor_rx.try_recv() {
-            if gen == doctor_gen && matches!(overlay, Some(OverlayState::DoctorRunning { .. })) {
+            // Apply async results (doctor diagnostics OR remote-mount index stats)
+            // only if the user is still viewing the matching overlay and the
+            // generation matches; otherwise the result is stale — drop it.
+            if gen == doctor_gen
+                && matches!(
+                    overlay,
+                    Some(OverlayState::DoctorRunning { .. })
+                        | Some(OverlayState::RemoteInfo { .. })
+                )
+            {
                 overlay = Some(result);
             }
         }
@@ -210,8 +241,42 @@ async fn run_tui_loop(
                         let _ = state.reload_if_changed();
                     }
                     KeyAction::ShowInfo(idx) => {
-                        if let Some(ov) = build_info_overlay(idx, &repos, &state) {
-                            overlay = Some(ov);
+                        if idx < repos.len() {
+                            // Local repo — gather live on-disk index stats.
+                            if let Some(ov) = build_info_overlay(idx, &repos, &state) {
+                                overlay = Some(ov);
+                            }
+                        } else if let Some(row) = rows.get(idx) {
+                            // Mounted remote project (appended after local rows).
+                            // Show federation coordinates immediately, then fetch
+                            // the peer's on-disk index stats in the background.
+                            let base = build_remote_info_overlay(row);
+                            // Bump the generation UNCONDITIONALLY: this invalidates
+                            // any still-in-flight doctor/remote-info result (they
+                            // share one channel + counter) so a late reply can't
+                            // clobber this overlay via the recv guard below.
+                            doctor_gen += 1;
+                            if let Some(crate::db_discovery::repos::Target::RemoteProject {
+                                peer,
+                                remote_alias,
+                                ..
+                            }) = state.config_snapshot().resolve_remote_project(&row.alias)
+                            {
+                                overlay = Some(base.clone());
+                                spawn_remote_info(
+                                    base,
+                                    peer,
+                                    remote_alias,
+                                    doctor_tx.clone(),
+                                    doctor_gen,
+                                );
+                            } else {
+                                // Mount no longer resolves (misconfig, or a config
+                                // reload raced this keypress). No fetch will run, so
+                                // don't leave the overlay stuck on "fetching…".
+                                overlay =
+                                    Some(with_remote_stats(base, RemoteStatsState::Unavailable));
+                            }
                         }
                     }
                     KeyAction::RunDoctor(idx) => {
@@ -226,6 +291,10 @@ async fn run_tui_loop(
                             // applied if this request is still the current one.
                             doctor_gen += 1;
                             spawn_doctor(alias, state.clone(), doctor_tx.clone(), doctor_gen);
+                        } else {
+                            // Remote mount (appended after local rows) — the
+                            // footer already greys this out; confirm the no-op.
+                            flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
                     }
                     KeyAction::ForceReindex(idx) => {
@@ -243,12 +312,16 @@ async fn run_tui_loop(
                                 }
                             };
                             flash = Some((msg, std::time::Instant::now()));
+                        } else {
+                            flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
                     }
                     KeyAction::RequestRemove(idx) => {
                         if idx < repos.len() {
                             let alias = repos[idx].0.clone();
                             overlay = Some(OverlayState::ConfirmRemove { alias });
+                        } else {
+                            flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
                     }
                     KeyAction::None => {}
@@ -326,6 +399,125 @@ fn map_repo_rows(
                 last_tool_call: info.last_tool_call.clone(),
                 lock_mode,
                 path,
+                is_remote: false,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Mounted remote projects (federation) — background discovery
+// ---------------------------------------------------------------------------
+
+/// Spawn the background task that periodically re-discovers mounted remote
+/// projects and pushes the latest `RepoRow` list through `tx`.
+///
+/// Runs off the render loop so per-peer HTTP never blocks a frame. Each round
+/// queries every configured peer's `/status` concurrently; peers that answer
+/// refresh an in-memory "last-known" alias list, and peers that fail this round
+/// reuse it — so a transient blip doesn't make a mount vanish from the table.
+fn spawn_remote_discovery(
+    state: Arc<ServeState>,
+    tx: tokio::sync::mpsc::Sender<Vec<RepoRow>>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let client = match crate::federation::FederationClient::new() {
+            Ok(c) => c,
+            // No HTTP client (e.g. TLS init failure) → no remote mounts, ever.
+            Err(e) => {
+                tracing::warn!("remote discovery disabled: HTTP client init failed: {e}");
+                return;
+            }
+        };
+        let interval = Duration::from_secs(crate::constants::REMOTE_DISCOVERY_INTERVAL_SECS);
+
+        loop {
+            let cfg = state.config_snapshot();
+            if !cfg.remotes.is_empty() {
+                let rows = discover_remote_rows(&client, &cfg).await;
+                // Capacity-1 channel: replace the pending snapshot if the render
+                // loop hasn't consumed it yet (try_send drops on Full — fine, the
+                // next round supersedes it anyway).
+                let _ = tx.try_send(rows);
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    });
+}
+
+/// Build the mounted remote-project rows for the TUI.
+///
+/// Rows come from the opt-in [`remote_mounts`](crate::db_discovery::repos::ReposConfig::remote_mounts)
+/// allowlist (config-driven, so they always show). Every peer's `/status` is
+/// polled concurrently only to *enrich* those rows with live per-repo state;
+/// a mount whose peer is unreachable this round simply falls back to a "warm"
+/// default. Discovery never defines which projects are mounted.
+async fn discover_remote_rows(
+    client: &crate::federation::FederationClient,
+    cfg: &crate::db_discovery::repos::ReposConfig,
+) -> Vec<RepoRow> {
+    use crate::db_discovery::repos::Target;
+    use crate::federation::ManagementOutcome;
+
+    // 1) Fan out /status to all peers concurrently, keyed (peer, remote_alias).
+    let mut status_lookup: std::collections::HashMap<
+        (String, String),
+        crate::federation::RemoteRepoStatus,
+    > = std::collections::HashMap::new();
+
+    let mut join = tokio::task::JoinSet::new();
+    for (peer_name, peer) in cfg.remotes.iter() {
+        let client = client.clone();
+        let peer = peer.clone();
+        let peer_name = peer_name.clone();
+        join.spawn(async move {
+            let outcome = client.list_repos(&peer).await;
+            (peer_name, outcome)
+        });
+    }
+    while let Some(res) = join.join_next().await {
+        if let Ok((peer_name, ManagementOutcome::Ok(status))) = res {
+            for r in status.repos {
+                status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
+            }
+        }
+    }
+
+    // 2) Build one row per mounted project, enriched with live status.
+    cfg.mounted_remote_projects()
+        .into_iter()
+        .map(|(local_name, target)| {
+            let Target::RemoteProject {
+                peer_name,
+                peer,
+                remote_alias,
+            } = target
+            else {
+                // mounted_remote_projects only ever yields RemoteProject.
+                unreachable!("mounted_remote_projects yielded a non-RemoteProject target");
+            };
+            let st = status_lookup.get(&(peer_name, remote_alias));
+            RepoRow {
+                alias: local_name,
+                // Reuse the peer's own status vocabulary (open/warm/…); default
+                // to "warm" for a cached-but-unreachable peer.
+                status: st
+                    .map(|s| s.status.clone())
+                    .unwrap_or_else(|| "warm".to_string()),
+                csharp_index: "none".to_string(),
+                csharp_error: None,
+                changes: st.map(|s| s.changes).unwrap_or(0),
+                tool_call_count: st.and_then(|s| s.tool_call_count).unwrap_or(0),
+                last_tool_call: st.and_then(|s| s.last_tool_call.clone()),
+                lock_mode: st.map(|s| s.lock_mode.clone()).unwrap_or_default(),
+                // Detail panel shows where the mount lives.
+                path: peer.url.clone(),
+                is_remote: true,
             }
         })
         .collect()
@@ -456,6 +648,30 @@ fn build_info_overlay(
         lock,
         index_age,
     })
+}
+
+/// Build a `RemoteInfo` overlay for a mounted remote project row.
+///
+/// Remote mounts have no local index on disk (chunks / db size / model live on
+/// the peer), so this surfaces the federation coordinates (peer URL) plus the
+/// peer-reported live status already carried on the `RepoRow`.
+fn build_remote_info_overlay(row: &RepoRow) -> OverlayState {
+    OverlayState::RemoteInfo {
+        alias: row.alias.clone(),
+        peer_url: row.path.clone(),
+        status: row.status.clone(),
+        lock: if row.lock_mode.is_empty() {
+            "—".to_string()
+        } else {
+            row.lock_mode.clone()
+        },
+        changes: row.changes,
+        tool_call_count: row.tool_call_count,
+        last_tool_call: row.last_tool_call.clone(),
+        // Index stats (chunks/files/db-size/model) live on the peer and are
+        // fetched asynchronously; start in the loading state.
+        stats: RemoteStatsState::Loading,
+    }
 }
 
 /// Format an ISO 8601 timestamp as a human-readable age string.
@@ -599,6 +815,69 @@ fn spawn_doctor(
         // Send result back to TUI loop (non-blocking — if channel closed, just drop it)
         let _ = tx.send((gen, result_overlay)).await;
     });
+}
+
+/// Spawn a background task to fetch a mounted remote project's on-disk index
+/// stats from the peer's `GET /repos/{alias}/info`, then send an enriched
+/// `RemoteInfo` overlay back via `tx` tagged with `gen` (so a stale or dismissed
+/// request's result is discarded by the receiver). On any failure the overlay
+/// falls back to `RemoteStatsState::Unavailable` — the mount coordinates already
+/// shown remain intact.
+fn spawn_remote_info(
+    base: OverlayState,
+    peer: crate::db_discovery::repos::RemotePeer,
+    remote_alias: String,
+    tx: tokio::sync::mpsc::Sender<(u64, OverlayState)>,
+    gen: u64,
+) {
+    tokio::spawn(async move {
+        use crate::federation::{FederationClient, ManagementOutcome};
+        let stats = match FederationClient::new() {
+            Ok(client) => match client.repo_info(&peer, &remote_alias).await {
+                ManagementOutcome::Ok(info) => RemoteStatsState::Ready(RemoteIndexStats {
+                    chunks: info.chunks,
+                    files: info.files,
+                    db_size_human: info.db_size_human,
+                    model: info.model,
+                }),
+                // Peer unreachable / non-2xx / unparseable — surface as unavailable.
+                _ => RemoteStatsState::Unavailable,
+            },
+            // No HTTP client (e.g. TLS init failure) → stats can't be fetched.
+            Err(_) => RemoteStatsState::Unavailable,
+        };
+        let enriched = with_remote_stats(base, stats);
+        let _ = tx.send((gen, enriched)).await;
+    });
+}
+
+/// Replace the `stats` field of a `RemoteInfo` overlay, leaving any other overlay
+/// variant untouched.
+fn with_remote_stats(overlay: OverlayState, stats: RemoteStatsState) -> OverlayState {
+    if let OverlayState::RemoteInfo {
+        alias,
+        peer_url,
+        status,
+        lock,
+        changes,
+        tool_call_count,
+        last_tool_call,
+        ..
+    } = overlay
+    {
+        OverlayState::RemoteInfo {
+            alias,
+            peer_url,
+            status,
+            lock,
+            changes,
+            tool_call_count,
+            last_tool_call,
+            stats,
+        }
+    } else {
+        overlay
+    }
 }
 
 // ---------------------------------------------------------------------------
