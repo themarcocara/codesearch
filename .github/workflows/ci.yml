@@ -138,5 +138,23 @@ jobs:
           # as that fix's regression test: haxe-sdk/haxe and haxe-sdk/std are
           # colocated exactly like a real Kha install, so if auto-detection
           # ever breaks, these tests fail here.
+          #
+          # Scoped to just this one integration test binary (--test
+          # symbols_haxe_test), not a bare `cargo test` -- a bare invocation
+          # also runs the full --lib unit test suite (everything under
+          # src/), which is unrelated to Haxe and already covered by the
+          # test-linux job. Running it here too is redundant AND was
+          # observed to cause a spurious failure: adding this job's own
+          # Haxe tests increases the total test count cargo test's default
+          # parallel harness schedules across the whole binary, and that
+          # extra concurrency was enough to trip an unrelated, pre-existing
+          # timing-sensitive LMDB open/close race in
+          # serve::tests::missing_db_not_cached_as_conflicted (nothing in
+          # this PR touches src/serve/mod.rs or the LMDB registry it
+          # depends on -- same test, same assertion, passed on the
+          # immediately preceding commit with no changes to that code
+          # path). Narrowing this job to only the Haxe-specific test target
+          # avoids re-running that unrelated, already-covered, and
+          # apparently contention-sensitive suite altogether.
           export CODESEARCH_HAXE="$PWD/haxe-sdk/haxe"
-          cargo test --features haxe_helper_integration -- --nocapture
+          cargo test --features haxe_helper_integration --test symbols_haxe_test -- --nocapture
