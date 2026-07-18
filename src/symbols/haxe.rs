@@ -220,9 +220,8 @@ impl HaxeSymbolIndexer {
         let mut opts = EnvOpenOptions::new();
         // Metadata only (two small string keys) — nowhere near LMDB's default.
         opts.map_size(8 * 1024 * 1024).max_dbs(2);
-        let env = unsafe {
-            TrackedEnv::open(&opts, &haxe_dir, &format!("HAXE({})", db_path.display()))?
-        };
+        let env =
+            unsafe { TrackedEnv::open(&opts, &haxe_dir, &format!("HAXE({})", db_path.display()))? };
         let mut wtxn = env.write_txn()?;
         env.create_database::<Str, Str>(&mut wtxn, Some(HAXE_META_DB_NAME))?;
         wtxn.commit()?;
@@ -244,7 +243,9 @@ impl HaxeSymbolIndexer {
     /// declaration's name starting on that line, via `tree-sitter-haxe`.
     fn resolve_position_to_offset(source: &[u8], line: u32) -> Option<usize> {
         let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_haxe::LANGUAGE.into()).ok()?;
+        parser
+            .set_language(&tree_sitter_haxe::LANGUAGE.into())
+            .ok()?;
         let tree = parser.parse(source, None)?;
         let target_row = line.checked_sub(1)? as usize;
         find_name_offset_at_row(tree.root_node(), target_row)
@@ -263,7 +264,10 @@ impl HaxeSymbolIndexer {
                 continue;
             };
             let mut parser = tree_sitter::Parser::new();
-            if parser.set_language(&tree_sitter_haxe::LANGUAGE.into()).is_err() {
+            if parser
+                .set_language(&tree_sitter_haxe::LANGUAGE.into())
+                .is_err()
+            {
                 continue;
             }
             let Some(tree) = parser.parse(&source, None) else {
@@ -459,11 +463,7 @@ impl SymbolIndexer for HaxeSymbolIndexer {
             .with_context(|| format!("Failed to read {}", abs_file.display()))?;
 
         let Some(offset) = Self::resolve_position_to_offset(&source, line) else {
-            tracing::debug!(
-                "No Haxe declaration found at {}:{}",
-                file.display(),
-                line
-            );
+            tracing::debug!("No Haxe declaration found at {}:{}", file.display(), line);
             return Ok(vec![]);
         };
 
