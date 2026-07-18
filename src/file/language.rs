@@ -26,6 +26,7 @@ pub enum Language {
     Swift,
     Kotlin,
     Dart,
+    Haxe,
     Shell,
     Markdown,
     Json,
@@ -98,6 +99,7 @@ impl Language {
             "swift" => Self::Swift,
             "kotlin" | "kt" => Self::Kotlin,
             "dart" => Self::Dart,
+            "haxe" | "hx" => Self::Haxe,
             "shell" | "sh" | "bash" => Self::Shell,
             "markdown" | "md" => Self::Markdown,
             "json" => Self::Json,
@@ -143,6 +145,7 @@ impl Language {
             "swift" => Self::Swift,
             "kt" | "kts" => Self::Kotlin,
             "dart" => Self::Dart,
+            "hx" => Self::Haxe,
             "sh" | "bash" | "zsh" => Self::Shell,
             "md" | "markdown" | "txt" => Self::Markdown, // Treat txt as markdown-like
             "json" => Self::Json,
@@ -173,6 +176,7 @@ impl Language {
                 | Self::Java
                 | Self::Kotlin
                 | Self::Dart
+                | Self::Haxe
                 | Self::Shell
                 | Self::Ruby
                 | Self::Php
@@ -204,6 +208,7 @@ impl Language {
             Self::Swift => "Swift",
             Self::Kotlin => "Kotlin",
             Self::Dart => "Dart",
+            Self::Haxe => "Haxe",
             Self::Shell => "Shell",
             Self::Markdown => "Markdown",
             Self::Json => "JSON",
