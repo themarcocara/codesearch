@@ -492,6 +492,37 @@ pub const SCIP_LMDB_MAP_SIZE_MB_ENV: &str = "CODESEARCH_SCIP_LMDB_MAP_MB";
 /// Coalesces bursts of file changes into a single write.
 pub const PERSIST_DEBOUNCE_SECS: u64 = 10;
 
+/// Environment variable to override the `haxe` compiler binary path used by
+/// the Haxe symbol indexer. Unlike `scip-csharp`, this is not a bundled
+/// codesearch helper — it's the user's own Haxe SDK install, so `$PATH` is
+/// the primary lookup and this env var exists only as an override.
+pub const HAXE_HELPER_ENV: &str = "CODESEARCH_HAXE";
+
+/// Binary name for the Haxe compiler (without extension).
+pub const HAXE_HELPER_NAME: &str = "haxe";
+
+/// Language identifier for the Haxe symbol indexer.
+/// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
+pub const LANG_HAXE: &str = "haxe";
+
+/// LMDB database name for Haxe adapter metadata (repo path, last-verified
+/// timestamp). Unlike the C# adapter, Haxe has no batch-indexed symbol
+/// table — `find_impact` queries drive the `haxe` compiler's `--display`
+/// protocol live, per symbol, so this table only stores enough to answer
+/// `has_index`/`index_age` and to resolve `repo_path` from `db_path`.
+pub const HAXE_META_DB_NAME: &str = "haxe_meta";
+
+/// LMDB metadata key (within `HAXE_META_DB_NAME`) storing the repo's
+/// absolute path, set by `rebuild()` and read back to locate the `.hxml`
+/// for on-demand `--display` invocations.
+pub const HAXE_META_REPO_PATH_KEY: &str = "repo_path";
+
+/// LMDB metadata key (within `HAXE_META_DB_NAME`) storing the last time
+/// `rebuild()` verified the helper + `.hxml` were present (UNIX epoch
+/// seconds). Not a "rebuild" in the C# sense — there is no batch index to
+/// go stale — just a last-verified marker for `index_age()`.
+pub const HAXE_META_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
+
 /// File extensions that should never be indexed, regardless of content.
 /// These are generated/compiled/binary-adjacent files with no semantic code value.
 pub const ALWAYS_SKIP_EXTENSIONS: &[&str] = &[

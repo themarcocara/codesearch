@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.1.30"
+version = "1.1.31"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -54,6 +54,7 @@ tree-sitter-yaml = "0.7.2"
 tree-sitter-json = "0.24.8"
 tree-sitter-md = "0.5.3"
 tree-sitter-dart = "0.2.0"
+tree-sitter-haxe = { git = "https://github.com/themarcocara/tree-sitter-haxe", rev = "69c6a47dc25f8eee2f5da7a95147c2b823c1d02a" }
 
 # File handling
 ignore = "0.4"
@@ -132,3 +133,4 @@ default = []
 cuda = ["ort/cuda"]        # Enable CUDA GPU acceleration (requires cuDNN)
 tensorrt = ["ort/tensorrt"] # Enable TensorRT acceleration (NVIDIA only)
 csharp_helper_integration = []  # Enable integration tests that require the scip-csharp helper binary
+haxe_helper_integration = []  # Enable integration tests that require a `haxe` compiler on PATH

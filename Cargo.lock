@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "codesearch"
-version = "1.1.30"
+version = "1.1.31"
 dependencies = [
  "anyhow",
  "arroy",
@@ -684,6 +684,7 @@ dependencies = [
  "tree-sitter-cpp",
  "tree-sitter-dart",
  "tree-sitter-go",
+ "tree-sitter-haxe",
  "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-json",
@@ -5107,6 +5108,15 @@ name = "tree-sitter-go"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8560a4d2f835cc0d4d2c2e03cbd0dde2f6114b43bc491164238d333e28b16ea"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-haxe"
+version = "0.13.0"
+source = "git+https://github.com/themarcocara/tree-sitter-haxe?rev=69c6a47dc25f8eee2f5da7a95147c2b823c1d02a#69c6a47dc25f8eee2f5da7a95147c2b823c1d02a"
 dependencies = [
  "cc",
  "tree-sitter-language",

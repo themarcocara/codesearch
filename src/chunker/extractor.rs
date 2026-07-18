@@ -89,6 +89,7 @@ pub fn get_extractor(language: Language) -> Option<Box<dyn LanguageExtractor>> {
         Language::Go => Some(Box::new(GoExtractor)),
         Language::Java => Some(Box::new(JavaExtractor)),
         Language::Dart => Some(Box::new(DartExtractor)),
+        Language::Haxe => Some(Box::new(HaxeExtractor)),
         _ => None,
     }
 }
@@ -1136,6 +1137,139 @@ fn find_dart_identifier(node: &Node, source: &[u8]) -> Option<String> {
     None
 }
 
+/// Haxe language extractor.
+///
+/// Node kind names come from `themarcocara/tree-sitter-haxe`'s
+/// `grammar-declarations.js`, confirmed against `tree-sitter parse` output
+/// (not guessed from another language's grammar).
+///
+/// Known grammar gap: plain (non-`enum`) `abstract Name(UnderlyingType) {}`
+/// declarations are not recognized by this grammar as their own node kind —
+/// only `enum abstract` (`enum_abstract_declaration`) is. A bare `abstract`
+/// type produces an `ERROR` node instead of a `class_declaration`-like node,
+/// so such declarations simply won't be picked up as named chunks by
+/// `definition_types` below (upstream parser limitation, not something this
+/// extractor can special-case around).
+pub struct HaxeExtractor;
+
+impl LanguageExtractor for HaxeExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "enum_abstract_declaration",
+            "typedef_declaration",
+            "function_declaration",
+        ]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "enum_abstract_declaration"
+            | "typedef_declaration"
+            | "function_declaration" => node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok().map(String::from)),
+            _ => None,
+        }
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "function_declaration" => {
+                // Interface method declarations have no body — signature is
+                // then the whole node text.
+                let body = node.child_by_field_name("body");
+                let sig_end = body.map(|b| b.start_byte()).unwrap_or(node.end_byte());
+                let sig_text = std::str::from_utf8(&source[node.start_byte()..sig_end]).ok()?;
+                Some(sig_text.trim().to_string())
+            }
+            "class_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("class {}", name))
+            }
+            "interface_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("interface {}", name))
+            }
+            "enum_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("enum {}", name))
+            }
+            "enum_abstract_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("enum abstract {}", name))
+            }
+            "typedef_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("typedef {}", name))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        // Haxe (dox) doc comments are `/** ... */` immediately preceding the
+        // declaration — there is no `///` convention like Dart/Rust.
+        let parent = node.parent()?;
+        let node_index = (0..parent.named_child_count())
+            .find(|&i| parent.named_child(i as u32).map(|c| c.id()) == Some(node.id()))?;
+
+        if node_index > 0 {
+            if let Some(prev) = parent.named_child((node_index - 1) as u32) {
+                if prev.kind() == "comment" {
+                    if let Ok(text) = prev.utf8_text(source) {
+                        if text.trim_start().starts_with("/**") {
+                            return Some(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        match node.kind() {
+            "function_declaration" => {
+                // Class/interface/enum/enum-abstract bodies AND function
+                // bodies all share the same generic "block" node kind in
+                // this grammar (no distinct class_body/function_body split
+                // like Dart has) — so a function_declaration's immediate
+                // parent being "block" is not enough on its own to tell a
+                // method apart from a locally-nested function. Check the
+                // block's own parent (the grandparent of this node) to see
+                // whether the block IS a type declaration's body.
+                if let Some(block) = node.parent() {
+                    if block.kind() == "block" {
+                        if let Some(owner) = block.parent() {
+                            if matches!(
+                                owner.kind(),
+                                "class_declaration"
+                                    | "interface_declaration"
+                                    | "enum_declaration"
+                                    | "enum_abstract_declaration"
+                            ) {
+                                return ChunkKind::Method;
+                            }
+                        }
+                    }
+                }
+                ChunkKind::Function
+            }
+            "class_declaration" => ChunkKind::Class,
+            "interface_declaration" => ChunkKind::Interface,
+            "enum_declaration" | "enum_abstract_declaration" => ChunkKind::Enum,
+            "typedef_declaration" => ChunkKind::TypeAlias,
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
 /// Helper: recursively find the first identifier in a declarator chain (for C/C++)
 fn find_identifier(node: Node, source: &[u8]) -> Option<String> {
     if node.kind() == "identifier"
@@ -1219,5 +1353,201 @@ mod tests {
 
         assert!(types.contains(&"function_definition"));
         assert!(types.contains(&"class_definition"));
+    }
+
+    #[test]
+    fn test_haxe_definition_types() {
+        let extractor = HaxeExtractor;
+        let types = extractor.definition_types();
+
+        assert!(types.contains(&"class_declaration"));
+        assert!(types.contains(&"interface_declaration"));
+        assert!(types.contains(&"enum_declaration"));
+        assert!(types.contains(&"enum_abstract_declaration"));
+        assert!(types.contains(&"typedef_declaration"));
+        assert!(types.contains(&"function_declaration"));
+    }
+
+    /// Parse Haxe source and return the tree alongside the source bytes
+    /// (the tree borrows nothing from `source`, so both must stay alive
+    /// together for the caller to walk it).
+    fn parse_haxe(source: &str) -> (tree_sitter::Tree, Vec<u8>) {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_haxe::LANGUAGE.into())
+            .expect("failed to load Haxe grammar");
+        let tree = parser.parse(source, None).expect("failed to parse Haxe source");
+        (tree, source.as_bytes().to_vec())
+    }
+
+    /// Depth-first search for the first node of the given kind.
+    fn find_node<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_node(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_haxe_class_and_method() {
+        let source = r#"
+/**
+ * A field definition.
+ */
+class FieldDefinition {
+  /** Validates the field. */
+  public function validate():Bool {
+    return true;
+  }
+}
+"#;
+        let (tree, source) = parse_haxe(source);
+        let extractor = HaxeExtractor;
+
+        let class_node = find_node(tree.root_node(), "class_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_name(class_node, &source),
+            Some("FieldDefinition".to_string())
+        );
+        assert_eq!(extractor.classify(class_node), ChunkKind::Class);
+        assert_eq!(
+            extractor.extract_signature(class_node, &source),
+            Some("class FieldDefinition".to_string())
+        );
+        let class_doc = extractor.extract_docstring(class_node, &source).unwrap();
+        assert!(class_doc.contains("A field definition."));
+
+        let method_node = find_node(tree.root_node(), "function_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_name(method_node, &source),
+            Some("validate".to_string())
+        );
+        assert_eq!(extractor.classify(method_node), ChunkKind::Method);
+        let method_doc = extractor.extract_docstring(method_node, &source).unwrap();
+        assert!(method_doc.contains("Validates the field."));
+    }
+
+    #[test]
+    fn test_haxe_top_level_function_vs_nested() {
+        let source = r#"
+function topLevelFn(x:Int):Int {
+  function helper():Int {
+    return 1;
+  }
+  return helper();
+}
+"#;
+        let (tree, source) = parse_haxe(source);
+        let extractor = HaxeExtractor;
+
+        let top_fn = find_node(tree.root_node(), "function_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_name(top_fn, &source),
+            Some("topLevelFn".to_string())
+        );
+        // Top-level function: not nested in a class/interface/enum body block.
+        assert_eq!(extractor.classify(top_fn), ChunkKind::Function);
+
+        // The nested `helper` function is still a Function (not a Method) —
+        // it's local to another function's body, not a type member.
+        let nested_fn = find_node(top_fn.child_by_field_name("body").unwrap(), "function_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_name(nested_fn, &source),
+            Some("helper".to_string())
+        );
+        assert_eq!(extractor.classify(nested_fn), ChunkKind::Function);
+    }
+
+    #[test]
+    fn test_haxe_constructor_name() {
+        // Regression check: the grammar's `function_declaration` rule types
+        // its `name` field as `choice($._lhs_expression, 'new')` — the `'new'`
+        // keyword alternative is an anonymous token, not a named identifier
+        // node, and doesn't show up in a named-nodes-only tree dump. Confirm
+        // `child_by_field_name` still resolves it regardless.
+        let source = r#"
+class Foo {
+  public function new(x:Int) {
+    this.x = x;
+  }
+}
+"#;
+        let (tree, source) = parse_haxe(source);
+        let extractor = HaxeExtractor;
+
+        let ctor = find_node(tree.root_node(), "function_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_name(ctor, &source),
+            Some("new".to_string())
+        );
+        assert_eq!(extractor.classify(ctor), ChunkKind::Method);
+    }
+
+    #[test]
+    fn test_haxe_interface_enum_typedef() {
+        let source = r#"
+interface Validatable {
+  function validate():Bool;
+}
+
+enum Color {
+  Red;
+  Green;
+  Blue;
+}
+
+enum abstract Status(Int) from Int to Int {
+  var Active = 0;
+  var Inactive = 1;
+}
+
+typedef Point = {
+  var x:Int;
+  var y:Int;
+}
+"#;
+        let (tree, source) = parse_haxe(source);
+        let extractor = HaxeExtractor;
+
+        let iface = find_node(tree.root_node(), "interface_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_name(iface, &source),
+            Some("Validatable".to_string())
+        );
+        assert_eq!(extractor.classify(iface), ChunkKind::Interface);
+
+        // Interface methods have no body — signature is the whole node text.
+        let iface_method = find_node(iface, "function_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_signature(iface_method, &source),
+            Some("function validate():Bool;".to_string())
+        );
+
+        let enum_node = find_node(tree.root_node(), "enum_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_name(enum_node, &source),
+            Some("Color".to_string())
+        );
+        assert_eq!(extractor.classify(enum_node), ChunkKind::Enum);
+
+        let enum_abstract = find_node(tree.root_node(), "enum_abstract_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_name(enum_abstract, &source),
+            Some("Status".to_string())
+        );
+        assert_eq!(extractor.classify(enum_abstract), ChunkKind::Enum);
+
+        let typedef_node = find_node(tree.root_node(), "typedef_declaration").unwrap();
+        assert_eq!(
+            extractor.extract_name(typedef_node, &source),
+            Some("Point".to_string())
+        );
+        assert_eq!(extractor.classify(typedef_node), ChunkKind::TypeAlias);
     }
 }

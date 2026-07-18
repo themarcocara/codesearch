@@ -8,6 +8,7 @@
 //! `SymbolIndexer` impls here.
 
 pub mod csharp;
+pub mod haxe;
 pub mod scip_parse;
 
 use std::path::{Path, PathBuf};
@@ -178,7 +179,10 @@ impl SymbolIndexerRegistry {
     /// Create a registry with default (MVP) indexers.
     pub fn new() -> Self {
         Self {
-            indexers: vec![Box::new(csharp::CSharpSymbolIndexer::new())],
+            indexers: vec![
+                Box::new(csharp::CSharpSymbolIndexer::new()),
+                Box::new(haxe::HaxeSymbolIndexer::new()),
+            ],
         }
     }
 
