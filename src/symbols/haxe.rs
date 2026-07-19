@@ -33,9 +33,9 @@
 //!
 //! ## Portable Haxe SDKs and `HAXE_STD_PATH` (e.g. Kode/Kha)
 //!
-//! Some Haxe distributions are a self-contained directory (compiler binary
-//! + `std/` standard library, sometimes shipped alongside per-platform
-//! runtime DLLs on Windows) rather than a system install — notably the
+//! Some Haxe distributions are a self-contained directory — compiler binary
+//! and `std/` standard library, sometimes shipped alongside per-platform
+//! runtime DLLs on Windows — rather than a system install, notably the
 //! `Kode/kha` game framework, which vendors its own per-platform Haxe SDK
 //! under `Tools/<platform>/` rather than trusting whatever `haxe` a
 //! developer might have on `$PATH`. Investigated directly: that binary
