@@ -31,6 +31,25 @@
 //! `find_references`/`find_references_by_position` know where to find the
 //! `.hxml` and can answer `has_index`/`index_age`.
 //!
+//! ## Portable Haxe SDKs and `HAXE_STD_PATH` (e.g. Kode/Kha)
+//!
+//! Some Haxe distributions are a self-contained directory — compiler binary
+//! and `std/` standard library, sometimes shipped alongside per-platform
+//! runtime DLLs on Windows — rather than a system install, notably the
+//! `Kode/kha` game framework, which vendors its own per-platform Haxe SDK
+//! under `Tools/<platform>/` rather than trusting whatever `haxe` a
+//! developer might have on `$PATH`. Investigated directly: that binary
+//! auto-discovers a *sibling* `std/` next to itself when present, but fails
+//! with "Standard library not found" once separated from it — and Kha's own
+//! build tool (`khamake`) never relies on that auto-discovery, always
+//! setting `HAXE_STD_PATH` explicitly instead. `invoke_display_usage`
+//! mirrors that: when the resolved `haxe` binary has a sibling `std/`
+//! directory, `HAXE_STD_PATH` is set to it for that invocation,
+//! unconditionally overriding whatever the ambient environment has — a std/
+//! library that doesn't match the resolved binary's version is a
+//! version-mismatch footgun, not something to defer to just because it
+//! happened to already be set. See `sibling_std_dir`.
+//!
 //! ## Known limitation: cold invocation per query (no compile-server yet)
 //!
 //! Each query spawns a fresh `haxe <hxml> --display ...` process, which
@@ -201,9 +220,8 @@ impl HaxeSymbolIndexer {
         let mut opts = EnvOpenOptions::new();
         // Metadata only (two small string keys) — nowhere near LMDB's default.
         opts.map_size(8 * 1024 * 1024).max_dbs(2);
-        let env = unsafe {
-            TrackedEnv::open(&opts, &haxe_dir, &format!("HAXE({})", db_path.display()))?
-        };
+        let env =
+            unsafe { TrackedEnv::open(&opts, &haxe_dir, &format!("HAXE({})", db_path.display()))? };
         let mut wtxn = env.write_txn()?;
         env.create_database::<Str, Str>(&mut wtxn, Some(HAXE_META_DB_NAME))?;
         wtxn.commit()?;
@@ -225,7 +243,9 @@ impl HaxeSymbolIndexer {
     /// declaration's name starting on that line, via `tree-sitter-haxe`.
     fn resolve_position_to_offset(source: &[u8], line: u32) -> Option<usize> {
         let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_haxe::LANGUAGE.into()).ok()?;
+        parser
+            .set_language(&tree_sitter_haxe::LANGUAGE.into())
+            .ok()?;
         let tree = parser.parse(source, None)?;
         let target_row = line.checked_sub(1)? as usize;
         find_name_offset_at_row(tree.root_node(), target_row)
@@ -244,7 +264,10 @@ impl HaxeSymbolIndexer {
                 continue;
             };
             let mut parser = tree_sitter::Parser::new();
-            if parser.set_language(&tree_sitter_haxe::LANGUAGE.into()).is_err() {
+            if parser
+                .set_language(&tree_sitter_haxe::LANGUAGE.into())
+                .is_err()
+            {
                 continue;
             }
             let Some(tree) = parser.parse(&source, None) else {
@@ -288,11 +311,29 @@ impl HaxeSymbolIndexer {
         offset: usize,
     ) -> Result<Vec<SymbolReference>> {
         let display_arg = format!("{}@{}@usage", file.display(), offset);
-        let output = Command::new(haxe_bin)
-            .current_dir(repo_path)
+        let mut cmd = Command::new(haxe_bin);
+        cmd.current_dir(repo_path)
             .arg(hxml)
             .arg("--display")
-            .arg(&display_arg)
+            .arg(&display_arg);
+
+        // Portable Haxe distributions (e.g. Kode/Kha's vendored `Tools/<platform>/`
+        // SDKs) ship a `std/` directory as a sibling of the compiler binary and
+        // rely on the caller setting HAXE_STD_PATH to it -- confirmed by testing:
+        // the binary auto-discovers a *sibling* std/ next to itself when present,
+        // but errors with "Standard library not found" when separated from it,
+        // and khamake (Kha's own build tool) never relies on that auto-discovery,
+        // always setting HAXE_STD_PATH explicitly instead. We do the same, and
+        // deliberately override rather than defer to any ambient HAXE_STD_PATH:
+        // once a specific haxe binary has been resolved (env var or PATH), a std/
+        // sitting right next to it is the one guaranteed to match that binary's
+        // version -- a stray unrelated HAXE_STD_PATH left over from some other
+        // Haxe install is a version-mismatch footgun, not a preference to respect.
+        if let Some(std_dir) = sibling_std_dir(haxe_bin) {
+            cmd.env("HAXE_STD_PATH", std_dir);
+        }
+
+        let output = cmd
             .output()
             .with_context(|| format!("Failed to execute haxe at {}", haxe_bin.display()))?;
 
@@ -422,11 +463,7 @@ impl SymbolIndexer for HaxeSymbolIndexer {
             .with_context(|| format!("Failed to read {}", abs_file.display()))?;
 
         let Some(offset) = Self::resolve_position_to_offset(&source, line) else {
-            tracing::debug!(
-                "No Haxe declaration found at {}:{}",
-                file.display(),
-                line
-            );
+            tracing::debug!("No Haxe declaration found at {}:{}", file.display(), line);
             return Ok(vec![]);
         };
 
@@ -537,6 +574,21 @@ fn walk_hx_files_inner(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// If `haxe_bin`'s directory contains a `std/` subdirectory, return its
+/// path. Mirrors `khamake`'s `Haxe.ts`: `path.resolve(haxeDirectory, 'std')`,
+/// used to derive `HAXE_STD_PATH` for portable/vendored Haxe SDKs (e.g.
+/// Kode/Kha's `Tools/<platform>/` distributions) where the compiler and its
+/// standard library travel together as a directory, not a system install.
+fn sibling_std_dir(haxe_bin: &Path) -> Option<PathBuf> {
+    let dir = haxe_bin.parent()?;
+    let std_dir = dir.join("std");
+    if std_dir.is_dir() {
+        Some(std_dir)
+    } else {
+        None
+    }
+}
+
 /// Parse `haxe --display <file>@<offset>@usage` stdout into references.
 ///
 /// Expected format, one entry per reference:
@@ -641,6 +693,46 @@ mod tests {
         std::fs::write(dir.join("server.hxml"), "-cp src2\n").unwrap();
 
         assert_eq!(HaxeSymbolIndexer::find_hxml(&dir), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_sibling_std_dir_present() {
+        let dir = std::env::temp_dir().join(format!(
+            "hx_test_std_present_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("std")).unwrap();
+        let haxe_bin = dir.join("haxe");
+        std::fs::write(&haxe_bin, "").unwrap();
+
+        assert_eq!(sibling_std_dir(&haxe_bin), Some(dir.join("std")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_sibling_std_dir_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "hx_test_std_absent_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let haxe_bin = dir.join("haxe");
+        std::fs::write(&haxe_bin, "").unwrap();
+
+        // No "std" subdirectory next to the binary -- e.g. a system-installed
+        // `haxe` on $PATH, which resolves its std library some other way.
+        assert_eq!(sibling_std_dir(&haxe_bin), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

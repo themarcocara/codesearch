@@ -1376,7 +1376,9 @@ mod tests {
         parser
             .set_language(&tree_sitter_haxe::LANGUAGE.into())
             .expect("failed to load Haxe grammar");
-        let tree = parser.parse(source, None).expect("failed to parse Haxe source");
+        let tree = parser
+            .parse(source, None)
+            .expect("failed to parse Haxe source");
         (tree, source.as_bytes().to_vec())
     }
 
@@ -1456,7 +1458,11 @@ function topLevelFn(x:Int):Int {
 
         // The nested `helper` function is still a Function (not a Method) —
         // it's local to another function's body, not a type member.
-        let nested_fn = find_node(top_fn.child_by_field_name("body").unwrap(), "function_declaration").unwrap();
+        let nested_fn = find_node(
+            top_fn.child_by_field_name("body").unwrap(),
+            "function_declaration",
+        )
+        .unwrap();
         assert_eq!(
             extractor.extract_name(nested_fn, &source),
             Some("helper".to_string())

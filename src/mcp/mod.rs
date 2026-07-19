@@ -6244,6 +6244,7 @@ impl CodesearchService {
                 let ext = Path::new(f).extension()?.to_str()?.to_lowercase();
                 match ext.as_str() {
                     "cs" => Some(crate::constants::LANG_CSHARP.to_string()),
+                    "hx" => Some(crate::constants::LANG_HAXE.to_string()),
                     _ => None,
                 }
             })
@@ -6268,7 +6269,12 @@ impl CodesearchService {
                         "No symbol indexers installed. Install the `scip-csharp` helper for C# support.".to_string(),
                     )]));
                 }
-                // Use the first installed language (MVP: only C#)
+                // Genuinely ambiguous (no `language`, and either no `file` or an
+                // extension not recognized above) — guess the first installed
+                // language rather than fail outright. Not MVP-only-C# anymore
+                // (Haxe is also registered); this is a last-resort fallback for
+                // requests this function truly can't disambiguate, not a
+                // language preference.
                 match registry.get(&installed[0]) {
                     Some(i) => i,
                     None => {
